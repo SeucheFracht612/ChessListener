@@ -1,0 +1,9 @@
+{
+  "name": "local.chess_listener",
+  "description": "Native host for ChessListener",
+  "path": "/home/seuchefracht612/Documents/ChessListener/Native/chess-listener-host",
+  "type": "stdio",
+  "allowed_extensions": [
+    "chess-listener@local"
+  ]
+}
