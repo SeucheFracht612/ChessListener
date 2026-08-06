@@ -1,23 +1,19 @@
 {
   "manifest_version": 3,
   "name": "ChessListener",
-  "version": "0.1.0",
-  "description": "Passively records positions from your Chess.com games to a local native application.",
-
+  "version": "0.2.0",
+  "description": "Provides a local live-analysis overlay for Chess.com games you are spectating.",
   "permissions": [
     "nativeMessaging"
   ],
-
   "host_permissions": [
     "https://www.chess.com/*"
   ],
-
   "background": {
     "scripts": [
       "background.js"
     ]
   },
-
   "content_scripts": [
     {
       "matches": [
@@ -29,7 +25,6 @@
       "run_at": "document_idle"
     }
   ],
-
   "browser_specific_settings": {
     "gecko": {
       "id": "chess-listener@local"

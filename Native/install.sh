@@ -27,10 +27,11 @@ check() { if [ -n "${2:-}" ]; then echo "  OK      $1"; else echo "  MISSING $1"
 
 check "stockfish"        "$(command -v stockfish || ([ -x /usr/games/stockfish ] && echo y))"
 check "lc0"              "$([ -x "$BASE/Engine/lc0" ] && echo y)"
-check "maia-1500 net"    "$([ -r "$BASE/Engine/maia-chess/maia_weights/maia-1500.pb.gz" ] && echo y)"
+check "Maia 1100-1900"   "$([ -r "$BASE/Engine/maia-chess/maia_weights/maia-1100.pb.gz" ] && [ -r "$BASE/Engine/maia-chess/maia_weights/maia-1900.pb.gz" ] && echo y)"
 check "PyQt6"            "$(python3 -c 'import PyQt6' 2>/dev/null && echo y)"
 
 echo
 echo "Load the extension: about:debugging -> This Firefox -> Load Temporary Add-on"
 echo "  -> pick $BASE/../Extension/manifest.json"
-echo "Log: /tmp/chess-listener.log"
+echo "Debug logs are disabled by default."
+echo "Set CHESSLISTENER_DEBUG=1 in the native host environment to enable /tmp logs."

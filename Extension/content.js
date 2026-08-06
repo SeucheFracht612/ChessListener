@@ -22,8 +22,6 @@ let captureTimer = null;
 let lastSentPosition = null;
 let pointerIsDown = false;
 
-console.log("[ChessListener] content script loaded.");
-
 function IsGamePage() {
     return (
         window.location.pathname.startsWith("/play/") ||
@@ -153,9 +151,6 @@ function ReadBoardPosition(board) {
     };
 }
 
-function FormatBoard(position) {
-    return position.match(/.{8}/g)?.join("\n") ?? position;
-}
 
 function ScheduleCapture() {
     if (activeBoard === null || pointerIsDown) {
@@ -224,18 +219,7 @@ async function CaptureStablePosition() {
     };
 
     try {
-        console.log(
-            "[ChessListener] sending position:\n" +
-            FormatBoard(message.board)
-        );
-
-        const response =
         await browser.runtime.sendMessage(message);
-
-        console.log(
-            "[ChessListener] background acknowledged position:",
-            response
-        );
 
         /*
          * Only mark it as sent after successful communication.
@@ -263,13 +247,8 @@ function AttachToBoard(board) {
     lastSentPosition = null;
 
     if (activeBoard === null) {
-        console.log("[ChessListener] no active game board found.");
         return;
     }
-
-    console.log(
-        `[ChessListener] attached to board #${activeBoard.id}`
-    );
 
     boardObserver = new MutationObserver(() => {
         ScheduleCapture();

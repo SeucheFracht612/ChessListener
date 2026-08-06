@@ -1699,20 +1699,30 @@ static void HandleMessage(
 
 int main(void)
 {
-    FILE *logFile = fopen(LOG_PATH, "a");
+    const char *debug = getenv("CHESSLISTENER_DEBUG");
+    const char *logPath =
+        debug != NULL && strcmp(debug, "1") == 0
+            ? LOG_PATH
+            : "/dev/null";
+    FILE *logFile = fopen(logPath, "a");
 
     if (logFile == NULL) {
         return EXIT_FAILURE;
     }
 
     /*
-     * Unbuffered stdin is required, not merely tidier: the stale-position
-     * check in analysis.c uses poll() on this descriptor, and poll() cannot
-     * see bytes that stdio has already pulled into a FILE buffer.
+     * Unbuffered stdin. This used to be load bearing: analysis.c polled this
+     * descriptor to spot a queued position, and poll() cannot see bytes stdio
+     * has already pulled into a FILE buffer. That check is gone -- the engine
+     * runs on its own thread now and the loop below never stalls -- but
+     * reading straight from the pipe is still the honest thing to do here.
      */
     setvbuf(stdin, NULL, _IONBF, 0);
 
-    AnalysisStart(logFile);
+    if (!AnalysisStart(logFile)) {
+        fclose(logFile);
+        return EXIT_SUCCESS;
+    }
 
     Position position = {0};
     int hasPosition = 0;

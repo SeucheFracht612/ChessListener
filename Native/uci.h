@@ -1,5 +1,17 @@
 /* uci.h -- persistent UCI client. Works for lc0+Maia and for Stockfish.
- * Replaces maia.h; delete maia.c/maia.h once you've switched over. */
+ *
+ * Two usage modes:
+ *
+ *   Blocking, one shot (Maia: "go nodes 1", finishes in milliseconds):
+ *       uci_analyse() / uci_bestmove()
+ *
+ *   Streaming, interruptible (Stockfish: "go infinite", read info lines as
+ *   they arrive, abort the moment the board moves on):
+ *       uci_search_begin() -> uci_search_poll() ... -> uci_search_abort()
+ *
+ * The streaming mode is what lets the overlay follow a premove burst: no
+ * search ever pins the caller for longer than one poll timeout.
+ */
 #ifndef UCI_H
 #define UCI_H
 
@@ -26,6 +38,7 @@ typedef struct {
 } UciConfig;
 
 #define UCI_PV_MAX 512
+#define UCI_LINES_MAX 5
 
 typedef struct {
     int  multipv;            /* 1-based rank                             */
@@ -41,11 +54,41 @@ typedef struct {
 
 UciEngine *uci_start(const UciConfig *cfg);
 
+/* ---- blocking one-shot (Maia) ---- */
+
 /* Fills lines[0..n-1] ranked best first. Returns the count, or negative on
  * error. lines[0].move always matches the engine's own bestmove. */
 int uci_analyse(UciEngine *e, const char *fen, UciLine *lines, int max);
 
 int uci_bestmove(UciEngine *e, const char *fen, char *out, size_t outsz);
+
+/* ---- streaming, interruptible (Stockfish) ---- */
+
+/* Clears the accumulator and issues "position fen ... / go infinite".
+ * Returns 0, or -2 if the engine has gone away. */
+int uci_search_begin(UciEngine *e, const char *fen);
+
+/* Consumes whatever the engine has emitted, waiting at most timeout_ms for
+ * the first line. Never blocks longer than that.
+ *   *updated  set when at least one ranked line changed
+ *   *finished set when the engine emitted bestmove (search is over)
+ * Returns 0, -1 protocol, -2 engine died, -4 terminal position.
+ * A quiet engine is not an error: 0 with *updated == 0. */
+int uci_search_poll(UciEngine *e, int timeout_ms, int *updated, int *finished);
+
+/* Sends "stop" and consumes up to and including bestmove, so the engine is
+ * clean for the next "position". Safe to call when no search is running. */
+int uci_search_abort(UciEngine *e);
+
+/* Ranked lines accumulated by the current (or last) search. */
+const UciLine *uci_lines(const UciEngine *e, int *count);
+
+/* Highest depth reported by the current search, 0 if none yet. */
+int uci_depth(const UciEngine *e);
+
+/* setoption. Only safe between searches -- call uci_search_abort() first. */
+int uci_set_option(UciEngine *e, const char *name, const char *value);
+int uci_set_multipv(UciEngine *e, int multipv);
 
 /* Convert a side-to-move score to white's POV, for a stable overlay. */
 int uci_cp_white(const UciLine *l, const char *fen);
