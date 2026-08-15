@@ -109,6 +109,15 @@ required_missing() {
     REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
 }
 
+is_managed_install_prefix() {
+    [ -d "$INSTALL_PREFIX" ] &&
+        [ ! -L "$INSTALL_PREFIX" ] &&
+        [ -f "$INSTALL_PREFIX/.chess-listener-install" ] &&
+        [ ! -L "$INSTALL_PREFIX/.chess-listener-install" ] &&
+        [ "$(cat "$INSTALL_PREFIX/.chess-listener-install")" = \
+            "ChessListener user installation" ]
+}
+
 find_stockfish() {
     if [ -x /usr/games/stockfish ]; then
         printf '%s\n' /usr/games/stockfish
@@ -294,8 +303,13 @@ check_optional_maia() {
         if validate_maia_at "$SCRIPT_DIR"; then
             optional "Local Maia runtime available: $MAIA_REASON"
             return
+        elif is_managed_install_prefix && \
+             validate_maia_at "$INSTALL_PREFIX"; then
+            optional "Preserving installed Maia runtime: $MAIA_REASON"
+            return
         fi
-    elif validate_maia_at "$INSTALL_PREFIX"; then
+    elif is_managed_install_prefix && \
+         validate_maia_at "$INSTALL_PREFIX"; then
         optional "Maia installed: $MAIA_REASON"
         return
     elif [ "$SCRIPT_DIR" != "$INSTALL_PREFIX" ] && \
@@ -315,8 +329,7 @@ check_installed_files() {
     local expected_host="$INSTALL_PREFIX/chess-listener-host"
 
     echo "Installed native host"
-    if [ -f "$INSTALL_PREFIX/.chess-listener-install" ] && \
-       [ "$(sed -n '1p' "$INSTALL_PREFIX/.chess-listener-install")" = "ChessListener user installation" ]; then
+    if is_managed_install_prefix; then
         ok "installation marker ($INSTALL_PREFIX)"
     else
         required_missing "ChessListener installation at $INSTALL_PREFIX"
@@ -415,7 +428,7 @@ if [ -e "$INSTALL_PREFIX" ] && [ ! -d "$INSTALL_PREFIX" ]; then
     exit 1
 fi
 if [ -d "$INSTALL_PREFIX" ] && \
-   [ ! -f "$INSTALL_PREFIX/.chess-listener-install" ] && \
+   ! is_managed_install_prefix && \
    [ -n "$(find "$INSTALL_PREFIX" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
     echo "error: refusing to overwrite an unmarked non-empty directory: $INSTALL_PREFIX" >&2
     exit 1
@@ -443,30 +456,34 @@ install -m 0755 "$SCRIPT_DIR/install.sh" "$INSTALL_PREFIX/install.sh"
 install -m 0755 "$SCRIPT_DIR/update.sh" "$INSTALL_PREFIX/update.sh"
 install -m 0755 "$SCRIPT_DIR/uninstall.sh" "$INSTALL_PREFIX/uninstall.sh"
 
-if [ -n "$MAIA_SOURCE" ] && [ "$MAIA_SOURCE" != "$INSTALL_PREFIX" ]; then
-    install -d -m 0755 \
-        "$INSTALL_PREFIX/Engine/maia-chess/maia_weights"
-    install -m 0755 "$MAIA_SOURCE/Engine/lc0" "$INSTALL_PREFIX/Engine/lc0"
-    for rating in 1100 1200 1300 1400 1500 1600 1700 1800 1900; do
-        install -m 0644 \
-            "$MAIA_SOURCE/Engine/maia-chess/maia_weights/maia-$rating.pb.gz" \
-            "$INSTALL_PREFIX/Engine/maia-chess/maia_weights/maia-$rating.pb.gz"
-    done
-    if [ -d "$MAIA_SOURCE/Engine/lib" ]; then
-        install -d -m 0755 "$INSTALL_PREFIX/Engine/lib"
-        cp -a "$MAIA_SOURCE/Engine/lib/." "$INSTALL_PREFIX/Engine/lib/"
+if [ -n "$MAIA_SOURCE" ]; then
+    if [ "$MAIA_SOURCE" = "$INSTALL_PREFIX" ]; then
+        echo "  preserved validated installed Maia runtime"
+    else
+        install -d -m 0755 \
+            "$INSTALL_PREFIX/Engine/maia-chess/maia_weights"
+        install -m 0755 "$MAIA_SOURCE/Engine/lc0" "$INSTALL_PREFIX/Engine/lc0"
+        for rating in 1100 1200 1300 1400 1500 1600 1700 1800 1900; do
+            install -m 0644 \
+                "$MAIA_SOURCE/Engine/maia-chess/maia_weights/maia-$rating.pb.gz" \
+                "$INSTALL_PREFIX/Engine/maia-chess/maia_weights/maia-$rating.pb.gz"
+        done
+        if [ -d "$MAIA_SOURCE/Engine/lib" ]; then
+            install -d -m 0755 "$INSTALL_PREFIX/Engine/lib"
+            cp -a "$MAIA_SOURCE/Engine/lib/." "$INSTALL_PREFIX/Engine/lib/"
+        fi
+        echo "  installed optional Maia runtime"
     fi
-    echo "  installed optional Maia runtime"
 else
-    # The stable prefix is installer-owned. Remove any legacy managed Maia
-    # payload rather than silently retaining the unproven binary removed in
-    # 0.2.1; a user who wants Maia supplies a validated local source runtime.
+    # The stable prefix is installer-owned. Remove any managed Maia payload
+    # that could not be fully validated rather than retaining a broken or
+    # unproven runtime.
     rm -f -- "$INSTALL_PREFIX/Engine/lc0"
     for rating in 1100 1200 1300 1400 1500 1600 1700 1800 1900; do
         rm -f -- \
             "$INSTALL_PREFIX/Engine/maia-chess/maia_weights/maia-$rating.pb.gz"
     done
-    echo "  optional Maia runtime not installed (legacy managed payload removed)"
+    echo "  optional Maia runtime not installed (invalid managed payload removed)"
 fi
 
 python3 - "$SCRIPT_DIR/local.chess_listener.json" "$MANIFEST_PATH" \

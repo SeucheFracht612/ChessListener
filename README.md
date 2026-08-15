@@ -135,9 +135,12 @@ The resolved manifest directory is recorded inside the marked runtime. Its
 installed `--check`, `update.sh`, and `uninstall.sh` reuse that exact directory
 without requiring the environment variable again.
 
-By default a missing, invalid, or incomplete user-provided Maia runtime is
-reported as optional and ChessListener continues with Stockfish. To make Maia
-mandatory for a particular installation:
+By default Maia is optional. A fully validated Maia runtime in the source
+checkout replaces the installed copy. When reinstalling from a source archive
+that contains no Maia payload, an already-installed runtime is preserved only
+if all nine nets still pass the complete validation. If neither copy validates,
+the incomplete managed payload is removed and ChessListener continues with
+Stockfish. To make Maia mandatory for a particular installation:
 
 ```bash
 ./Native/install.sh --require-maia
@@ -324,6 +327,13 @@ ldd Native/Engine/lc0
 
 `ldd` must not contain `not found`. More engine-layout detail is in
 [`Native/Engine/README.md`](Native/Engine/README.md).
+
+A fresh source ZIP cannot provision Maia because Git archives do not contain
+submodule contents and ChessListener does not distribute an lc0 binary. It can
+preserve a fully validated Maia runtime already in the marked installation.
+If an earlier reinstall already removed that runtime, restore it once from your
+known working checkout (or rebuild lc0 and initialize the Maia submodule), then
+run `./Native/install.sh --require-maia`.
 
 ### The extension vanished after restart
 

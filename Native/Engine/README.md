@@ -66,9 +66,12 @@ The installer does more than check filenames. It requires all nine rating nets
 (1100, 1200, …, 1900), validates every gzip stream, checks the user-provided
 lc0's dynamic dependencies, and completes a bounded UCI handshake with **each**
 rating net. Maia is copied to the stable runtime only after every check passes.
-The local `Native/Engine/lc0` file stays untracked. Because each engine start
-has its own 30-second ceiling, validation can take several minutes on a broken
-or unusually slow lc0 build; failures identify the exact rating.
+On reinstall, a valid source runtime is preferred; if the source archive has no
+Maia payload, an existing runtime in the marked installation is preserved only
+after the same complete validation. Invalid or incomplete managed payloads are
+removed. The local `Native/Engine/lc0` file stays untracked. Because each engine
+start has its own 30-second ceiling, validation can take several minutes on a
+broken or unusually slow lc0 build; failures identify the exact rating.
 
 To inspect the handshake manually:
 

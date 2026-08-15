@@ -11,6 +11,8 @@
 - Made native and extension tests deterministic and added clean-build CI.
 - Added validated, idempotent user installation plus diagnostics, update, and
   guarded uninstall paths.
+- Preserved a fully validated installed Maia runtime when reinstalling from a
+  source archive without optional engine payloads.
 - Repaired engine submodule metadata and documented required Stockfish versus
   optional Maia dependencies.
 - Removed the unproven prebuilt lc0 binary; `Native/Engine/lc0` is now an

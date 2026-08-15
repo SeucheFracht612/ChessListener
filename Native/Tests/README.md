@@ -12,9 +12,11 @@ Node-based protocol tests when present.
 `test_install_lifecycle.py` creates an isolated marked runtime with a custom
 install prefix and Firefox manifest directory. It verifies installed
 diagnostics, update delegation/path persistence, uninstall dry-run, refusal to
-touch an unmarked directory, and removal of only the recognized runtime and
-manifest. It uses fake local dependencies and never changes the real user
-installation.
+touch unmarked or symlinked directories, and removal of only the recognized
+runtime and manifest. It also performs ZIP-style reinstalls with a fake Maia
+runtime, proving that validated lc0, all nine nets, and local libraries are
+preserved byte-for-byte while incomplete payloads are removed. It uses fake
+local dependencies and never changes the real user installation.
 
 `e2e.py` drives `chess-listener-host` from both ends at once: it speaks the
 browser's length-prefixed native-messaging protocol (including the version
