@@ -1,0 +1,6 @@
+[submodule "Native/Engine/lc0-src"]
+	path = Native/Engine/lc0-src
+	url = https://github.com/LeelaChessZero/lc0.git
+[submodule "Native/Engine/maia-chess"]
+	path = Native/Engine/maia-chess
+	url = https://github.com/CSSLab/maia-chess.git

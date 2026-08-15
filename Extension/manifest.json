@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChessListener",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Provides a local live-analysis overlay for Chess.com games you are spectating.",
   "permissions": [
     "nativeMessaging"

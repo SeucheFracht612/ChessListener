@@ -1,22 +1,102 @@
 # Native messaging host for ChessListener.
-# main.c is the host (browser length-prefix framing); uci.c is the engine glue.
-# analysis.c runs the engines on their own thread, so -pthread is required.
 
-CC      ?= cc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -pthread
-LDFLAGS ?= -pthread
-TARGET   = chess-listener-host
-OBJS     = main.o uci.o overlay.o analysis.o
+CC        ?= cc
+PYTHON    ?= python3
+NODE      ?= node
+TARGET    ?= chess-listener-host
+BUILD_DIR ?= .build/release
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+CPPFLAGS ?=
+CFLAGS   ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -pthread
+LDFLAGS  ?=
+LDLIBS   ?= -pthread
 
-main.o:      main.c     analysis.h
-analysis.o:  analysis.c analysis.h uci.h overlay.h
-uci.o:       uci.c      uci.h
-overlay.o:   overlay.c  overlay.h uci.h
+SOURCES := main.c uci.c overlay.c analysis.c
+OBJECTS := $(addprefix $(BUILD_DIR)/,$(SOURCES:.c=.o))
+DEPS    := $(OBJECTS:.o=.d)
+
+.DEFAULT_GOAL := all
+
+.PHONY: all clean check check-python check-js check-shell test test-js debug asan
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+# Parse source files without importing PyQt or writing __pycache__ directories.
+check-python:
+	$(PYTHON) -c 'import ast, pathlib, sys; files = [pathlib.Path(name) for name in sys.argv[1:]]; [ast.parse(path.read_text(encoding="utf-8"), filename=str(path)) for path in files]; print(f"Python syntax: {len(files)} files OK")' overlay.py san.py Tests/*.py
+
+check-js:
+	$(NODE) --check ../Extension/background.js
+	$(NODE) --check ../Extension/content.js
+	@for file in ../Extension/Tests/*.js; do \
+		[ -e "$$file" ] || continue; \
+		$(NODE) --check "$$file"; \
+	done
+
+check-shell:
+	bash -n install.sh uninstall.sh update.sh
+
+check: check-python check-js check-shell
+
+test-js:
+	@if [ -f ../Extension/Tests/test_background.js ]; then \
+		echo "Running Extension/Tests/test_background.js"; \
+		$(NODE) ../Extension/Tests/test_background.js; \
+	else \
+		echo "No extension tests found"; \
+	fi
+
+# -B is deliberate: tests must exercise objects compiled from the current
+# checkout, never old or accidentally committed build products.
+test:
+	$(MAKE) --no-print-directory -B $(TARGET)
+	$(MAKE) --no-print-directory check
+	$(MAKE) --no-print-directory test-js
+	$(PYTHON) Tests/test_install_lifecycle.py
+	$(PYTHON) Tests/test_san.py
+	CHESSLISTENER_HOST="$(abspath $(TARGET))" \
+	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
+		$(PYTHON) Tests/test_catchup.py
+	CHESSLISTENER_HOST="$(abspath $(TARGET))" \
+	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
+		$(PYTHON) Tests/e2e.py
+
+debug:
+	$(MAKE) --no-print-directory -B \
+		BUILD_DIR=.build/debug \
+		TARGET=chess-listener-host-debug \
+		CFLAGS='-std=c11 -O0 -g3 -Wall -Wextra -Wpedantic -pthread'
+
+asan:
+	$(MAKE) --no-print-directory -B \
+		BUILD_DIR=.build/asan \
+		TARGET=chess-listener-host-asan \
+		CFLAGS='-std=c11 -O1 -g3 -Wall -Wextra -Wpedantic -pthread -fno-omit-frame-pointer -fsanitize=address,undefined' \
+		LDFLAGS='-fsanitize=address,undefined'
+	ASAN_OPTIONS='detect_leaks=0:halt_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+	CHESSLISTENER_HOST="$(abspath chess-listener-host-asan)" \
+	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
+		$(PYTHON) Tests/test_catchup.py
+	ASAN_OPTIONS='detect_leaks=0:halt_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+	CHESSLISTENER_HOST="$(abspath chess-listener-host-asan)" \
+	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
+		$(PYTHON) Tests/e2e.py
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -rf .build
+	rm -f chess-listener-host chess-listener-host-debug chess-listener-host-asan
+	rm -f main.o uci.o overlay.o analysis.o
+	rm -rf __pycache__ Tests/__pycache__
 
-.PHONY: clean
+-include $(DEPS)

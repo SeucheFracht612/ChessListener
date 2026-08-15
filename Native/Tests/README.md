@@ -1,36 +1,50 @@
-# Native host tests
+# ChessListener tests
+
+Run the complete suite from the repository root:
+
+    make test
+
+The test target forcibly recompiles the native host before running anything,
+so old object files or a checked-in executable cannot hide a broken checkout.
+It also checks Python, JavaScript, and shell syntax and runs the extension's
+Node-based protocol tests when present.
+
+`test_install_lifecycle.py` creates an isolated marked runtime with a custom
+install prefix and Firefox manifest directory. It verifies installed
+diagnostics, update delegation/path persistence, uninstall dry-run, refusal to
+touch an unmarked directory, and removal of only the recognized runtime and
+manifest. It uses fake local dependencies and never changes the real user
+installation.
 
 `e2e.py` drives `chess-listener-host` from both ends at once: it speaks the
-browser's length-prefixed native-messaging protocol on one side, and
-`stub_overlay.py` stands in for `overlay.py` on the other.
+browser's length-prefixed native-messaging protocol (including the version
+handshake) on one side, while `stub_overlay.py` stands in for `overlay.py` on
+the other. `fake_uci_engine.py` is a deterministic UCI engine, so neither a
+system Stockfish installation nor network access is required.
 
-It exists because of one specific regression class: the host used to run the
-engine synchronously inside its message loop, so a fast sequence of moves
-stalled everything. These checks fail if that ever comes back.
-
-    # needs a stockfish binary on the system
-    GAP=0.04 BUDGET=600 python3 Tests/e2e.py
+The integration checks fail if the host stalls the browser while analysis is
+running, drops board frames during a burst, publishes stale analysis as final,
+or fails to apply a live settings change.
 
 What it asserts:
 
-* every position message is answered in under 150 ms (it is normally under 5)
+* ordinary single-ply e2e messages are answered in under 250 ms (normally <5)
+* skipped-snapshot catch-up completes within its separate 2-second bound
 * every position reaches the overlay as a board frame, none are lost in a burst
 * evaluations are published, and the last one belongs to the last position
 * a live `SET` sent mid-session is acknowledged
 
 Knobs:
 
-* `GAP` - seconds between moves. `0.008` is faster than any real premove burst.
-* `BUDGET` - Stockfish milliseconds per position. `0` means Continuous.
+* `GAP` - optional seconds between moves; the default of `0` creates a burst.
+* `CHESSLISTENER_TEST_TIMEOUT` - total deadline for asynchronous overlay state.
+* `CHESSLISTENER_TEST_MESSAGE_TIMEOUT` - deadline for one native response.
 
-Worth running under ThreadSanitizer after touching the threading:
+For a debug build, or to build and run the integration checks under
+AddressSanitizer and UndefinedBehaviorSanitizer:
 
-    make clean
-    make CFLAGS="-std=c11 -O1 -g -Wall -Wextra -pthread -fsanitize=thread" \
-         LDFLAGS="-pthread -fsanitize=thread"
-    TSAN_OPTIONS="halt_on_error=0 log_path=/tmp/tsan" python3 Tests/e2e.py
-    make clean && make          # do not ship the sanitizer build
+    make debug
+    make asan
 
-Maia is not covered: the sandbox this was written in has no lc0 build, so
-`CHESSLISTENER_LC0` is pointed at a nonexistent path and the host exercises the
-Stockfish-only path.
+Maia is intentionally disabled in these tests. The host exercises its
+Stockfish-only fallback while avoiding the large lc0 binary and weight files.

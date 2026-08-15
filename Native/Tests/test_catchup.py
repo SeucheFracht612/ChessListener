@@ -1,51 +1,20 @@
-"""Skipped-snapshot recovery.
-
-content.js debounces for 120 ms and double-reads for another 75 ms before it
-sends, so anything faster than roughly a move every 200 ms arrives as a single
-board frame that is several plies ahead. The host used to match exactly one
-legal move against the new board, and on failure it *kept its stale position* --
-so one skipped snapshot made every later frame fail too and the overlay stayed
-frozen on an old position for the rest of the game.
-
-Every case here is a gap the old code could not survive.
-
-    python3 Tests/test_catchup.py
-"""
+"""Skipped-snapshot recovery checks for the native position tracker."""
 
 import os
-import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from e2e import HOST, INITIAL, apply_move, recv, send
+from e2e import INITIAL, apply_move, recv, send, start_host, stop_host
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 
 OPENING = [
     "e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6",
     "d2d3", "f8c5", "c2c3", "d7d6", "b1d2", "e8g8",
     "e1g1", "c8e6", "c4b3", "d8d7", "h2h3", "a7a6", "f1e1",
 ]
-
-
-def start_host():
-    environment = dict(os.environ)
-    environment.update(
-        CHESSLISTENER_OVERLAY=os.path.join(HERE, "stub_overlay.py"),
-        CHESSLISTENER_STOCKFISH="/usr/games/stockfish",
-        CHESSLISTENER_LC0="/nonexistent",
-        CHESSLISTENER_STUB_LOG=os.path.join(HERE, "catchup_frames.jsonl"),
-    )
-    open(environment["CHESSLISTENER_STUB_LOG"], "w").close()
-
-    return subprocess.Popen(
-        [HOST],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        env=environment,
-    )
 
 
 def snapshot(proc, board):
@@ -58,110 +27,106 @@ def snapshot(proc, board):
 
 
 def run_case(gap_plies, moves_after_gap=4):
-    """Play a few moves, drop `gap_plies` worth of snapshots, then continue.
+    """Drop ``gap_plies`` snapshots and verify subsequent tracking.
 
-    Returns (reason_at_gap, [reasons after the gap], seconds spent on the gap).
+    Returns ``(reason_at_gap, reasons_after_gap, seconds_at_gap)``.
     """
-    proc = start_host()
-    board = INITIAL
-    index = 0
+    with tempfile.TemporaryDirectory(prefix="chess-listener-catchup-") as temp:
+        proc = start_host(os.path.join(temp, "frames.jsonl"))
+        try:
+            board = INITIAL
+            index = 0
+            snapshot(proc, board)
 
-    snapshot(proc, board)
+            # Two clean moves first, so the tracker is definitely locked on.
+            for _ in range(2):
+                board = apply_move(board, OPENING[index])
+                index += 1
+                snapshot(proc, board)
 
-    # Two clean moves first, so the tracker is definitely locked on.
-    for _ in range(2):
-        board = apply_move(board, OPENING[index])
-        index += 1
-        snapshot(proc, board)
+            # Apply the gap, but send only its final board.
+            for _ in range(gap_plies):
+                board = apply_move(board, OPENING[index])
+                index += 1
 
-    # The gap: apply the moves but send only the final board.
-    for _ in range(gap_plies):
-        board = apply_move(board, OPENING[index])
-        index += 1
+            began = time.monotonic()
+            gap_reason = snapshot(proc, board)["reason"]
+            elapsed = time.monotonic() - began
 
-    began = time.monotonic()
-    gap_reason = snapshot(proc, board)["reason"]
-    elapsed = time.monotonic() - began
+            after = []
+            for _ in range(moves_after_gap):
+                board = apply_move(board, OPENING[index])
+                index += 1
+                after.append(snapshot(proc, board)["reason"])
 
-    after = []
-
-    for _ in range(moves_after_gap):
-        board = apply_move(board, OPENING[index])
-        index += 1
-        after.append(snapshot(proc, board)["reason"])
-
-    proc.stdin.close()
-    proc.wait(timeout=10)
-    return gap_reason, after, elapsed
+            return gap_reason, after, elapsed
+        finally:
+            stop_host(proc)
 
 
 def main():
     failures = []
 
-    # A gap the search can reconstruct exactly.
+    # Gaps inside the reconstruction limit must be recovered exactly.
     for gap in (2, 3, 4, 5, 6):
         reason, after, elapsed = run_case(gap)
-        recovered = all(r == "move_recorded" for r in after)
-        print(f"gap of {gap} plies -> {reason:<17} "
-              f"then {'all tracked' if recovered else after}  "
-              f"({elapsed * 1000:.0f} ms)")
+        recovered = all(item == "move_recorded" for item in after)
+        print(
+            f"gap of {gap} plies -> {reason:<17} "
+            f"then {'all tracked' if recovered else after}  "
+            f"({elapsed * 1000:.0f} ms)"
+        )
 
         if reason != "move_recorded":
             failures.append(f"{gap}-ply gap was not reconstructed ({reason})")
-
         if not recovered:
             failures.append(f"did not track cleanly after a {gap}-ply gap")
-
         if elapsed > 2.0:
             failures.append(f"{gap}-ply search took {elapsed:.1f}s")
 
-    # A gap past the search cap. Exact reconstruction is impossible, so the
-    # requirement is only that it resynchronises and keeps working -- the old
-    # code went dead here permanently.
+    # Past the search cap, exact reconstruction is optional, but the tracker
+    # must resynchronise and continue instead of freezing permanently.
     for gap in (8, 11):
         reason, after, elapsed = run_case(gap)
         print(f"gap of {gap} plies -> {reason:<17} then {after}")
 
         if reason == "move_recorded":
-            # Deep gaps can still be reachable by luck; that is fine.
             recovered_from = 0
         elif reason == "resynchronising":
-            # One frame of downtime is the documented cost, then it must track.
             recovered_from = 1
         else:
             failures.append(f"{gap}-ply gap gave an unexpected {reason}")
             continue
 
         tail = after[recovered_from:]
+        if not tail or not all(item == "move_recorded" for item in tail):
+            failures.append(f"never recovered after a {gap}-ply gap: {after}")
 
-        if not tail or not all(r == "move_recorded" for r in tail):
-            failures.append(
-                f"never recovered after a {gap}-ply gap: {after}"
-            )
+        if elapsed > 2.0:
+            failures.append(f"{gap}-ply recovery took {elapsed:.1f}s")
 
-    # Back-to-back gaps, which is what a long premove chain actually looks like.
-    proc = start_host()
-    board = INITIAL
-    snapshot(proc, board)
-    index = 0
-    reasons = []
+    # Back-to-back gaps model a long premove chain.
+    with tempfile.TemporaryDirectory(prefix="chess-listener-catchup-") as temp:
+        proc = start_host(os.path.join(temp, "frames.jsonl"))
+        try:
+            board = INITIAL
+            snapshot(proc, board)
+            index = 0
+            reasons = []
 
-    for _ in range(4):
-        for _ in range(2):
-            board = apply_move(board, OPENING[index])
-            index += 1
+            for _ in range(4):
+                for _ in range(2):
+                    board = apply_move(board, OPENING[index])
+                    index += 1
+                reasons.append(snapshot(proc, board)["reason"])
+        finally:
+            stop_host(proc)
 
-        reasons.append(snapshot(proc, board)["reason"])
-
-    proc.stdin.close()
-    proc.wait(timeout=10)
     print(f"four 2-ply gaps in a row -> {reasons}")
-
-    if not all(r == "move_recorded" for r in reasons):
+    if not all(reason == "move_recorded" for reason in reasons):
         failures.append(f"consecutive gaps not handled: {reasons}")
 
     print()
-
     if failures:
         for failure in failures:
             print("FAIL:", failure)

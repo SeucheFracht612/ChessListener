@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "analysis.h"
+#include "version.h"
 
 #define MAX_MESSAGE_SIZE (1024U * 1024U)
 #define LOG_PATH "/tmp/chess-listener.log"
@@ -272,6 +273,68 @@ static int ExtractJsonBoolField(
     }
 
     return 0;
+}
+
+/* Same restricted parser, for a base-10 integer field. */
+static int ExtractJsonIntField(
+    const char *json,
+    const char *fieldName,
+    int *valueOut)
+{
+    char key[64];
+    int keyLength;
+    const char *cursor;
+    char *end;
+    long value;
+
+    if (json == NULL || fieldName == NULL || valueOut == NULL) {
+        return 0;
+    }
+
+    keyLength = snprintf(key, sizeof(key), "\"%s\"", fieldName);
+
+    if (keyLength < 0 || (size_t)keyLength >= sizeof(key)) {
+        return 0;
+    }
+
+    cursor = strstr(json, key);
+
+    if (cursor == NULL) {
+        return 0;
+    }
+
+    cursor += (size_t)keyLength;
+
+    while (isspace((unsigned char)*cursor) != 0) {
+        cursor += 1;
+    }
+
+    if (*cursor != ':') {
+        return 0;
+    }
+
+    cursor += 1;
+
+    while (isspace((unsigned char)*cursor) != 0) {
+        cursor += 1;
+    }
+
+    value = strtol(cursor, &end, 10);
+
+    if (end == cursor || value < 0L || value > 999L) {
+        return 0;
+    }
+
+    while (isspace((unsigned char)*end) != 0) {
+        end += 1;
+    }
+
+    if (*end != ',' && *end != '}') {
+        return 0;
+    }
+
+    *valueOut = (int)value;
+    return 1;
 }
 
 static int IsWhitePiece(char piece)
@@ -1651,6 +1714,83 @@ static int WriteResponse(
     return written >= 0 && (size_t)written < MAX_RESPONSE_LENGTH;
 }
 
+enum {
+    HELLO_REJECTED = -1,
+    HELLO_NOT_RECEIVED = 0,
+    HELLO_ACCEPTED = 1
+};
+
+/* Validate the browser/host protocol before launching the overlay or engines.
+ * This keeps incompatible components from appearing to work while silently
+ * disagreeing about message fields. */
+static int HandleHello(
+    const char *message,
+    FILE *logFile,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    char type[32];
+    int protocol;
+    int written;
+
+    if (!ExtractJsonStringField(message, "type", type, sizeof(type)) ||
+        strcmp(type, "hello") != 0) {
+        written = snprintf(
+            response,
+            MAX_RESPONSE_LENGTH,
+            "{\"type\":\"error\",\"ok\":false,"
+            "\"reason\":\"hello_required\",\"protocol_version\":%d,"
+            "\"host_version\":\"%s\"}",
+            CHESSLISTENER_PROTOCOL_VERSION,
+            CHESSLISTENER_HOST_VERSION);
+
+        fprintf(logFile, "Rejected message before protocol hello.\n");
+        fflush(logFile);
+        return written >= 0 && (size_t)written < MAX_RESPONSE_LENGTH
+            ? HELLO_NOT_RECEIVED
+            : HELLO_REJECTED;
+    }
+
+    if (!ExtractJsonIntField(message, "protocol_version", &protocol) ||
+        protocol != CHESSLISTENER_PROTOCOL_VERSION) {
+        written = snprintf(
+            response,
+            MAX_RESPONSE_LENGTH,
+            "{\"type\":\"hello\",\"ok\":false,"
+            "\"reason\":\"incompatible_protocol\","
+            "\"protocol_version\":%d,\"host_version\":\"%s\"}",
+            CHESSLISTENER_PROTOCOL_VERSION,
+            CHESSLISTENER_HOST_VERSION);
+
+        fprintf(
+            logFile,
+            "Rejected incompatible protocol hello; host requires protocol %d.\n",
+            CHESSLISTENER_PROTOCOL_VERSION);
+        fflush(logFile);
+        return HELLO_REJECTED;
+    }
+
+    written = snprintf(
+        response,
+        MAX_RESPONSE_LENGTH,
+        "{\"type\":\"hello\",\"ok\":true,\"protocol_version\":%d,"
+        "\"host_version\":\"%s\",\"capabilities\":["
+        "\"position_snapshot\",\"last_move\",\"streaming_analysis\"]}",
+        CHESSLISTENER_PROTOCOL_VERSION,
+        CHESSLISTENER_HOST_VERSION);
+
+    if (written < 0 || (size_t)written >= MAX_RESPONSE_LENGTH) {
+        return HELLO_REJECTED;
+    }
+
+    fprintf(
+        logFile,
+        "Protocol %d hello accepted (host %s).\n",
+        CHESSLISTENER_PROTOCOL_VERSION,
+        CHESSLISTENER_HOST_VERSION);
+    fflush(logFile);
+    return HELLO_ACCEPTED;
+}
+
 /*
  * Holds the first frame seen when we join a game already in progress. See
  * InferMovedColor: two frames are needed before a position can be adopted.
@@ -1690,192 +1830,193 @@ static void HandleMessage(
         boardString,
         sizeof(boardString))) {
         fprintf(logFile, "Rejected position without a valid board field.\n");
-    fflush(logFile);
-    (void)WriteResponse(response, 0, "invalid_board_field", NULL, NULL);
-    return;
-        }
+        fflush(logFile);
+        (void)WriteResponse(response, 0, "invalid_board_field", NULL, NULL);
+        return;
+    }
 
-        (void)ExtractJsonBoolField(message, "visually_flipped", &visuallyFlipped);
+    (void)ExtractJsonBoolField(message, "visually_flipped", &visuallyFlipped);
 
-        size_t pieceCount = 0U;
+    size_t pieceCount = 0U;
 
-        if (!ValidateBoardString(boardString, &pieceCount)) {
-            fprintf(logFile, "Rejected invalid board: %s\n", boardString);
-            fflush(logFile);
-            (void)WriteResponse(response, 0, "invalid_board", NULL, NULL);
+    if (!ValidateBoardString(boardString, &pieceCount)) {
+        fprintf(logFile, "Rejected invalid board: %s\n", boardString);
+        fflush(logFile);
+        (void)WriteResponse(response, 0, "invalid_board", NULL, NULL);
+        return;
+    }
+
+    if (
+        *hasPosition &&
+        memcmp(position->board, boardString, BOARD_SQUARE_COUNT) == 0
+    ) {
+        fprintf(logFile, "Ignored duplicate position.\n");
+        fflush(logFile);
+        (void)WriteResponse(response, 0, "duplicate", NULL, NULL);
+        return;
+    }
+
+    if (memcmp(boardString, INITIAL_BOARD, BOARD_SQUARE_COUNT) == 0) {
+        char fen[MAX_FEN_LENGTH];
+
+        InitializePosition(position);
+        *hasPosition = 1;
+
+        if (!PositionToFen(position, fen)) {
+            (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
             return;
         }
 
+        hasPendingBoard = 0;
+
+        fprintf(logFile, "\n=== New standard game ===\n");
+        LogBoard(logFile, position->board, pieceCount);
+        fprintf(logFile, "FEN: %s\n", fen);
+        fflush(logFile);
+
+        AnalysisPublish(fen, visuallyFlipped, NULL);
+
+        (void)WriteResponse(response, 1, "game_started", fen, NULL);
+        return;
+    }
+
+    if (!*hasPosition) {
+        Color movedColor;
+
+        /*
+         * Spectating starts mid-game, so refusing everything but the
+         * initial position would mean never locking on. Adopt instead,
+         * once a second frame tells us whose turn it is.
+         */
         if (
-            *hasPosition &&
-            memcmp(position->board, boardString, BOARD_SQUARE_COUNT) == 0
+            hasPendingBoard &&
+            InferMovedColor(pendingBoard, boardString, &movedColor)
         ) {
-            fprintf(logFile, "Ignored duplicate position.\n");
-            fflush(logFile);
-            (void)WriteResponse(response, 0, "duplicate", NULL, NULL);
-            return;
-        }
-
-        if (memcmp(boardString, INITIAL_BOARD, BOARD_SQUARE_COUNT) == 0) {
-            InitializePosition(position);
-            *hasPosition = 1;
-
             char fen[MAX_FEN_LENGTH];
+
+            AdoptPosition(position, pendingBoard, boardString, movedColor);
+            *hasPosition = 1;
+            hasPendingBoard = 0;
 
             if (!PositionToFen(position, fen)) {
                 (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
                 return;
             }
 
-            hasPendingBoard = 0;
-
-            fprintf(logFile, "\n=== New standard game ===\n");
+            fprintf(logFile, "\n=== Adopted game in progress ===\n");
             LogBoard(logFile, position->board, pieceCount);
-            fprintf(logFile, "FEN: %s\n", fen);
+            fprintf(
+                logFile,
+                "FEN: %s (castling rights are a best guess)\n",
+                fen
+            );
             fflush(logFile);
 
             AnalysisPublish(fen, visuallyFlipped, NULL);
 
-            (void)WriteResponse(response, 1, "game_started", fen, NULL);
+            (void)WriteResponse(response, 1, "game_adopted", fen, NULL);
             return;
         }
 
-        if (!*hasPosition) {
-            Color movedColor;
+        memcpy(pendingBoard, boardString, BOARD_SQUARE_COUNT);
+        hasPendingBoard = 1;
+
+        fprintf(
+            logFile,
+            "Holding first frame of a game in progress; "
+            "waiting for one more move to establish the side to move.\n"
+        );
+        LogBoard(logFile, boardString, pieceCount);
+        fflush(logFile);
+        (void)WriteResponse(
+            response, 0, "waiting_for_second_frame", NULL, NULL);
+        return;
+    }
+
+    Move matchingMove;
+    Position result;
+    size_t matchCount = 0U;
+    int plies = 1;
+
+    if (!FindMatchingMove(
+        position,
+        boardString,
+        &matchingMove,
+        &result,
+        &matchCount)) {
+        /*
+         * No single move explains the new board. Before giving up, look for
+         * a short sequence: snapshots get skipped whenever moves come in
+         * faster than the content script's debounce.
+         */
+        if (
+            matchCount == 0U &&
+            FindMoveSequence(
+                position, boardString, &matchingMove, &result, &plies)
+        ) {
+            fprintf(
+                logFile,
+                "\nCaught up: %d plies were played between snapshots.\n",
+                plies
+            );
+            fflush(logFile);
+        } else {
+            fprintf(
+                logFile,
+                "Unreachable transition: %zu single moves matched, no "
+                "sequence up to %d plies. Resynchronising.\n",
+                matchCount,
+                MAX_CATCHUP_PLIES
+            );
+            LogBoardDifference(logFile, position->board, boardString);
+            LogBoard(logFile, boardString, pieceCount);
+            fflush(logFile);
 
             /*
-             * Spectating starts mid-game, so refusing everything but the
-             * initial position would mean never locking on. Adopt instead,
-             * once a second frame tells us whose turn it is.
+             * Keeping the stale position here was the real bug: every later
+             * frame then failed against it too, so one skipped snapshot
+             * killed the tool for the rest of the game. Drop back to the
+             * mid-game join path instead -- hold this board, and the next
+             * frame re-establishes whose turn it is. One move of downtime
+             * rather than all of them.
              */
-            if (
-                hasPendingBoard &&
-                InferMovedColor(pendingBoard, boardString, &movedColor)
-            ) {
-                char fen[MAX_FEN_LENGTH];
-
-                AdoptPosition(position, pendingBoard, boardString, movedColor);
-                *hasPosition = 1;
-                hasPendingBoard = 0;
-
-                if (!PositionToFen(position, fen)) {
-                    (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
-                    return;
-                }
-
-                fprintf(logFile, "\n=== Adopted game in progress ===\n");
-                LogBoard(logFile, position->board, pieceCount);
-                fprintf(
-                    logFile,
-                    "FEN: %s (castling rights are a best guess)\n",
-                        fen
-                );
-                fflush(logFile);
-
-                AnalysisPublish(fen, visuallyFlipped, NULL);
-
-                (void)WriteResponse(response, 1, "game_adopted", fen, NULL);
-                return;
-            }
-
+            *hasPosition = 0;
             memcpy(pendingBoard, boardString, BOARD_SQUARE_COUNT);
             hasPendingBoard = 1;
 
-            fprintf(
-                logFile,
-                "Holding first frame of a game in progress; "
-                "waiting for one more move to establish the side to move.\n"
-            );
-            LogBoard(logFile, boardString, pieceCount);
-            fflush(logFile);
-            (void)WriteResponse(response, 0, "waiting_for_second_frame", NULL, NULL);
+            (void)WriteResponse(response, 0, "resynchronising", NULL, NULL);
             return;
         }
+    }
 
-        Move matchingMove;
-        Position result;
-        size_t matchCount = 0U;
-        int plies = 1;
+    *position = result;
 
-        if (!FindMatchingMove(
-            position,
-            boardString,
-            &matchingMove,
-            &result,
-            &matchCount)) {
-            /*
-             * No single move explains the new board. Before giving up, look for
-             * a short sequence: snapshots get skipped whenever moves come in
-             * faster than the content script's debounce.
-             */
-            if (
-                matchCount == 0U &&
-                FindMoveSequence(
-                    position, boardString, &matchingMove, &result, &plies)
-            ) {
-                fprintf(
-                    logFile,
-                    "\nCaught up: %d plies were played between snapshots.\n",
-                    plies
-                );
-                fflush(logFile);
-            } else {
-                fprintf(
-                    logFile,
-                    "Unreachable transition: %zu single moves matched, no "
-                    "sequence up to %d plies. Resynchronising.\n",
-                    matchCount,
-                    MAX_CATCHUP_PLIES
-                );
-                LogBoardDifference(logFile, position->board, boardString);
-                LogBoard(logFile, boardString, pieceCount);
-                fflush(logFile);
+    char fen[MAX_FEN_LENGTH];
+    char uci[6];
+    MoveToUci(matchingMove, uci);
 
-                /*
-                 * Keeping the stale position here was the real bug: every later
-                 * frame then failed against it too, so one skipped snapshot
-                 * killed the tool for the rest of the game. Drop back to the
-                 * mid-game join path instead -- hold this board, and the next
-                 * frame re-establishes whose turn it is. One move of downtime
-                 * rather than all of them.
-                 */
-                *hasPosition = 0;
-                memcpy(pendingBoard, boardString, BOARD_SQUARE_COUNT);
-                hasPendingBoard = 1;
+    if (!PositionToFen(position, fen)) {
+        (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
+        return;
+    }
 
-                (void)WriteResponse(response, 0, "resynchronising", NULL, NULL);
-                return;
-            }
-            }
+    fprintf(logFile, "\nMove: %s\n", uci);
+    LogBoard(logFile, position->board, pieceCount);
+    fprintf(logFile, "FEN: %s\n", fen);
+    fflush(logFile);
 
-            *position = result;
+    AnalysisPublish(fen, visuallyFlipped, uci);
 
-            char fen[MAX_FEN_LENGTH];
-            char uci[6];
-            MoveToUci(matchingMove, uci);
-
-            if (!PositionToFen(position, fen)) {
-                (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
-                return;
-            }
-
-            fprintf(logFile, "\nMove: %s\n", uci);
-            LogBoard(logFile, position->board, pieceCount);
-            fprintf(logFile, "FEN: %s\n", fen);
-            fflush(logFile);
-
-            AnalysisPublish(fen, visuallyFlipped, uci);
-
-            (void)WriteResponse(response, 1, "move_recorded", fen, uci);
+    (void)WriteResponse(response, 1, "move_recorded", fen, uci);
 }
 
 int main(void)
 {
     const char *debug = getenv("CHESSLISTENER_DEBUG");
     const char *logPath =
-    debug != NULL && strcmp(debug, "1") == 0
-    ? LOG_PATH
-    : "/dev/null";
+        debug != NULL && strcmp(debug, "1") == 0
+            ? LOG_PATH
+            : "/dev/null";
     FILE *logFile = fopen(logPath, "a");
 
     if (logFile == NULL) {
@@ -1891,9 +2032,58 @@ int main(void)
      */
     setvbuf(stdin, NULL, _IONBF, 0);
 
-    if (!AnalysisStart(logFile)) {
+    /* Complete the native-messaging handshake before opening any UI or engine.
+     * A stale extension therefore gets a precise response and a clean exit
+     * instead of launching an incompatible overlay. */
+    for (;;) {
+        char *message = NULL;
+        char response[MAX_RESPONSE_LENGTH];
+        int helloStatus;
+
+        if (!ReadNativeMessage(&message)) {
+            fclose(logFile);
+            return EXIT_SUCCESS;
+        }
+
+        helloStatus = HandleHello(message, logFile, response);
+        free(message);
+
+        if (!WriteNativeMessage(response)) {
+            fclose(logFile);
+            return EXIT_FAILURE;
+        }
+
+        if (helloStatus == HELLO_REJECTED) {
+            fclose(logFile);
+            return EXIT_FAILURE;
+        }
+
+        if (helloStatus == HELLO_ACCEPTED) {
+            break;
+        }
+    }
+
+    int analysisStatus = AnalysisStart(logFile);
+
+    if (analysisStatus <= 0) {
+        if (analysisStatus < 0) {
+            char response[MAX_RESPONSE_LENGTH];
+            int written = snprintf(
+                response,
+                sizeof(response),
+                "{\"type\":\"error\",\"ok\":false,"
+                "\"reason\":\"incompatible_overlay_protocol\","
+                "\"protocol_version\":%d,\"host_version\":\"%s\"}",
+                CHESSLISTENER_PROTOCOL_VERSION,
+                CHESSLISTENER_HOST_VERSION);
+
+            if (written >= 0 && (size_t)written < sizeof(response)) {
+                (void)WriteNativeMessage(response);
+            }
+        }
+
         fclose(logFile);
-        return EXIT_SUCCESS;
+        return analysisStatus < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
     Position position = {0};

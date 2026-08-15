@@ -18,6 +18,7 @@
 
 #define BASE_MAX     1024
 #define FEN_MAX      128
+#define MOVE_MAX     8
 #define POLL_SLICE_MS 40    /* how fast we notice a new position           */
 #define PUSH_EVERY_MS 120   /* how often a deepening search redraws the bar */
 
@@ -32,6 +33,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_wake = PTHREAD_COND_INITIALIZER;
 
 static char          g_fen[FEN_MAX];
+static char          g_last_move[MOVE_MAX];
 static int           g_flip;
 static unsigned long g_seq;        /* newest position handed in           */
 static unsigned long g_taken;      /* newest position the worker has taken */
@@ -39,6 +41,11 @@ static OverlaySettings g_settings;
 static int           g_options_dirty;  /* threads / multipv / budget changed */
 static int           g_maia_reload;    /* rating changed, lc0 must restart   */
 static int           g_quit;
+
+/* Serialises the board-frame write with committing that position to the
+ * worker. This guarantees that an analysis frame can never overtake its board
+ * frame, even if a future caller publishes from more than one thread. */
+static pthread_mutex_t g_publish_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t g_worker;
 static pthread_t g_controller;
@@ -246,6 +253,38 @@ static int StartOverlay(void)
     return 1;
 }
 
+static void DisableStockfish(const char *operation, int status)
+{
+    Log(
+        "analysis: Stockfish %s failed (%d); disabling the engine",
+        operation,
+        status);
+
+    if (g_stockfish != NULL) {
+        uci_stop(g_stockfish);
+        g_stockfish = NULL;
+    }
+
+    (void)overlay_publish_status(
+        g_overlay, "warn", "Stockfish stopped after an engine error.");
+}
+
+static void DisableMaia(const char *operation, int status)
+{
+    Log(
+        "analysis: Maia %s failed (%d); disabling the engine",
+        operation,
+        status);
+
+    if (g_maia != NULL) {
+        uci_stop(g_maia);
+        g_maia = NULL;
+    }
+
+    (void)overlay_publish_status(
+        g_overlay, "warn", "Maia stopped after an engine error.");
+}
+
 /* ---------------------------------------------------------- worker loop -- */
 
 /* True when the worker should drop what it is doing: a newer position, a
@@ -272,7 +311,8 @@ static void OverlayGone(void)
 }
 
 static void PublishAnalysis(unsigned long seq, const char *fen, int flip,
-                            int depth, int final, const char *human)
+                            const char *lastMove, int depth, int final,
+                            const char *human)
 {
     const UciLine *lines = NULL;
     int count = 0;
@@ -283,7 +323,7 @@ static void PublishAnalysis(unsigned long seq, const char *fen, int flip,
 
     if (
         overlay_publish_analysis(
-            g_overlay, seq, fen, flip, depth, final,
+            g_overlay, seq, fen, flip, lastMove, depth, final,
             count > 0 ? &lines[0] : NULL,
             (human != NULL && *human != '\0') ? human : NULL,
             count > 0 ? lines : NULL,
@@ -294,7 +334,7 @@ static void PublishAnalysis(unsigned long seq, const char *fen, int flip,
 }
 
 static void AnalysePosition(unsigned long seq, const char *fen, int flip,
-                            long budgetMs)
+                            const char *lastMove, long budgetMs)
 {
     char human[8];
     long started;
@@ -310,29 +350,26 @@ static void AnalysePosition(unsigned long seq, const char *fen, int flip,
 
         if (status != 0) {
             human[0] = '\0';
-            Log("analysis: Maia query failed (%d)", status);
 
-            if (status == -2) {
-                uci_stop(g_maia);
-                g_maia = NULL;
-                (void)overlay_publish_status(g_overlay, "warn",
-                                             "Maia stopped responding.");
+            /* -4 is a clean terminal position. Every other negative result
+             * leaves the one-shot UCI exchange potentially desynchronised, so
+             * never hand that process another position. */
+            if (status != -4) {
+                DisableMaia("query", status);
             }
         }
     }
 
     if (g_stockfish == NULL) {
-        PublishAnalysis(seq, fen, flip, 0, 1, human);
+        PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
         return;
     }
 
-    if (uci_search_begin(g_stockfish, fen) != 0) {
-        Log("analysis: stockfish search failed to start");
-        uci_stop(g_stockfish);
-        g_stockfish = NULL;
-        (void)overlay_publish_status(g_overlay, "warn",
-                                     "Stockfish stopped responding.");
-        PublishAnalysis(seq, fen, flip, 0, 1, human);
+    status = uci_search_begin(g_stockfish, fen);
+
+    if (status != 0) {
+        DisableStockfish("search start", status);
+        PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
         return;
     }
 
@@ -347,43 +384,62 @@ static void AnalysePosition(unsigned long seq, const char *fen, int flip,
         status = uci_search_poll(g_stockfish, POLL_SLICE_MS, &updated, &finished);
 
         if (status == -4) {                       /* mate or stalemate */
-            PublishAnalysis(seq, fen, flip, 0, 1, human);
+            PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
             return;
         }
 
-        if (status == -2) {
-            Log("analysis: stockfish died mid-search");
-            uci_stop(g_stockfish);
-            g_stockfish = NULL;
-            (void)overlay_publish_status(g_overlay, "warn",
-                                         "Stockfish stopped responding.");
-            PublishAnalysis(seq, fen, flip, 0, 1, human);
+        if (status != 0) {
+            /* A protocol/read error (-1) used to fall through and immediately
+             * poll again forever. Any non-terminal error makes the stream
+             * unsafe to reuse; stop it and publish a final engine-less frame. */
+            DisableStockfish("search poll", status);
+            PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
             return;
         }
 
         now = NowMs();
 
         if (Superseded(seq)) {
+            int abortStatus;
+
             /* The board has moved on. Kill the search now; the outer loop
              * picks up the newer position on its next turn. */
-            (void)uci_search_abort(g_stockfish);
+            abortStatus = uci_search_abort(g_stockfish);
+
+            if (abortStatus != 0) {
+                DisableStockfish("search abort", abortStatus);
+            }
+
             return;
         }
 
         if (finished) {
-            PublishAnalysis(seq, fen, flip, uci_depth(g_stockfish), 1, human);
+            PublishAnalysis(
+                seq, fen, flip, lastMove,
+                uci_depth(g_stockfish), 1, human);
             return;
         }
 
         if (budgetMs > 0L && now - started >= budgetMs) {
-            (void)uci_search_abort(g_stockfish);
-            PublishAnalysis(seq, fen, flip, uci_depth(g_stockfish), 1, human);
+            int depth = uci_depth(g_stockfish);
+            int abortStatus = uci_search_abort(g_stockfish);
+
+            if (abortStatus != 0) {
+                DisableStockfish("search deadline abort", abortStatus);
+                depth = 0;
+            }
+
+            PublishAnalysis(
+                seq, fen, flip, lastMove,
+                depth, 1, human);
             return;
         }
 
         if (updated && now - lastPush >= PUSH_EVERY_MS) {
             lastPush = now;
-            PublishAnalysis(seq, fen, flip, uci_depth(g_stockfish), 0, human);
+            PublishAnalysis(
+                seq, fen, flip, lastMove,
+                uci_depth(g_stockfish), 0, human);
         }
     }
 }
@@ -391,21 +447,32 @@ static void AnalysePosition(unsigned long seq, const char *fen, int flip,
 static void ApplyStockfishOptions(const OverlaySettings *settings)
 {
     char value[16];
+    int status;
 
     if (g_stockfish == NULL) {
         return;
     }
 
-    (void)uci_search_abort(g_stockfish);
+    status = uci_search_abort(g_stockfish);
+
+    if (status != 0) {
+        DisableStockfish("option-change abort", status);
+        return;
+    }
 
     snprintf(value, sizeof(value), "%d", settings->threads);
 
-    if (uci_set_option(g_stockfish, "Threads", value) != 0) {
-        Log("analysis: could not set Threads=%d", settings->threads);
+    status = uci_set_option(g_stockfish, "Threads", value);
+
+    if (status != 0) {
+        DisableStockfish("Threads option", status);
+        return;
     }
 
-    if (uci_set_multipv(g_stockfish, settings->multipv) != 0) {
-        Log("analysis: could not set MultiPV=%d", settings->multipv);
+    status = uci_set_multipv(g_stockfish, settings->multipv);
+
+    if (status != 0) {
+        DisableStockfish("MultiPV option", status);
     }
 }
 
@@ -437,6 +504,7 @@ static void *WorkerThread(void *unused)
 
     for (;;) {
         char fen[FEN_MAX];
+        char lastMove[MOVE_MAX];
         unsigned long seq;
         int flip;
         int reload;
@@ -467,6 +535,7 @@ static void *WorkerThread(void *unused)
         seq = g_seq;
         flip = g_flip;
         memcpy(fen, g_fen, sizeof(fen));
+        memcpy(lastMove, g_last_move, sizeof(lastMove));
         g_taken = seq;
 
         pthread_mutex_unlock(&g_lock);
@@ -481,7 +550,7 @@ static void *WorkerThread(void *unused)
         }
 
         if (fen[0] != '\0') {
-            AnalysePosition(seq, fen, flip, settings.budget_ms);
+            AnalysePosition(seq, fen, flip, lastMove, settings.budget_ms);
         }
     }
 
@@ -570,12 +639,18 @@ int AnalysisStart(FILE *logFile)
     startupStatus = overlay_wait_for_start(g_overlay, &settings);
 
     if (startupStatus <= 0) {
-        Log(
-            startupStatus == 0
-                ? "analysis: startup window closed"
-                : "analysis: invalid startup settings");
+        int result = 0;
+
+        if (startupStatus == OVERLAY_START_CLOSED) {
+            Log("analysis: startup window closed");
+        } else if (startupStatus == OVERLAY_START_PROTOCOL_MISMATCH) {
+            Log("analysis: incompatible overlay protocol");
+            result = -1;
+        } else {
+            Log("analysis: invalid startup settings or IPC failure");
+        }
         overlay_stop(g_overlay);
-        return 0;
+        return result;
     }
 
     StartStockfish(&settings);
@@ -649,7 +724,8 @@ void AnalysisStop(void)
     (void)g_controller;
 }
 
-void AnalysisPublish(const char *fen, int visuallyFlipped)
+void AnalysisPublish(const char *fen, int visuallyFlipped,
+                     const char *lastMove)
 {
     unsigned long seq;
 
@@ -659,18 +735,33 @@ void AnalysisPublish(const char *fen, int visuallyFlipped)
         return;
     }
 
+    pthread_mutex_lock(&g_publish_lock);
+
     pthread_mutex_lock(&g_lock);
-    g_seq += 1UL;
-    seq = g_seq;
+    seq = g_seq + 1UL;
+    pthread_mutex_unlock(&g_lock);
+
+    /* Publish before making this seq visible to the worker. The overlay write
+     * lock serialises old analysis frames with this board frame, while the
+     * worker cannot start the new analysis until the commit below. */
+    if (
+        overlay_publish_position(
+            g_overlay, seq, fen, visuallyFlipped, lastMove) != 0
+    ) {
+        pthread_mutex_unlock(&g_publish_lock);
+        OverlayGone();
+        return;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    g_seq = seq;
     g_flip = visuallyFlipped;
     snprintf(g_fen, sizeof(g_fen), "%s", fen);
+    snprintf(
+        g_last_move, sizeof(g_last_move), "%s",
+        lastMove != NULL ? lastMove : "");
     pthread_cond_broadcast(&g_wake);
     pthread_mutex_unlock(&g_lock);
 
-    /* Paint the new board straight away. The evaluation for this seq lands
-     * later; the overlay ignores any evaluation older than the board it is
-     * showing. */
-    if (overlay_publish_position(g_overlay, seq, fen, visuallyFlipped) != 0) {
-        OverlayGone();
-    }
+    pthread_mutex_unlock(&g_publish_lock);
 }

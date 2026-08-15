@@ -1,0 +1,21 @@
+# Native build products
+/Native/.build/
+/Native/chess-listener-host
+/Native/chess-listener-host-debug
+/Native/chess-listener-host-asan
+/Native/*.o
+/Native/*.d
+
+# Optional local Maia runtime. Release builds do not vendor an opaque lc0
+# executable; users may provide a validated build at this path.
+/Native/Engine/lc0
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+/Native/Tests/*.jsonl
+
+# Local logs and editor/OS clutter
+*.log
+.DS_Store
+*~

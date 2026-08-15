@@ -1,49 +1,60 @@
-"""Headless stand-in for overlay.py, used by e2e.py.
+#!/usr/bin/env python3
+"""Headless stand-in for ``overlay.py`` used by native integration tests.
 
-Speaks the same control protocol: START immediately, one live SET a moment
-later, and logs every frame the host publishes.
+It starts immediately, logs every host frame, and can deterministically send a
+live settings update after a configured number of position frames. No sleeps
+or GUI dependencies are involved.
 """
 
 import json
 import os
 import sys
-import threading
-import time
 
-LOG = os.environ.get("CHESSLISTENER_STUB_LOG", "/tmp/overlay_frames.jsonl")
+
+LOG = os.environ.get("CHESSLISTENER_STUB_LOG", "/tmp/chess-listener-frames.jsonl")
+SET_AFTER = int(os.environ.get("CHESSLISTENER_STUB_SET_AFTER_POSITIONS", "0"))
+PROTOCOL = os.environ.get("CHESSLISTENER_STUB_PROTOCOL", "1")
 
 
 def send(command):
-    os.write(sys.stdout.fileno(), (command + "\n").encode())
-
-
-def later():
-    # Change strength while searches are in flight, which is the case the live
-    # settings panel actually creates.
-    time.sleep(1.2)
-    send("SET budget=250 maia=1900 threads=1 multipv=2")
+    os.write(sys.stdout.fileno(), (command + "\n").encode("utf-8"))
 
 
 def main():
-    send("START budget=" + os.environ.get("BUDGET","600") + " maia=1900 threads=2 multipv=3")
-    threading.Thread(target=later, daemon=True).start()
+    budget = os.environ.get("BUDGET", "100")
+    send(
+        f"START protocol={PROTOCOL} ui_version=0.2.1-test budget={budget} "
+        "maia=1900 threads=1 multipv=3"
+    )
 
-    with open(LOG, "a") as log:
+    positions = 0
+    settings_sent = False
+
+    with open(LOG, "a", encoding="utf-8") as log:
         for line in sys.stdin:
             line = line.strip()
-
             if not line:
                 continue
 
             try:
-                json.loads(line)
+                frame = json.loads(line)
             except json.JSONDecodeError as error:
                 print(f"stub: bad JSON from host: {error}", file=sys.stderr)
-                continue
+                return 1
 
             log.write(line + "\n")
             log.flush()
 
+            if frame.get("type") == "position":
+                positions += 1
+
+            if SET_AFTER > 0 and positions >= SET_AFTER and not settings_sent:
+                # Exercise option changes while board snapshots are arriving.
+                send("SET budget=90 maia=1900 threads=1 multipv=2")
+                settings_sent = True
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

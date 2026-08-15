@@ -21,12 +21,18 @@ typedef struct {
     int  multipv;
 } OverlaySettings;
 
+enum {
+    OVERLAY_START_PROTOCOL_MISMATCH = -2,
+    OVERLAY_START_ERROR = -1,
+    OVERLAY_START_CLOSED = 0,
+    OVERLAY_START_OK = 1
+};
+
 /* python3 is looked up on PATH; script must be an absolute path. */
 Overlay *overlay_start(const char *script);
 
-/* Blocks until the startup window either starts analysis or closes.
- * Returns 1 with validated settings, 0 if the window was closed, or -1 for a
- * malformed control message / IPC failure. */
+/* Blocks until the startup window either starts analysis or closes. START must
+ * carry the current protocol number. Returns one of OVERLAY_START_* above. */
 int overlay_wait_for_start(Overlay *o, OverlaySettings *settings);
 
 /* Reads one control line (blocking). Returns 1 on a line, 0 on EOF (the
@@ -47,16 +53,18 @@ int overlay_publish_status(Overlay *o, const char *kind, const char *text);
 /* Echo the settings actually in force after a live change. */
 int overlay_publish_settings(Overlay *o, const OverlaySettings *settings);
 
-/* Board-only frame: paints immediately, carries no evaluation. This is what
- * keeps the overlay in step with a premove burst. */
+/* Board-only frame: paints immediately, carries no evaluation. last_move is a
+ * UCI move or NULL when the game was started/adopted without known history. */
 int overlay_publish_position(Overlay *o, unsigned long seq, const char *fen,
-                             int flip);
+                             int flip, const char *last_move);
 
-/* Evaluation frame for the position identified by seq. best/human may be NULL,
- * lines may be NULL with n = 0. Scores are white's POV. Returns 0, or -1 if
- * the overlay has gone away -- treat that as "user closed the window". */
+/* Evaluation frame for the position identified by seq. best/human/last_move
+ * may be NULL; lines may be NULL with n = 0. Scores are white's POV. Returns
+ * 0, or -1 if the overlay has gone away -- treat that as "user closed the
+ * window". */
 int overlay_publish_analysis(Overlay *o, unsigned long seq, const char *fen,
-                             int flip, int depth, int final,
+                             int flip, const char *last_move,
+                             int depth, int final,
                              const UciLine *best, const char *human_move,
                              const UciLine *lines, int n);
 

@@ -27,13 +27,15 @@
 
 /* Opens the startup window, waits for the user's settings, then starts the
  * engines and the worker threads. Returns 1 when analysis is ready, 0 when
- * startup was cancelled or the overlay could not be started. */
+ * startup was cancelled/unavailable, or -1 for an incompatible UI protocol. */
 int AnalysisStart(FILE *logFile);
 
 void AnalysisStop(void);
 
-/* Record a new position. Returns immediately: the board is painted now, the
- * evaluation follows on the engine thread. */
-void AnalysisPublish(const char *fen, int visuallyFlipped);
+/* Record a new position. lastMove is UCI or NULL when unknown. Returns
+ * immediately: the board is painted now, the evaluation follows on the
+ * engine thread. */
+void AnalysisPublish(const char *fen, int visuallyFlipped,
+                     const char *lastMove);
 
 #endif /* ANALYSIS_H */

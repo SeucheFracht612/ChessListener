@@ -66,6 +66,8 @@ from PyQt6.QtWidgets import (
 APP_ID = "chess-overlay"
 ORGANIZATION = "ChessListener"
 APPLICATION = "ChessListener"
+APP_VERSION = "0.2.1"
+PROTOCOL_VERSION = 1
 
 FRAME_INTERVAL_MS = 16
 SETTINGS_DEBOUNCE_MS = 300
@@ -880,7 +882,6 @@ class Overlay(QWidget):
         self.last_move = ""
         self.last_san = ""
         self.fen = ""
-        self.previous_fen = ""
         self.best_cp = None
         self.best_mate = None
         self.depth = 0
@@ -895,7 +896,7 @@ class Overlay(QWidget):
         self.expanded_geometry = None
         self.opacity_percent = 100
 
-        self.setWindowTitle("ChessListener")
+        self.setWindowTitle(f"ChessListener {APP_VERSION}")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
 
         if not DECORATED:
@@ -1411,12 +1412,22 @@ class Overlay(QWidget):
             widget.show()
 
         saved = self.settings.value("window/geometry")
+        restored = False
 
-        if not (isinstance(saved, (bytes, bytearray)) and self.restoreGeometry(saved)):
+        if saved is not None:
+            try:
+                restored = self.restoreGeometry(saved)
+            except (TypeError, RuntimeError):
+                restored = False
+
+        if not restored:
             self.resize(352, 500)
 
         self.frame_timer.start()
-        self.send_control("START " + self.settings_payload())
+        self.send_control(
+            f"START protocol={PROTOCOL_VERSION} ui_version={APP_VERSION} "
+            + self.settings_payload()
+        )
 
     def queue_settings(self):
         if self.applying_settings or not self.start_command_sent:
@@ -1578,17 +1589,30 @@ class Overlay(QWidget):
             return
 
         last = state.get("last") or ""
+        same_position = seq == self.position_seq and state["fen"] == self.fen
+
+        if same_position:
+            # A very fast engine can publish analysis before the corresponding
+            # board frame. apply_analysis() adopts that frame, so the later
+            # equal-sequence position must merge metadata rather than erase the
+            # evaluation that just arrived.
+            if last and not self.last_move:
+                self.last_move = last
+
+            self.flip = bool(state.get("flip"))
+            self.side_to_move = state.get("stm", side)
+            self.dirty = True
+            return
 
         # SAN for the move just played has to be read off the board it came
         # from -- which is the one we are about to replace, so do it first.
         if last and any(square != "." for square in self.grid):
-            self.last_san = name_move(self.previous_fen, self.grid, last)
+            self.last_san = name_move(self.fen, self.grid, last)
         else:
             self.last_san = ""
 
         self.position_seq = seq
         self.last_move = last
-        self.previous_fen = self.fen
         self.fen = state["fen"]
         self.grid = grid
         self.side_to_move = state.get("stm", side)
