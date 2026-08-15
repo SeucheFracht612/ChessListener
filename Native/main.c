@@ -1086,6 +1086,150 @@ static int BoardsEqual(const char left[64], const char right[64])
     return memcmp(left, right, BOARD_SQUARE_COUNT) == 0;
 }
 
+/*
+ * Recovering from skipped snapshots.
+ *
+ * content.js debounces and double-reads before it sends, so a fast sequence --
+ * a premove chain, or just a strong player blitzing a forced line -- arrives as
+ * ONE board frame that is several plies ahead. Matching a single move against it
+ * fails, and because the tracker then keeps its stale position, every later
+ * frame fails too: one skipped snapshot used to kill the rest of the game.
+ *
+ * So search for a *sequence* instead, shallowest first, and take the first
+ * sequence that lands on the observed board. Transpositions can produce more
+ * than one path to the same board; they agree on the board and on castling
+ * rights, and can differ only in which move was last, which affects nothing
+ * beyond the label showing what was just played.
+ */
+#define MAX_CATCHUP_PLIES 6
+#define CATCHUP_NODE_BUDGET 2000000
+
+#define MAX_SQUARES_PER_PLY 4
+
+static int OutOfReach(
+    const char current[64],
+    const char observed[64],
+    int pliesRemaining)
+{
+    int differing = 0;
+    int allowance = pliesRemaining * MAX_SQUARES_PER_PLY;
+
+    for (size_t square = 0U; square < BOARD_SQUARE_COUNT; square += 1U) {
+        if (current[square] != observed[square]) {
+            differing += 1;
+
+            if (differing > allowance) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int SearchMoveSequence(
+    const Position *position,
+    const char observedBoard[64],
+    int pliesRemaining,
+    unsigned long *nodeBudget,
+    Move *lastMoveOut,
+    Position *resultOut)
+{
+    MoveList legalMoves;
+
+    if (pliesRemaining <= 0) {
+        return 0;
+    }
+
+    GenerateLegalMoves(position, &legalMoves);
+
+    for (size_t index = 0U; index < legalMoves.count; index += 1U) {
+        Position candidate;
+
+        if (*nodeBudget == 0UL) {
+            return 0;
+        }
+
+        *nodeBudget -= 1UL;
+
+        ApplyMoveUnchecked(position, legalMoves.moves[index], &candidate);
+
+        if (
+            pliesRemaining > 1 &&
+            OutOfReach(candidate.board, observedBoard, pliesRemaining - 1)
+        ) {
+            continue;
+        }
+
+        if (BoardsEqual(candidate.board, observedBoard)) {
+            /* Only a match at the exact target depth counts. A shallower hit
+             * was already found by an earlier iteration of the deepening loop,
+             * so reaching here at depth > 1 means the board must still differ
+             * one ply from the end. */
+            if (pliesRemaining == 1) {
+                if (lastMoveOut != NULL) {
+                    *lastMoveOut = legalMoves.moves[index];
+                }
+
+                if (resultOut != NULL) {
+                    *resultOut = candidate;
+                }
+
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (
+            SearchMoveSequence(
+                &candidate,
+                observedBoard,
+                pliesRemaining - 1,
+                nodeBudget,
+                lastMoveOut,
+                resultOut)
+        ) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Returns the number of plies that were played, 0 if the board is out of reach.
+ * pliesOut of 1 is the ordinary case; more means snapshots were skipped.
+ */
+static int FindMoveSequence(
+    const Position *position,
+    const char observedBoard[64],
+    Move *lastMoveOut,
+    Position *resultOut,
+    int *pliesOut)
+{
+    for (int plies = 2; plies <= MAX_CATCHUP_PLIES; plies += 1) {
+        unsigned long budget = CATCHUP_NODE_BUDGET;
+
+        if (OutOfReach(position->board, observedBoard, plies)) {
+            continue;
+        }
+
+        if (
+            SearchMoveSequence(
+                position, observedBoard, plies, &budget, lastMoveOut, resultOut)
+        ) {
+            if (pliesOut != NULL) {
+                *pliesOut = plies;
+            }
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static int FindMatchingMove(
     const Position *position,
     const char observedBoard[64],
@@ -1590,7 +1734,7 @@ static void HandleMessage(
             fprintf(logFile, "FEN: %s\n", fen);
             fflush(logFile);
 
-            AnalysisPublish(fen, visuallyFlipped);
+            AnalysisPublish(fen, visuallyFlipped, NULL);
 
             (void)WriteResponse(response, 1, "game_started", fen, NULL);
             return;
@@ -1624,11 +1768,11 @@ static void HandleMessage(
                 fprintf(
                     logFile,
                     "FEN: %s (castling rights are a best guess)\n",
-                    fen
+                        fen
                 );
                 fflush(logFile);
 
-                AnalysisPublish(fen, visuallyFlipped);
+                AnalysisPublish(fen, visuallyFlipped, NULL);
 
                 (void)WriteResponse(response, 1, "game_adopted", fen, NULL);
                 return;
@@ -1651,6 +1795,7 @@ static void HandleMessage(
         Move matchingMove;
         Position result;
         size_t matchCount = 0U;
+        int plies = 1;
 
         if (!FindMatchingMove(
             position,
@@ -1658,22 +1803,49 @@ static void HandleMessage(
             &matchingMove,
             &result,
             &matchCount)) {
-            fprintf(
-                logFile,
-                "Rejected transition: %zu legal moves matched the observed board.\n",
-                matchCount
-            );
-        LogBoardDifference(logFile, position->board, boardString);
-        LogBoard(logFile, boardString, pieceCount);
-        fflush(logFile);
-        (void)WriteResponse(
-            response,
-            0,
-            matchCount == 0U ? "no_legal_move_match" : "ambiguous_move",
-            NULL,
-            NULL
-        );
-        return;
+            /*
+             * No single move explains the new board. Before giving up, look for
+             * a short sequence: snapshots get skipped whenever moves come in
+             * faster than the content script's debounce.
+             */
+            if (
+                matchCount == 0U &&
+                FindMoveSequence(
+                    position, boardString, &matchingMove, &result, &plies)
+            ) {
+                fprintf(
+                    logFile,
+                    "\nCaught up: %d plies were played between snapshots.\n",
+                    plies
+                );
+                fflush(logFile);
+            } else {
+                fprintf(
+                    logFile,
+                    "Unreachable transition: %zu single moves matched, no "
+                    "sequence up to %d plies. Resynchronising.\n",
+                    matchCount,
+                    MAX_CATCHUP_PLIES
+                );
+                LogBoardDifference(logFile, position->board, boardString);
+                LogBoard(logFile, boardString, pieceCount);
+                fflush(logFile);
+
+                /*
+                 * Keeping the stale position here was the real bug: every later
+                 * frame then failed against it too, so one skipped snapshot
+                 * killed the tool for the rest of the game. Drop back to the
+                 * mid-game join path instead -- hold this board, and the next
+                 * frame re-establishes whose turn it is. One move of downtime
+                 * rather than all of them.
+                 */
+                *hasPosition = 0;
+                memcpy(pendingBoard, boardString, BOARD_SQUARE_COUNT);
+                hasPendingBoard = 1;
+
+                (void)WriteResponse(response, 0, "resynchronising", NULL, NULL);
+                return;
+            }
             }
 
             *position = result;
@@ -1692,7 +1864,7 @@ static void HandleMessage(
             fprintf(logFile, "FEN: %s\n", fen);
             fflush(logFile);
 
-            AnalysisPublish(fen, visuallyFlipped);
+            AnalysisPublish(fen, visuallyFlipped, uci);
 
             (void)WriteResponse(response, 1, "move_recorded", fen, uci);
 }
@@ -1701,9 +1873,9 @@ int main(void)
 {
     const char *debug = getenv("CHESSLISTENER_DEBUG");
     const char *logPath =
-        debug != NULL && strcmp(debug, "1") == 0
-            ? LOG_PATH
-            : "/dev/null";
+    debug != NULL && strcmp(debug, "1") == 0
+    ? LOG_PATH
+    : "/dev/null";
     FILE *logFile = fopen(logPath, "a");
 
     if (logFile == NULL) {
@@ -1750,4 +1922,3 @@ int main(void)
     fclose(logFile);
     return EXIT_SUCCESS;
 }
-

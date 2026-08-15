@@ -26,6 +26,11 @@ import math
 import os
 import sys
 
+try:
+    import san as san_rules
+except ImportError:  # pragma: no cover - overlay must still run without it
+    san_rules = None
+
 from PyQt6.QtCore import QPointF, QRectF, QSettings, QSocketNotifier, Qt, QTimer
 from PyQt6.QtGui import (
     QBrush,
@@ -50,6 +55,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizeGrip,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -64,6 +70,15 @@ APPLICATION = "ChessListener"
 FRAME_INTERVAL_MS = 16
 SETTINGS_DEBOUNCE_MS = 300
 STATUS_LINGER_MS = 4000
+GEOMETRY_SAVE_MS = 600
+
+# Frameless by default: this window floats over the browser, and a full title
+# bar is a lot of chrome for a 340 px panel. KDE and GNOME both handle
+# startSystemMove() on a frameless window, but set CHESSLISTENER_DECORATED=1 if
+# a compositor disagrees.
+DECORATED = os.environ.get("CHESSLISTENER_DECORATED", "") == "1"
+
+OPACITY_CHOICES = ((100, "Opaque"), (94, "94%"), (86, "86%"), (78, "78%"))
 
 # Board palette. Higher contrast between the two square colours than before,
 # and pieces are filled shapes with a dark outline rather than glyphs tinted
@@ -75,6 +90,7 @@ COLOR_PIECE_BLACK = QColor("#25221e")
 COLOR_PIECE_EDGE = QColor("#16130d")
 COLOR_BEST = QColor("#3f7fd0")
 COLOR_HUMAN = QColor("#d98b34")
+COLOR_LAST = QColor("#e0c552")
 COLOR_COORD = QColor("#7d8492")
 
 COLOR_BG = QColor("#1a1c20")
@@ -162,6 +178,56 @@ def square_index(name):
     return (7 - rank_index) * 8 + file_index
 
 
+PIECE_LETTER = {"k": "K", "q": "Q", "r": "R", "b": "B", "n": "N"}
+
+
+def to_san(grid, move):
+    """Render a UCI move as algebraic, using the board it is played from.
+
+    Approximate fallback, used only when san.py is unavailable: no
+    disambiguation (Nbd2 comes out as Nd2) and no check or mate suffix, because
+    both need legal move generation. Everything else is exact: piece letter,
+    captures, en passant, castling, promotion.
+
+    Prefer name_move(), which uses san.py when it is importable.
+    """
+    if not move or len(move) < 4:
+        return move or ""
+
+    origin = square_index(move[0:2])
+    target = square_index(move[2:4])
+
+    if origin is None or target is None:
+        return move
+
+    piece = grid[origin]
+
+    if piece == ".":
+        return move
+
+    letter = piece.upper()
+    captured = grid[target] != "."
+    origin_file, target_file = origin % 8, target % 8
+
+    if letter == "K" and abs(target_file - origin_file) == 2:
+        return "O-O" if target_file > origin_file else "O-O-O"
+
+    if letter == "P":
+        # A diagonal pawn move onto an empty square is en passant.
+        if origin_file != target_file:
+            captured = True
+
+        text = f"{chr(ord('a') + origin_file)}x" if captured else ""
+        text += move[2:4]
+
+        if len(move) > 4:
+            text += "=" + move[4].upper()
+
+        return text
+
+    return PIECE_LETTER.get(piece.lower(), "") + ("x" if captured else "") + move[2:4]
+
+
 def format_score(centipawns, mate):
     if mate is not None:
         if mate == 0:
@@ -227,6 +293,29 @@ def resolve_piece_font():
     return QFont().family()
 
 
+def name_move(fen, grid, uci):
+    """Algebraic name for a UCI move, exact where possible.
+
+    san.py does real move generation, so it gets disambiguation (Nbd2) and
+    check/mate suffixes right; it is perft-checked against Kiwipete and friends.
+    A stale FEN or a missing module falls through to the approximate grid
+    version rather than showing nothing.
+    """
+    if not uci:
+        return ""
+
+    if san_rules is not None and fen:
+        try:
+            named = san_rules.Board(fen).san(uci)
+        except (ValueError, IndexError, KeyError):
+            named = uci
+
+        if named != uci:
+            return named
+
+    return to_san(grid, uci)
+
+
 class BoardView(QWidget):
     """The board, drawn in a single paintEvent.
 
@@ -241,6 +330,7 @@ class BoardView(QWidget):
         self.flip = False
         self.best_move = ""
         self.human_move = ""
+        self.last_move = ""
         self.side_to_move = "w"
         self._path_cache = {}
         self.setMinimumSize(200, 200)
@@ -253,9 +343,10 @@ class BoardView(QWidget):
         self.side_to_move = side_to_move
         self.flip = flip
 
-    def set_moves(self, best_move, human_move):
+    def set_moves(self, best_move, human_move, last_move):
         self.best_move = best_move or ""
         self.human_move = human_move or ""
+        self.last_move = last_move or ""
 
     # -- geometry ---------------------------------------------------------
 
@@ -436,6 +527,36 @@ class BoardView(QWidget):
                 painter.setBrush(tint)
                 painter.drawRect(rect)
 
+        # The move that was just played gets an outline rather than another
+        # fill: three overlapping tints on the same square turn to mud.
+        if len(self.last_move) >= 4:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(
+                QPen(
+                    COLOR_LAST,
+                    max(1.5, size * 0.055),
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.SquareCap,
+                    Qt.PenJoinStyle.MiterJoin,
+                )
+            )
+            edge = max(1.0, size * 0.033)
+
+            for name in (self.last_move[0:2], self.last_move[2:4]):
+                index = square_index(name)
+
+                if index is None:
+                    continue
+
+                view = 63 - index if self.flip else index
+                painter.drawRect(
+                    self.square_rect(view, board).adjusted(
+                        edge, edge, -edge, -edge
+                    )
+                )
+
+            painter.setPen(Qt.PenStyle.NoPen)
+
         # Coordinates in the gutter, outside the playing area.
         coord_font = QFont(QApplication.font())
         coord_font.setPixelSize(max(7, int(self.gutter() * 0.74)))
@@ -524,6 +645,11 @@ class EvalBar(QWidget):
         self.mate = None
         self.depth = 0
         self.has_eval = False
+        # The bar slides to a new evaluation instead of snapping. A deepening
+        # search revises its score several times a second, and a bar that jumps
+        # on every revision is genuinely hard to read.
+        self.target_fraction = 0.5
+        self.display_fraction = 0.5
         self.setFixedHeight(26)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -532,6 +658,23 @@ class EvalBar(QWidget):
         self.mate = mate
         self.depth = depth
         self.has_eval = has_eval
+
+        if has_eval:
+            self.target_fraction = win_fraction(centipawns, mate)
+
+    def advance(self):
+        """Step the animation. True when the bar needs repainting."""
+        delta = self.target_fraction - self.display_fraction
+
+        if abs(delta) < 0.0015:
+            if self.display_fraction != self.target_fraction:
+                self.display_fraction = self.target_fraction
+                return True
+
+            return False
+
+        self.display_fraction += delta * 0.28
+        return True
 
     def paintEvent(self, _event):
         painter = QPainter(self)
@@ -546,19 +689,24 @@ class EvalBar(QWidget):
 
         base_font = QFont(QApplication.font())
 
+        fraction = self.display_fraction
+        split = rect.width() * fraction
+
         if not self.has_eval:
-            painter.fillRect(rect, QColor("#383c44"))
-            painter.setPen(QColor("#98a0ae"))
-            base_font.setPixelSize(max(9, int(rect.height() * 0.50)))
+            # Hold the previous split, muted, rather than blanking the bar.
+            # "Roughly here, recalculating" is more useful than a grey slab,
+            # and the missing number makes clear it is not a live reading.
+            painter.fillRect(rect, QColor("#2f2c28"))
+            painter.fillRect(QRectF(0.0, 0.0, split, rect.height()),
+                             QColor("#8f8b81"))
+            painter.setPen(QColor(255, 255, 255, 120))
+            base_font.setPixelSize(max(9, int(rect.height() * 0.60)))
             painter.setFont(base_font)
             painter.drawText(
-                rect, Qt.AlignmentFlag.AlignCenter, "thinking\u2026"
+                rect, Qt.AlignmentFlag.AlignCenter, "\u2026"
             )
             painter.end()
             return
-
-        fraction = win_fraction(self.centipawns, self.mate)
-        split = rect.width() * fraction
 
         painter.fillRect(rect, COLOR_BAR_BLACK)
         painter.fillRect(QRectF(0.0, 0.0, split, rect.height()), COLOR_BAR_WHITE)
@@ -648,6 +796,65 @@ class TurnDot(QWidget):
         painter.end()
 
 
+class PageStack(QStackedWidget):
+    """Reports the current page's size, not the largest page's.
+
+    Stock QStackedWidget takes the maximum hint over every page it holds, which
+    pinned this window's height to the tallest one -- so hiding the board for
+    compact mode collapsed the page but not the window.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def sizeHint(self):
+        page = self.currentWidget()
+        return page.sizeHint() if page is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        page = self.currentWidget()
+
+        if page is None:
+            return super().minimumSizeHint()
+
+        return page.minimumSizeHint()
+
+
+class TitleBar(QWidget):
+    """Slim header that also drags the window when it has no decorations."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(26)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or DECORATED:
+            super().mousePressEvent(event)
+            return
+
+        handle = self.window().windowHandle()
+
+        # Hand the drag to the compositor rather than tracking the cursor
+        # ourselves: manual move loops are the thing that breaks on Wayland.
+        if handle is not None:
+            handle.startSystemMove()
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        window = self.window()
+
+        if hasattr(window, "toggle_compact"):
+            window.toggle_compact()
+            event.accept()
+            return
+
+        super().mouseDoubleClickEvent(event)
+
+
 class Overlay(QWidget):
     def __init__(self):
         super().__init__()
@@ -670,6 +877,10 @@ class Overlay(QWidget):
         self.flip = False
         self.best_move = ""
         self.human_move = ""
+        self.last_move = ""
+        self.last_san = ""
+        self.fen = ""
+        self.previous_fen = ""
         self.best_cp = None
         self.best_mate = None
         self.depth = 0
@@ -680,9 +891,17 @@ class Overlay(QWidget):
 
         self.piece_family = resolve_piece_font()
 
+        self.compact = False
+        self.expanded_geometry = None
+        self.opacity_percent = 100
+
         self.setWindowTitle("ChessListener")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setMinimumWidth(320)
+
+        if not DECORATED:
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+
+        self.setMinimumWidth(300)
 
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(FRAME_INTERVAL_MS)
@@ -697,11 +916,27 @@ class Overlay(QWidget):
         self.settings_timer.setInterval(SETTINGS_DEBOUNCE_MS)
         self.settings_timer.timeout.connect(self.send_settings)
 
+        self.geometry_timer = QTimer(self)
+        self.geometry_timer.setSingleShot(True)
+        self.geometry_timer.setInterval(GEOMETRY_SAVE_MS)
+        self.geometry_timer.timeout.connect(self.save_geometry)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self.stack = QStackedWidget()
-        root.addWidget(self.stack)
+        self.title_bar = self.build_title_bar()
+        root.addWidget(self.title_bar)
+
+        self.stack = PageStack()
+        root.addWidget(self.stack, 1)
+
+        if not DECORATED:
+            grip_row = QHBoxLayout()
+            grip_row.setContentsMargins(0, 0, 2, 2)
+            grip_row.addStretch(1)
+            grip_row.addWidget(QSizeGrip(self))
+            root.addLayout(grip_row)
 
         self.startup_page = self.build_startup_page()
         self.analysis_page = self.build_analysis_page()
@@ -771,11 +1006,69 @@ class Overlay(QWidget):
                 padding: 4px 10px;
             }}
             QPushButton#ghost:hover {{ background: #2b2f36; }}
+            QPushButton#titleButton {{
+                background: transparent;
+                border: 0;
+                border-radius: 4px;
+                color: #98a0ae;
+                font-size: 14px;
+                font-weight: 700;
+                padding: 0;
+            }}
+            QPushButton#titleButton:hover {{
+                background: #32363e;
+                color: #e8ebf0;
+            }}
+            QLabel#lastLine {{ color: #d8c464; }}
             QCheckBox {{ spacing: 8px; }}
             """
         )
 
     # -- pages ------------------------------------------------------------
+
+    def build_title_bar(self):
+        bar = TitleBar()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(9, 3, 4, 3)
+        layout.setSpacing(6)
+
+        self.turn_dot = TurnDot()
+        layout.addWidget(self.turn_dot)
+
+        # Fixed height: the status line appearing and vanishing must not
+        # reflow the board underneath it.
+        self.status_label = QLabel("ChessListener")
+        self.status_label.setObjectName("statusInfo")
+        self.status_label.setFixedHeight(16)
+        layout.addWidget(self.status_label, 1)
+
+        self.compact_button = self.make_title_button("\u2013", "Collapse")
+        self.compact_button.clicked.connect(self.toggle_compact)
+        layout.addWidget(self.compact_button)
+
+        self.settings_button = self.make_title_button("\u2261", "Settings")
+        self.settings_button.clicked.connect(self.toggle_settings)
+        layout.addWidget(self.settings_button)
+
+        if not DECORATED:
+            close_button = self.make_title_button("\u00d7", "Close")
+            close_button.clicked.connect(self.close)
+            layout.addWidget(close_button)
+
+        self.turn_dot.hide()
+        self.compact_button.hide()
+        self.settings_button.hide()
+        return bar
+
+    @staticmethod
+    def make_title_button(text, tooltip):
+        button = QPushButton(text)
+        button.setObjectName("titleButton")
+        button.setToolTip(tooltip)
+        button.setFixedSize(20, 20)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setCursor(Qt.CursorShape.ArrowCursor)
+        return button
 
     def build_startup_page(self):
         page = QWidget()
@@ -854,28 +1147,8 @@ class Overlay(QWidget):
     def build_analysis_page(self):
         page = QWidget()
         root = QVBoxLayout(page)
-        root.setContentsMargins(9, 8, 9, 9)
+        root.setContentsMargins(9, 3, 9, 8)
         root.setSpacing(6)
-
-        header = QHBoxLayout()
-        header.setSpacing(7)
-
-        self.turn_dot = TurnDot()
-        header.addWidget(self.turn_dot)
-
-        # Fixed height: the status line appearing and vanishing must not reflow
-        # the board underneath it.
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("statusInfo")
-        self.status_label.setFixedHeight(16)
-        header.addWidget(self.status_label, 1)
-
-        self.settings_button = QPushButton("Settings")
-        self.settings_button.setObjectName("ghost")
-        self.settings_button.clicked.connect(self.open_settings)
-        header.addWidget(self.settings_button)
-
-        root.addLayout(header)
 
         self.board = BoardView(self.piece_family)
         root.addWidget(self.board, 1)
@@ -887,15 +1160,26 @@ class Overlay(QWidget):
         mono.setStyleHint(QFont.StyleHint.Monospace)
         mono.setPointSize(9)
 
-        self.best_label = QLabel("Stockfish  --")
+        # Three aligned rows: what just happened, what the engine wants, what a
+        # human of the chosen rating would play. Padded with a monospace font
+        # rather than a grid layout so the values line up without the labels
+        # jumping every time a move name changes width.
+        self.last_label = QLabel("")
+        self.last_label.setObjectName("lastLine")
+        self.best_label = QLabel("")
         self.best_label.setObjectName("engineLine")
-        self.human_label = QLabel("Maia  --")
+        self.human_label = QLabel("")
         self.human_label.setObjectName("engineLine")
         self.pv_label = QLabel("")
         self.pv_label.setObjectName("pvLine")
         self.pv_label.setWordWrap(True)
 
-        for widget in (self.best_label, self.human_label, self.pv_label):
+        for widget in (
+            self.last_label,
+            self.best_label,
+            self.human_label,
+            self.pv_label,
+        ):
             widget.setFont(mono)
             root.addWidget(widget)
 
@@ -931,15 +1215,21 @@ class Overlay(QWidget):
 
         self.live_threads = QSpinBox()
         self.live_threads.setRange(1, max(1, os.cpu_count() or 1))
-        
+
+        self.live_opacity = QComboBox()
+
+        for percent, label in OPACITY_CHOICES:
+            self.live_opacity.addItem(label, percent)
+
         self.live_multipv = QSpinBox()
         self.live_multipv.setRange(1, 5)
-        
+
         rows = (
             ("Analysis strength", self.live_budget),
             ("Stockfish threads", self.live_threads),
             ("Candidate lines", self.live_multipv),
             ("Natural-move model", self.live_maia),
+            ("Window opacity", self.live_opacity),
         )
 
         for row, (label_text, widget) in enumerate(rows):
@@ -959,7 +1249,7 @@ class Overlay(QWidget):
         note = QLabel(
             "Strength, CPU and line count take effect on the next search. "
             "Changing the Maia rating reloads its network, which takes a few "
-            "seconds."
+            "seconds. Double-click the header to collapse the window."
         )
         note.setObjectName("helper")
         note.setWordWrap(True)
@@ -968,6 +1258,9 @@ class Overlay(QWidget):
 
         for widget in (self.live_budget, self.live_maia):
             widget.currentIndexChanged.connect(self.queue_settings)
+
+        # Opacity is ours alone; the host never needs to hear about it.
+        self.live_opacity.currentIndexChanged.connect(self.apply_opacity)
 
         for widget in (self.live_threads, self.live_multipv):
             widget.valueChanged.connect(self.queue_settings)
@@ -1046,6 +1339,14 @@ class Overlay(QWidget):
         self.live_multipv.setValue(self.multipv)
         self.applying_settings = False
 
+        try:
+            saved_opacity = int(self.settings.value("window/opacity", 100))
+        except (TypeError, ValueError):
+            saved_opacity = 100
+
+        self.select_data(self.live_opacity, saved_opacity, 0)
+        self.apply_opacity()
+
         self.update_startup_budget_help()
         self.update_live_budget_help()
 
@@ -1104,9 +1405,16 @@ class Overlay(QWidget):
         self.start_command_sent = True
 
         self.set_status("Starting Stockfish and Maia\u2026", "info", linger=False)
-        self.human_label.setText(f"Maia {self.maia_rating}  --")
         self.stack.setCurrentWidget(self.analysis_page)
-        self.resize(352, 492)
+
+        for widget in (self.turn_dot, self.compact_button, self.settings_button):
+            widget.show()
+
+        saved = self.settings.value("window/geometry")
+
+        if not (isinstance(saved, (bytes, bytearray)) and self.restoreGeometry(saved)):
+            self.resize(352, 500)
+
         self.frame_timer.start()
         self.send_control("START " + self.settings_payload())
 
@@ -1122,9 +1430,81 @@ class Overlay(QWidget):
         self.threads = int(self.live_threads.value())
         self.multipv = int(self.live_multipv.value())
 
-        self.human_label.setText(f"Maia {self.maia_rating}  --")
         self.save_settings()
         self.send_control("SET " + self.settings_payload())
+        self.dirty = True
+
+    def apply_opacity(self):
+        self.opacity_percent = int(self.live_opacity.currentData())
+        self.setWindowOpacity(self.opacity_percent / 100.0)
+        self.settings.setValue("window/opacity", self.opacity_percent)
+
+    def toggle_compact(self):
+        if not self.start_command_sent:
+            return
+
+        self.compact = not self.compact
+
+        if self.compact:
+            self.expanded_geometry = self.saveGeometry()
+            self.compact_button.setText("+")
+            self.compact_button.setToolTip("Expand")
+        else:
+            self.compact_button.setText("\u2013")
+            self.compact_button.setToolTip("Collapse")
+
+        for widget in (self.board, self.last_label, self.pv_label):
+            widget.setVisible(not self.compact)
+
+        # The board has an Expanding policy and a 200 px floor, so the window
+        # will not shrink until the layout has been recalculated without it.
+        QTimer.singleShot(0, self.settle_after_compact)
+
+    def settle_after_compact(self):
+        self.analysis_page.updateGeometry()
+        self.stack.updateGeometry()
+        self.layout().activate()
+
+        if self.compact:
+            self.resize(self.width(), self.sizeHint().height())
+        elif self.expanded_geometry is not None:
+            self.restoreGeometry(self.expanded_geometry)
+
+    def toggle_settings(self):
+        if self.stack.currentWidget() is self.settings_page:
+            self.close_settings()
+        else:
+            self.open_settings()
+
+    def save_geometry(self):
+        if self.start_command_sent and not self.compact:
+            self.settings.setValue("window/geometry", self.saveGeometry())
+
+    def note_geometry_change(self):
+        if self.start_command_sent and not self.compact:
+            self.geometry_timer.start()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.note_geometry_change()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.note_geometry_change()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if key == Qt.Key.Key_Escape:
+            if self.stack.currentWidget() is self.settings_page:
+                self.close_settings()
+                return
+
+        if key == Qt.Key.Key_Space and self.start_command_sent:
+            self.toggle_compact()
+            return
+
+        super().keyPressEvent(event)
 
     def open_settings(self):
         self.stack.setCurrentWidget(self.settings_page)
@@ -1197,13 +1577,28 @@ class Overlay(QWidget):
         if seq < self.position_seq:
             return
 
+        last = state.get("last") or ""
+
+        # SAN for the move just played has to be read off the board it came
+        # from -- which is the one we are about to replace, so do it first.
+        if last and any(square != "." for square in self.grid):
+            self.last_san = name_move(self.previous_fen, self.grid, last)
+        else:
+            self.last_san = ""
+
         self.position_seq = seq
+        self.last_move = last
+        self.previous_fen = self.fen
+        self.fen = state["fen"]
         self.grid = grid
         self.side_to_move = state.get("stm", side)
         self.flip = bool(state.get("flip"))
 
         # A new board invalidates the old evaluation. Showing the previous
         # eval beside a new position is worse than showing none.
+        # A blanket reset here would also wipe the last move that was just
+        # decoded above -- that one belongs to the new position, not the old
+        # evaluation.
         self.best_move = ""
         self.human_move = ""
         self.best_cp = None
@@ -1252,7 +1647,7 @@ class Overlay(QWidget):
             if not ok
         ]
 
-        self.human_label.setText(f"Maia {self.maia_rating}  --")
+        self.dirty = True
 
         if missing:
             self.set_status(
@@ -1284,40 +1679,58 @@ class Overlay(QWidget):
     # -- the only place board data reaches widgets -------------------------
 
     def flush_frame(self):
-        if not self.dirty:
-            return
+        if self.dirty:
+            self.dirty = False
+            self.repaint_state()
 
-        self.dirty = False
+        # Runs every frame, dirty or not: the bar slides toward its target
+        # after the state that set it has already been applied.
+        if self.eval_bar.advance():
+            self.eval_bar.update()
 
+    def repaint_state(self):
         self.board.set_position(self.grid, self.side_to_move, self.flip)
-        self.board.set_moves(self.best_move, self.human_move)
+        self.board.set_moves(self.best_move, self.human_move, self.last_move)
         self.board.update()
 
         self.eval_bar.set_eval(
             self.best_cp, self.best_mate, self.depth, self.has_eval
         )
-        self.eval_bar.update()
 
         self.turn_dot.set_side(self.side_to_move)
         self.turn_dot.update()
 
-        self.best_label.setText(f"Stockfish  {self.best_move or '--'}")
+        best_san = name_move(self.fen, self.grid, self.best_move)
+        human_san = name_move(self.fen, self.grid, self.human_move)
+
+        self.last_label.setText(
+            f"{'Played':<11}{self.last_san or self.last_move or '--'}"
+        )
+        self.best_label.setText(f"{'Stockfish':<11}{best_san or '--'}")
         self.human_label.setText(
-            f"Maia {self.maia_rating}  {self.human_move or '--'}"
+            f"{'Maia ' + str(self.maia_rating):<11}{human_san or '--'}"
         )
 
-        if self.lines:
+        if self.lines and len(self.lines) > 1:
+            # Skip the first line: it is already on the Stockfish row.
             self.pv_label.setText(
                 "   ".join(
-                    f"{line.get('move', '?')} "
+                    f"{name_move(self.fen, self.grid, line.get('move', '')) or '?'} "
                     f"{format_score(line.get('cp'), line.get('mate'))}"
-                    for line in self.lines[:4]
+                    for line in self.lines[1:4]
                 )
             )
         else:
             self.pv_label.setText("")
 
     def closeEvent(self, event: QCloseEvent):
+        if self.compact and self.expanded_geometry is not None:
+            self.settings.setValue("window/geometry", self.expanded_geometry)
+        else:
+            self.save_geometry()
+
+        self.settings.sync()
+
         try:
             self.send_control("QUIT")
         except OSError:
