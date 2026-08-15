@@ -427,7 +427,7 @@ int overlay_wait_for_start(Overlay *overlay, OverlaySettings *settings)
         }
 
         if (strcmp(line, "QUIT") == 0) {
-            return OVERLAY_START_CLOSED;
+            return OVERLAY_START_DISMISSED;
         }
 
         if (strncmp(line, "START", 5) == 0 &&
@@ -503,6 +503,56 @@ static int publish_buffer(Overlay *overlay, const char *buffer, size_t length)
         }                                                               \
         length += (size_t)_written;                                     \
     } while (0)
+
+static int append_json_string(char *buffer, size_t capacity, size_t *length,
+                              const char *text)
+{
+    int written;
+
+    if (buffer == NULL || length == NULL || *length >= capacity) {
+        return -1;
+    }
+
+    if (text == NULL) {
+        text = "";
+    }
+
+    written = snprintf(buffer + *length, capacity - *length, "\"");
+
+    if (written < 0 || (size_t)written >= capacity - *length) {
+        return -1;
+    }
+    *length += (size_t)written;
+
+    for (const char *cursor = text; *cursor != '\0'; cursor += 1) {
+        unsigned char character = (unsigned char)*cursor;
+
+        if (character == '"' || character == '\\') {
+            written = snprintf(
+                buffer + *length, capacity - *length, "\\%c", character);
+        } else if (character < 0x20U) {
+            written = snprintf(
+                buffer + *length, capacity - *length,
+                "\\u%04x", (unsigned int)character);
+        } else {
+            written = snprintf(
+                buffer + *length, capacity - *length, "%c", character);
+        }
+
+        if (written < 0 || (size_t)written >= capacity - *length) {
+            return -1;
+        }
+        *length += (size_t)written;
+    }
+
+    written = snprintf(buffer + *length, capacity - *length, "\"");
+
+    if (written < 0 || (size_t)written >= capacity - *length) {
+        return -1;
+    }
+    *length += (size_t)written;
+    return 0;
+}
 
 static int black_to_move(const char *fen)
 {
@@ -612,6 +662,104 @@ int overlay_publish_settings(Overlay *overlay, const OverlaySettings *settings)
     return publish_buffer(overlay, buffer, (size_t)written);
 }
 
+int overlay_publish_session_start(Overlay *overlay, const char *session_id,
+                                  const char *label)
+{
+    char buffer[4096];
+    size_t length = 0U;
+
+    if (session_id == NULL || *session_id == '\0') {
+        return -1;
+    }
+
+    APPEND("{\"type\":\"session\",\"event\":\"started\","
+           "\"session_id\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, session_id) < 0) {
+        return -1;
+    }
+    APPEND(",\"label\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, label) < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_session_end(Overlay *overlay, const char *reason)
+{
+    char buffer[512];
+    size_t length = 0U;
+
+    APPEND("{\"type\":\"session\",\"event\":\"ended\",\"reason\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, reason) < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_recovery(Overlay *overlay, const char *action,
+                             const char *text)
+{
+    char buffer[768];
+    size_t length = 0U;
+
+    if (action == NULL || *action == '\0') {
+        return -1;
+    }
+
+    APPEND("{\"type\":\"recovery\",\"action\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, action) < 0) {
+        return -1;
+    }
+    APPEND(",\"text\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, text) < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_recovery_result(Overlay *overlay, const char *action,
+                                    int accepted, const char *text)
+{
+    char buffer[1024];
+    size_t length = 0U;
+
+    if (action == NULL || *action == '\0') {
+        return -1;
+    }
+
+    APPEND("{\"type\":\"recovery\",\"action\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, action) < 0) {
+        return -1;
+    }
+    APPEND(",\"accepted\":%s,\"ok\":%s,\"kind\":\"%s\",\"text\":",
+           accepted ? "true" : "false",
+           accepted ? "true" : "false",
+           accepted ? "info" : "warn");
+    if (append_json_string(buffer, sizeof(buffer), &length, text) < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_orientation(Overlay *overlay, int flip)
+{
+    char buffer[80];
+    int written = snprintf(
+        buffer, sizeof(buffer),
+        "{\"type\":\"orientation\",\"flip\":%s}\n",
+        flip ? "true" : "false");
+
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        return -1;
+    }
+
+    return publish_buffer(overlay, buffer, (size_t)written);
+}
+
 int overlay_publish_status(Overlay *overlay, const char *kind, const char *text)
 {
     char buffer[512];
@@ -621,21 +769,14 @@ int overlay_publish_status(Overlay *overlay, const char *kind, const char *text)
         return -1;
     }
 
-    APPEND("{\"type\":\"status\",\"kind\":\"%s\",\"text\":\"",
+    APPEND("{\"type\":\"status\",\"kind\":\"%s\",\"text\":",
            kind != NULL ? kind : "info");
 
-    /* The only strings we ever send here are our own, but escaping quotes and
-     * backslashes costs nothing and keeps a stray engine path from producing
-     * invalid JSON. */
-    for (const char *p = text; *p != '\0'; p += 1) {
-        if (*p == '"' || *p == '\\') {
-            APPEND("\\%c", *p);
-        } else if ((unsigned char)*p >= 0x20U) {
-            APPEND("%c", *p);
-        }
+    if (append_json_string(buffer, sizeof(buffer), &length, text) < 0) {
+        return -1;
     }
 
-    APPEND("\"}\n");
+    APPEND("}\n");
     return publish_buffer(overlay, buffer, length);
 }
 

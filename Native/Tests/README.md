@@ -6,8 +6,14 @@ Run the complete suite from the repository root:
 
 The test target forcibly recompiles the native host before running anything,
 so old object files or a checked-in executable cannot hide a broken checkout.
-It also checks Python, JavaScript, and shell syntax and runs the extension's
-Node-based protocol tests when present.
+It also checks Python, JavaScript, and shell syntax and runs every extension
+Node test under `Extension/Tests/`.
+
+The extension fixtures cover single-owner tab arbitration, explicit switching,
+session-storage restoration after a Firefox event-page restart, sticky stop and
+dismissal, one crash retry, stale route/capture rejection, forced re-read,
+orientation changes, pointer cancellation, game-over lifecycle, popup action
+errors, and recovery-button state.
 
 `test_install_lifecycle.py` creates an isolated marked runtime with a custom
 install prefix and Firefox manifest directory. It verifies installed
@@ -19,10 +25,13 @@ preserved byte-for-byte while incomplete payloads are removed. It uses fake
 local dependencies and never changes the real user installation.
 
 `e2e.py` drives `chess-listener-host` from both ends at once: it speaks the
-browser's length-prefixed native-messaging protocol (including the version
-handshake) on one side, while `stub_overlay.py` stands in for `overlay.py` on
-the other. `fake_uci_engine.py` is a deterministic UCI engine, so neither a
-system Stockfish installation nor network access is required.
+browser's length-prefixed native-messaging protocol 2 (including version and
+capability negotiation) on one side, while `stub_overlay.py` stands in for
+`overlay.py` on the other. It also exercises session isolation and monotonic
+snapshots, exact/rejected FEN recovery, initial-position repetition, forced
+refresh, orientation-only updates, scoped UI commands, and intentional
+dismissal. `fake_uci_engine.py` is deterministic, so neither a system
+Stockfish installation nor network access is required.
 
 The integration checks fail if the host stalls the browser while analysis is
 running, drops board frames during a burst, publishes stale analysis as final,

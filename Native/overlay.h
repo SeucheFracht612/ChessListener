@@ -22,6 +22,7 @@ typedef struct {
 } OverlaySettings;
 
 enum {
+    OVERLAY_START_DISMISSED = -3,
     OVERLAY_START_PROTOCOL_MISMATCH = -2,
     OVERLAY_START_ERROR = -1,
     OVERLAY_START_CLOSED = 0,
@@ -52,6 +53,17 @@ int overlay_publish_status(Overlay *o, const char *kind, const char *text);
 
 /* Echo the settings actually in force after a live change. */
 int overlay_publish_settings(Overlay *o, const OverlaySettings *settings);
+
+/* Session and recovery frames carry product lifecycle separately from chess
+ * positions. All strings are JSON-escaped by this module. */
+int overlay_publish_session_start(Overlay *o, const char *session_id,
+                                  const char *label);
+int overlay_publish_session_end(Overlay *o, const char *reason);
+int overlay_publish_recovery(Overlay *o, const char *action,
+                             const char *text);
+int overlay_publish_recovery_result(Overlay *o, const char *action,
+                                    int accepted, const char *text);
+int overlay_publish_orientation(Overlay *o, int flip);
 
 /* Board-only frame: paints immediately, carries no evaluation. last_move is a
  * UCI move or NULL when the game was started/adopted without known history. */

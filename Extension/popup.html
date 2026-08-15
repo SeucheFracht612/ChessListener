@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChessListener</title>
+  <link rel="stylesheet" href="popup.css">
+  <script src="popup.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">ChessListener</p>
+        <h1>Analysis session</h1>
+      </div>
+      <span id="status-badge" class="badge" data-status="idle">Idle</span>
+    </header>
+
+    <section class="session-card" aria-live="polite">
+      <p id="session-label" class="session-label">No active board</p>
+      <p id="session-detail" class="session-detail">
+        Open a Chess.com game or press Analyze this tab.
+      </p>
+    </section>
+
+    <p id="error" class="error" role="alert" hidden></p>
+
+    <div class="actions">
+      <button id="analyze" class="primary" type="button">
+        Analyze this tab
+      </button>
+      <button id="rescan" type="button" disabled>Re-read board</button>
+      <button id="stop" class="danger" type="button" disabled>
+        Stop session
+      </button>
+    </div>
+
+    <footer id="version">Protocol 2</footer>
+  </main>
+</body>
+</html>

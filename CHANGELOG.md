@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0 — session and recovery release
+
+- Added deterministic ownership of one active browser game so snapshots from
+  multiple tabs can no longer corrupt one native chess state.
+- Added a Firefox toolbar popup for inspecting the owner, explicitly switching
+  to the current tab, re-reading its board, and stopping analysis.
+- Added session lifecycle messages for navigation, game completion, tab close,
+  and explicit stop; overlay dismissal is sticky for the current session.
+- Added one bounded automatic native-host reconnect with latest-snapshot replay
+  after an unexpected failure.
+- Added a Recovery page in the existing overlay style with visible-board state
+  replacement, exact FEN override, engine restart, re-scan, and session stop.
+- Made board orientation an independent update instead of waiting for the next
+  piece movement.
+- Added page-instance, route-generation, session, and snapshot sequence guards
+  so late asynchronous work cannot roll a game backwards or cross sessions.
+- Advanced extension, host, and overlay negotiation to protocol 2 / version
+  0.3.0 and expanded deterministic lifecycle/recovery coverage.
+- Kept participant-versus-spectator policy outside the software: bot games and
+  other local testing remain usable, while the documentation states that the
+  user is responsible for following applicable rules.
+
 ## 0.2.1 — stabilization release
 
 - Restored clean source builds and removed reliance on stale build artifacts.

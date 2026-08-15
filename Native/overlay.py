@@ -4,9 +4,13 @@
 The native host sends one JSON object per line on stdin. This process reserves
 stdout for a small control protocol:
 
-    START budget=400 maia=1900 threads=2 multipv=3
+    START protocol=2 ui_version=0.3.0 budget=400 maia=1900 threads=2 multipv=3
     SET   budget=900 maia=1600 threads=4 multipv=3
-    QUIT
+    RESCAN <session-id>
+    FEN <session-id> rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+    RESTART <session-id>
+    STOP <session-id>
+    QUIT <session-id>  # bare QUIT is used before a session starts
 
 All diagnostics go to stderr, which the native host redirects to a local file.
 
@@ -54,6 +58,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSizeGrip,
     QSizePolicy,
@@ -66,8 +71,8 @@ from PyQt6.QtWidgets import (
 APP_ID = "chess-overlay"
 ORGANIZATION = "ChessListener"
 APPLICATION = "ChessListener"
-APP_VERSION = "0.2.1"
-PROTOCOL_VERSION = 1
+APP_VERSION = "0.3.0"
+PROTOCOL_VERSION = 2
 
 FRAME_INTERVAL_MS = 16
 SETTINGS_DEBOUNCE_MS = 300
@@ -135,11 +140,16 @@ BUDGET_PRESETS = (
 )
 
 MAIA_RATINGS = tuple(range(1100, 2000, 100))
+FEN_PIECES = frozenset("PNBRQKpnbrqk")
 
 
 def fen_to_grid(fen):
     """Return (64-square a8..h1 grid, side to move)."""
     parts = fen.split()
+
+    if not parts:
+        raise ValueError("FEN is empty")
+
     rows = parts[0].split("/")
 
     if len(rows) != 8:
@@ -151,19 +161,107 @@ def fen_to_grid(fen):
         square_count = 0
 
         for character in row:
-            if character.isdigit():
+            if character in "12345678":
                 empty_count = int(character)
                 grid.extend("." * empty_count)
                 square_count += empty_count
-            else:
+            elif character in FEN_PIECES:
                 grid.append(character)
                 square_count += 1
+            else:
+                raise ValueError("bad FEN piece: " + character)
 
         if square_count != 8:
             raise ValueError("bad FEN rank: " + row)
 
+    if len(grid) != 64:
+        raise ValueError("FEN board does not contain 64 squares")
+
     side = parts[1] if len(parts) > 1 else "w"
+
+    if side not in {"w", "b"}:
+        raise ValueError("side to move must be 'w' or 'b'")
+
     return grid, side
+
+
+def grid_to_fen_board(grid):
+    """Encode an a8..h1 grid as the first FEN field."""
+    if len(grid) != 64:
+        raise ValueError("the visible board does not contain 64 squares")
+
+    rows = []
+
+    for start in range(0, 64, 8):
+        encoded = []
+        empty = 0
+
+        for piece in grid[start : start + 8]:
+            if piece == ".":
+                empty += 1
+                continue
+
+            if piece not in FEN_PIECES:
+                raise ValueError(f"the visible board contains an unknown piece: {piece}")
+
+            if empty:
+                encoded.append(str(empty))
+                empty = 0
+            encoded.append(piece)
+
+        if empty:
+            encoded.append(str(empty))
+
+        rows.append("".join(encoded))
+
+    return "/".join(rows)
+
+
+def validate_fen_input(raw_fen):
+    """Friendly UI validation; the native host remains authoritative."""
+    fields = raw_fen.strip().split()
+
+    if len(fields) != 6:
+        raise ValueError("FEN needs all six fields")
+
+    board, side, castling, en_passant, halfmove, fullmove = fields
+    grid, parsed_side = fen_to_grid(f"{board} {side}")
+
+    if parsed_side != side:
+        raise ValueError("invalid side to move")
+    if grid.count("K") != 1 or grid.count("k") != 1:
+        raise ValueError("the position needs exactly one king of each colour")
+
+    if castling != "-":
+        if any(character not in "KQkq" for character in castling):
+            raise ValueError("castling rights may only contain K, Q, k and q")
+        if len(set(castling)) != len(castling):
+            raise ValueError("castling rights contain a duplicate")
+        canonical = "".join(
+            character for character in "KQkq" if character in castling
+        )
+        if castling != canonical:
+            raise ValueError("write castling rights in KQkq order")
+
+    if en_passant != "-" and not (
+        len(en_passant) == 2
+        and en_passant[0] in "abcdefgh"
+        and en_passant[1] in "36"
+    ):
+        raise ValueError("en-passant must be '-' or a square on rank 3 or 6")
+
+    try:
+        halfmove_value = int(halfmove)
+        fullmove_value = int(fullmove)
+    except ValueError as error:
+        raise ValueError("move counters must be whole numbers") from error
+
+    if halfmove_value < 0:
+        raise ValueError("halfmove clock cannot be negative")
+    if fullmove_value < 1:
+        raise ValueError("fullmove number must be at least 1")
+
+    return " ".join(fields)
 
 
 def square_index(name):
@@ -889,6 +987,10 @@ class Overlay(QWidget):
         self.lines = []
         self.status_text = ""
         self.dirty = False
+        self.session_id = ""
+        self.session_label = ""
+        self.session_active = False
+        self.recovery_action = ""
 
         self.piece_family = resolve_piece_font()
 
@@ -942,8 +1044,14 @@ class Overlay(QWidget):
         self.startup_page = self.build_startup_page()
         self.analysis_page = self.build_analysis_page()
         self.settings_page = self.build_settings_page()
+        self.recovery_page = self.build_recovery_page()
 
-        for page in (self.startup_page, self.analysis_page, self.settings_page):
+        for page in (
+            self.startup_page,
+            self.analysis_page,
+            self.settings_page,
+            self.recovery_page,
+        ):
             self.stack.addWidget(page)
 
         self.stack.setCurrentWidget(self.startup_page)
@@ -977,14 +1085,16 @@ class Overlay(QWidget):
                 border: 1px solid #343841;
                 border-radius: 10px;
             }}
-            QComboBox, QSpinBox {{
+            QComboBox, QSpinBox, QLineEdit {{
                 background: #171a1e;
                 border: 1px solid #414751;
                 border-radius: 7px;
                 padding: 6px 4px 6px 9px;
                 min-height: 20px;
             }}
-            QComboBox:focus, QSpinBox:focus {{ border-color: #6d98c4; }}
+            QComboBox:focus, QSpinBox:focus, QLineEdit:focus {{
+                border-color: #6d98c4;
+            }}
             QComboBox QAbstractItemView {{
                 background: #171a1e;
                 selection-background-color: #3f7fd0;
@@ -1047,6 +1157,11 @@ class Overlay(QWidget):
         self.compact_button.clicked.connect(self.toggle_compact)
         layout.addWidget(self.compact_button)
 
+        self.recovery_button = self.make_title_button("\u21bb", "Recovery")
+        self.recovery_button.clicked.connect(self.toggle_recovery)
+        self.recovery_button.setEnabled(False)
+        layout.addWidget(self.recovery_button)
+
         self.settings_button = self.make_title_button("\u2261", "Settings")
         self.settings_button.clicked.connect(self.toggle_settings)
         layout.addWidget(self.settings_button)
@@ -1058,6 +1173,7 @@ class Overlay(QWidget):
 
         self.turn_dot.hide()
         self.compact_button.hide()
+        self.recovery_button.hide()
         self.settings_button.hide()
         return bar
 
@@ -1082,7 +1198,7 @@ class Overlay(QWidget):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Live spectator analysis for games you are watching on Chess.com."
+            "Local analysis for Chess.com boards, including bot and test games."
         )
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
@@ -1270,6 +1386,137 @@ class Overlay(QWidget):
 
         return page
 
+    def build_recovery_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(9)
+
+        header = QHBoxLayout()
+        title = QLabel("Recovery")
+        title.setObjectName("heading")
+        header.addWidget(title)
+        header.addStretch(1)
+
+        done_button = QPushButton("Done")
+        done_button.setObjectName("ghost")
+        done_button.clicked.connect(self.close_recovery)
+        header.addWidget(done_button)
+        layout.addLayout(header)
+
+        help_text = QLabel(
+            "Use recovery when the visible board and overlay no longer agree. "
+            "The native host validates every replacement position."
+        )
+        help_text.setObjectName("helper")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        rescan_button = QPushButton("Re-read board from Chess.com")
+        rescan_button.setObjectName("ghost")
+        rescan_button.clicked.connect(self.request_rescan)
+        layout.addWidget(rescan_button)
+
+        panel = QFrame()
+        panel.setObjectName("panel")
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(12, 12, 12, 12)
+        grid.setHorizontalSpacing(9)
+        grid.setVerticalSpacing(7)
+
+        grid.addWidget(QLabel("Reset from visible board"), 0, 0, 1, 2)
+
+        self.recovery_side = QComboBox()
+        self.recovery_side.addItem("White to move", "w")
+        self.recovery_side.addItem("Black to move", "b")
+        grid.addWidget(QLabel("Side"), 1, 0)
+        grid.addWidget(self.recovery_side, 1, 1)
+
+        castling = QWidget()
+        castling_layout = QHBoxLayout(castling)
+        castling_layout.setContentsMargins(0, 0, 0, 0)
+        castling_layout.setSpacing(7)
+        self.castle_white_king = QCheckBox("K")
+        self.castle_white_queen = QCheckBox("Q")
+        self.castle_black_king = QCheckBox("k")
+        self.castle_black_queen = QCheckBox("q")
+
+        for checkbox in (
+            self.castle_white_king,
+            self.castle_white_queen,
+            self.castle_black_king,
+            self.castle_black_queen,
+        ):
+            castling_layout.addWidget(checkbox)
+        castling_layout.addStretch(1)
+
+        grid.addWidget(QLabel("Castling"), 2, 0)
+        grid.addWidget(castling, 2, 1)
+
+        self.recovery_en_passant = QLineEdit()
+        self.recovery_en_passant.setMaxLength(2)
+        self.recovery_en_passant.setPlaceholderText("-")
+        grid.addWidget(QLabel("En-passant"), 3, 0)
+        grid.addWidget(self.recovery_en_passant, 3, 1)
+
+        counters = QWidget()
+        counters_layout = QHBoxLayout(counters)
+        counters_layout.setContentsMargins(0, 0, 0, 0)
+        counters_layout.setSpacing(6)
+        self.recovery_halfmove = QSpinBox()
+        self.recovery_halfmove.setRange(0, 9999)
+        self.recovery_fullmove = QSpinBox()
+        self.recovery_fullmove.setRange(1, 9999)
+        counters_layout.addWidget(self.recovery_halfmove)
+        counters_layout.addWidget(QLabel("/"))
+        counters_layout.addWidget(self.recovery_fullmove)
+        grid.addWidget(QLabel("Half / fullmove"), 4, 0)
+        grid.addWidget(counters, 4, 1)
+
+        visible_button = QPushButton("Apply visible board")
+        visible_button.clicked.connect(self.apply_visible_fen)
+        grid.addWidget(visible_button, 5, 0, 1, 2)
+        grid.setColumnStretch(1, 1)
+        layout.addWidget(panel)
+
+        self.recovery_exact_fen = QLineEdit()
+        self.recovery_exact_fen.setPlaceholderText(
+            "Exact six-field FEN, for example: 8/8/8/8/8/8/4K3/7k w - - 0 1"
+        )
+        layout.addWidget(self.recovery_exact_fen)
+
+        exact_button = QPushButton("Apply exact FEN")
+        exact_button.setObjectName("ghost")
+        exact_button.clicked.connect(self.apply_exact_fen)
+        layout.addWidget(exact_button)
+
+        actions = QHBoxLayout()
+        restart_button = QPushButton("Restart engines")
+        restart_button.setObjectName("ghost")
+        restart_button.clicked.connect(self.request_engine_restart)
+        actions.addWidget(restart_button)
+
+        stop_button = QPushButton("Stop session")
+        stop_button.setObjectName("ghost")
+        stop_button.clicked.connect(self.request_session_stop)
+        actions.addWidget(stop_button)
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
+        self.recovery_controls = (
+            rescan_button,
+            panel,
+            self.recovery_exact_fen,
+            exact_button,
+            restart_button,
+            stop_button,
+        )
+
+        for control in self.recovery_controls:
+            control.setEnabled(False)
+
+        return page
+
     def make_budget_combo(self):
         combo = QComboBox()
 
@@ -1408,7 +1655,12 @@ class Overlay(QWidget):
         self.set_status("Starting Stockfish and Maia\u2026", "info", linger=False)
         self.stack.setCurrentWidget(self.analysis_page)
 
-        for widget in (self.turn_dot, self.compact_button, self.settings_button):
+        for widget in (
+            self.turn_dot,
+            self.compact_button,
+            self.recovery_button,
+            self.settings_button,
+        ):
             widget.show()
 
         saved = self.settings.value("window/geometry")
@@ -1510,6 +1762,9 @@ class Overlay(QWidget):
             if self.stack.currentWidget() is self.settings_page:
                 self.close_settings()
                 return
+            if self.stack.currentWidget() is self.recovery_page:
+                self.close_recovery()
+                return
 
         if key == Qt.Key.Key_Space and self.start_command_sent:
             self.toggle_compact()
@@ -1527,6 +1782,132 @@ class Overlay(QWidget):
             self.send_settings()
 
         self.stack.setCurrentWidget(self.analysis_page)
+
+    def toggle_recovery(self):
+        if self.stack.currentWidget() is self.recovery_page:
+            self.close_recovery()
+        else:
+            self.open_recovery()
+
+    def open_recovery(self):
+        if not self.start_command_sent or not self.session_active:
+            self.set_status("No active analysis session", "warn", linger=False)
+            return
+
+        self.populate_recovery_fields()
+        self.stack.setCurrentWidget(self.recovery_page)
+
+    def close_recovery(self):
+        self.stack.setCurrentWidget(self.analysis_page)
+
+    def set_recovery_enabled(self, enabled):
+        self.recovery_button.setEnabled(enabled)
+
+        for control in self.recovery_controls:
+            control.setEnabled(enabled)
+
+    def populate_recovery_fields(self):
+        fields = self.fen.split()
+
+        if len(fields) == 6:
+            _board, side, castling, en_passant, halfmove, fullmove = fields
+        else:
+            side, castling, en_passant, halfmove, fullmove = (
+                self.side_to_move,
+                "-",
+                "-",
+                "0",
+                "1",
+            )
+
+        self.select_data(self.recovery_side, side, 0)
+        self.castle_white_king.setChecked("K" in castling)
+        self.castle_white_queen.setChecked("Q" in castling)
+        self.castle_black_king.setChecked("k" in castling)
+        self.castle_black_queen.setChecked("q" in castling)
+        self.recovery_en_passant.setText(
+            "" if en_passant == "-" else en_passant
+        )
+
+        try:
+            self.recovery_halfmove.setValue(max(0, int(halfmove)))
+            self.recovery_fullmove.setValue(max(1, int(fullmove)))
+        except ValueError:
+            self.recovery_halfmove.setValue(0)
+            self.recovery_fullmove.setValue(1)
+
+        self.recovery_exact_fen.setText(self.fen)
+
+    def visible_board_fen(self):
+        board = grid_to_fen_board(self.grid)
+        side = self.recovery_side.currentData()
+        castling = "".join(
+            right
+            for right, checkbox in (
+                ("K", self.castle_white_king),
+                ("Q", self.castle_white_queen),
+                ("k", self.castle_black_king),
+                ("q", self.castle_black_queen),
+            )
+            if checkbox.isChecked()
+        ) or "-"
+        en_passant = self.recovery_en_passant.text().strip() or "-"
+
+        return validate_fen_input(
+            f"{board} {side} {castling} {en_passant} "
+            f"{self.recovery_halfmove.value()} {self.recovery_fullmove.value()}"
+        )
+
+    def scoped_control(self, command, payload=None):
+        if not self.session_active or not self.session_id:
+            raise ValueError("No active analysis session")
+
+        line = f"{command} {self.session_id}"
+        return line if payload is None else f"{line} {payload}"
+
+    def begin_recovery(self, command, status, payload=None):
+        try:
+            control = self.scoped_control(command, payload)
+        except ValueError as error:
+            self.set_status(str(error), "warn", linger=False)
+            return
+
+        self.recovery_action = command.lower()
+        self.send_control(control)
+        self.stack.setCurrentWidget(self.analysis_page)
+        self.set_status(status, "info", linger=True)
+        self.dirty = True
+
+    def request_rescan(self):
+        self.begin_recovery("RESCAN", "Waiting for the visible board\u2026")
+
+    def apply_visible_fen(self):
+        try:
+            fen = self.visible_board_fen()
+        except ValueError as error:
+            self.set_status(str(error), "warn", linger=False)
+            return
+
+        self.begin_recovery(
+            "FEN", "Validating the position\u2026", payload=fen
+        )
+
+    def apply_exact_fen(self):
+        try:
+            fen = validate_fen_input(self.recovery_exact_fen.text())
+        except ValueError as error:
+            self.set_status(str(error), "warn", linger=False)
+            return
+
+        self.begin_recovery(
+            "FEN", "Validating the position\u2026", payload=fen
+        )
+
+    def request_engine_restart(self):
+        self.begin_recovery("RESTART", "Restarting engines\u2026")
+
+    def request_session_stop(self):
+        self.begin_recovery("STOP", "Stopping this session\u2026")
 
     # -- status -----------------------------------------------------------
 
@@ -1548,7 +1929,8 @@ class Overlay(QWidget):
             self.status_timer.start(STATUS_LINGER_MS)
 
     def clear_status(self):
-        self.set_status("", "info", linger=False)
+        fallback = self.session_label if self.session_active else ""
+        self.set_status(fallback, "info", linger=False)
 
     def clear_startup_notice(self):
         """Belt and braces for the notice that used to get stuck.
@@ -1558,7 +1940,7 @@ class Overlay(QWidget):
         late ready message can no longer leave it on screen forever.
         """
         if self.status_text.startswith("Starting"):
-            self.set_status("", "info", linger=False)
+            self.clear_status()
 
     # -- incoming frames --------------------------------------------------
 
@@ -1575,6 +1957,110 @@ class Overlay(QWidget):
             self.apply_settings_echo(state)
         elif kind == "status":
             self.apply_status(state)
+        elif kind == "session":
+            self.apply_session(state)
+        elif kind == "recovery":
+            self.apply_recovery(state)
+        elif kind == "orientation":
+            self.apply_orientation(state)
+
+    def clear_evaluation(self, clear_last=False):
+        self.best_move = ""
+        self.human_move = ""
+        self.best_cp = None
+        self.best_mate = None
+        self.depth = 0
+        self.has_eval = False
+        self.lines = []
+
+        if clear_last:
+            self.last_move = ""
+            self.last_san = ""
+
+        self.dirty = True
+
+    def clear_position(self):
+        self.position_seq = 0
+        self.grid = ["."] * 64
+        self.side_to_move = "w"
+        self.flip = False
+        self.fen = ""
+        self.last_move = ""
+        self.last_san = ""
+        self.clear_evaluation(clear_last=True)
+
+    def apply_session(self, state):
+        event = state.get("event", "")
+
+        if event == "started":
+            self.session_id = str(state.get("session_id", ""))
+            self.session_label = str(state.get("label", "")).strip()
+            self.session_active = True
+            self.recovery_action = ""
+            self.set_recovery_enabled(True)
+            self.clear_position()
+            self.set_status(
+                self.session_label or "Analysis session ready",
+                "info",
+                linger=False,
+            )
+            return
+
+        if event != "ended":
+            return
+
+        reason = str(state.get("reason", "ended"))
+        keep_final_board = reason in {
+            "game_ended",
+            "game-ended",
+            "game_end",
+            "completed",
+        }
+
+        self.session_active = False
+        self.session_id = ""
+        self.session_label = ""
+        self.recovery_action = ""
+        self.set_recovery_enabled(False)
+
+        if self.stack.currentWidget() is self.recovery_page:
+            self.stack.setCurrentWidget(self.analysis_page)
+
+        if keep_final_board:
+            self.clear_evaluation(clear_last=False)
+            message = "Game ended \u2014 analysis stopped"
+        else:
+            self.clear_position()
+            message = "Session stopped"
+
+        self.set_status(message, "info", linger=False)
+
+    def apply_recovery(self, state):
+        action = str(state.get("action", ""))
+
+        if "accepted" in state or "ok" in state:
+            accepted = bool(state.get("accepted", state.get("ok")))
+            self.recovery_action = ""
+            text = str(state.get("text", "")).strip()
+            kind = str(state.get("kind", "info" if accepted else "warn"))
+
+            if text:
+                self.set_status(
+                    text,
+                    kind if kind in {"info", "warn"} else "info",
+                    linger=accepted,
+                )
+            return
+
+        self.recovery_action = action
+        text = str(state.get("text", "")).strip()
+
+        if text:
+            self.set_status(text, "info", linger=True)
+
+    def apply_orientation(self, state):
+        self.flip = bool(state.get("flip"))
+        self.dirty = True
 
     def apply_position(self, state):
         try:
@@ -1587,6 +2073,9 @@ class Overlay(QWidget):
 
         if seq < self.position_seq:
             return
+
+        # A native position is the authoritative completion of RESCAN/FEN.
+        self.recovery_action = ""
 
         last = state.get("last") or ""
         same_position = seq == self.position_seq and state["fen"] == self.fen
@@ -1606,7 +2095,13 @@ class Overlay(QWidget):
 
         # SAN for the move just played has to be read off the board it came
         # from -- which is the one we are about to replace, so do it first.
-        if last and any(square != "." for square in self.grid):
+        if last and last == self.last_move and state["fen"] == self.fen:
+            # A forced re-read republishes the same authoritative position so
+            # the engines run again. Keep the SAN already derived from the
+            # actual pre-move board instead of trying to decode that move from
+            # its post-move FEN.
+            pass
+        elif last and any(square != "." for square in self.grid):
             self.last_san = name_move(self.fen, self.grid, last)
         else:
             self.last_san = ""
@@ -1623,18 +2118,15 @@ class Overlay(QWidget):
         # A blanket reset here would also wipe the last move that was just
         # decoded above -- that one belongs to the new position, not the old
         # evaluation.
-        self.best_move = ""
-        self.human_move = ""
-        self.best_cp = None
-        self.best_mate = None
-        self.depth = 0
-        self.has_eval = False
-        self.lines = []
+        self.clear_evaluation(clear_last=False)
 
         self.clear_startup_notice()
         self.dirty = True
 
     def apply_analysis(self, state):
+        if self.recovery_action:
+            return
+
         seq = int(state.get("seq", -1))
 
         # Stale evaluation for a position the board has already left behind.
@@ -1661,6 +2153,10 @@ class Overlay(QWidget):
 
     def apply_ready(self, state):
         self.apply_settings_echo(state)
+
+        if self.recovery_action in {"restart", "restart_engines"}:
+            self.recovery_action = ""
+            self.clear_evaluation(clear_last=False)
 
         missing = [
             name
@@ -1698,7 +2194,11 @@ class Overlay(QWidget):
     def apply_status(self, state):
         text = str(state.get("text", ""))
         kind = state.get("kind", "info")
-        self.set_status(text, kind if kind in {"info", "warn"} else "info")
+
+        if text:
+            self.set_status(text, kind if kind in {"info", "warn"} else "info")
+        else:
+            self.clear_status()
 
     # -- the only place board data reaches widgets -------------------------
 
@@ -1756,7 +2256,12 @@ class Overlay(QWidget):
         self.settings.sync()
 
         try:
-            self.send_control("QUIT")
+            command = (
+                f"QUIT {self.session_id}"
+                if self.session_active and self.session_id
+                else "QUIT"
+            )
+            self.send_control(command)
         except OSError:
             pass
 

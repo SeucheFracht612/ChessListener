@@ -1,21 +1,23 @@
 # ChessListener
 
-ChessListener is a local analysis companion for **Chess.com games you are
-spectating**. A Firefox extension observes the board, a native C host rebuilds
-the chess position, Stockfish supplies objective analysis, and an optional
-Maia/lc0 model predicts a plausible human move for a selected rating.
+ChessListener is a local analysis companion for Chess.com boards. A Firefox
+extension observes the board, a native C host rebuilds the chess position,
+Stockfish supplies objective analysis, and an optional Maia/lc0 model predicts
+a plausible human move for a selected rating.
 
-> **Fair-play boundary:** do not use ChessListener while playing a live game.
-> It is intended only for games in which you are a spectator and for analysis
-> after a game has ended. Site rules and tournament rules remain authoritative;
-> see the [Chess.com Fair Play Policy](https://www.chess.com/legal/fair-play).
+ChessListener deliberately does not try to decide whether a page is a
+spectator, bot, test, or participant game. That keeps local testing possible
+and avoids a brittle site-policy detector. You are responsible for using it
+where analysis is allowed; site and tournament rules remain authoritative.
+See the [Chess.com Fair Play Policy](https://www.chess.com/legal/fair-play).
 
 ## Current support
 
 - Linux x86-64 only.
-- Firefox installed as a normal distribution package.
+- Firefox 115 or newer, installed as a normal distribution package.
 - Debian and Ubuntu are the primary supported distributions.
-- Chess.com spectator pages.
+- Chess.com pages containing a supported live board, including bot and
+  spectator games.
 - Stockfish is required. Maia is optional and needs a user-provided lc0
   executable; the overlay works in Stockfish-only mode when it is unavailable.
 
@@ -152,7 +154,9 @@ Stockfish. To make Maia mandatory for a particular installation:
 2. Select **This Firefox**.
 3. Select **Load Temporary Add-on…**.
 4. Choose `Extension/manifest.json` from this checkout.
-5. Open a supported Chess.com game as a spectator.
+5. Open a supported Chess.com board. The first visible board can claim the
+   single analysis session automatically, or use the toolbar popup and select
+   **Analyze this tab**.
 
 The repository does **not** currently publish a Mozilla-signed XPI. Firefox
 release builds remove temporary add-ons when the browser exits, so step 3 must
@@ -193,6 +197,33 @@ Alternatively, pass the same `--prefix`/`CHESSLISTENER_PREFIX` and
 Reload the temporary extension in `about:debugging` after an extension update.
 Keep `Extension/` and the installed native host from the same release.
 
+## Sessions and recovery
+
+ChessListener analyzes exactly one browser game at a time. Boards in other
+tabs are remembered but cannot replace the owner automatically. Use the
+Firefox toolbar popup to inspect the active game, explicitly switch with
+**Analyze this tab**, request **Re-read board**, or **Stop session**.
+
+Navigation, game completion, and closing the owning tab end its session and
+stop position analysis. Closing the overlay is sticky for that session: a
+later board mutation does not immediately reopen it. An unexpected native-host
+failure gets one automatic reconnect and latest-position replay; after that,
+the popup reports the failure and waits for an explicit action.
+
+The overlay's circular-arrow **Recovery** page contains the manual tools:
+
+- re-read the current Chess.com board;
+- replace hidden state using the visible pieces plus side to move, castling,
+  en-passant, and move counters;
+- apply an exact six-field FEN;
+- restart Stockfish and Maia; or
+- stop the current session.
+
+The native host validates replacement FENs before changing its authoritative
+position. A rejected value leaves the prior position intact. Board orientation
+is tracked separately, so flipping a board no longer requires a move before
+the overlay follows it.
+
 ## Uninstall
 
 Preview the exact targets, then remove them:
@@ -221,7 +252,7 @@ CUSTOM_PREFIX=/absolute/custom/path/chess-listener
 | Layer | Responsibility |
 |---|---|
 | `Extension/content.js` | Detects supported Chess.com boards/routes, filters unstable DOM snapshots, and sends board state. |
-| `Extension/background.js` | Owns the Firefox native-messaging connection and verifies protocol compatibility. |
+| `Extension/background.js` | Brokers one explicit game session across tabs, owns reconnect/replay, and verifies protocol compatibility. |
 | `Native/main.c` | Parses native messages, reconstructs legal chess state, infers/catches up moves, and emits FEN. |
 | `Native/analysis.c` | Runs latest-position-wins analysis with Stockfish and optional Maia. |
 | `Native/uci.c` | Manages persistent UCI engine processes, UCI parsing, timeouts, and cancellation. |
@@ -230,11 +261,12 @@ CUSTOM_PREFIX=/absolute/custom/path/chess-listener
 | `Native/san.py` | Converts UCI moves and principal variations to SAN for display. |
 
 The browser-to-host channel uses Firefox's length-prefixed native-messaging
-format. Release 0.2.1 uses **protocol version 1**. The extension sends a `hello`
+format. Release 0.3.0 uses **protocol version 2**. The extension sends a `hello`
 containing its protocol and release version; the host replies with its version
-and capabilities before accepting positions. The host and Python overlay also
-negotiate protocol 1 before engines begin. A mismatch is rejected instead of
-silently mixing incompatible components.
+and capabilities before accepting session-scoped snapshots or recovery
+commands. The host and Python overlay also negotiate protocol 2 before engines
+begin. A mismatch is rejected instead of silently mixing incompatible
+components.
 
 If Firefox reports an incompatible protocol, update and reinstall the native
 host, reload the extension, and run `./Native/install.sh --check`.
@@ -351,10 +383,10 @@ those are required for capture and the local host connection.
 Debug logs are local but may preserve game positions until deleted. Chess.com
 itself still receives the normal traffic generated by its website.
 
-Release 0.2.1 does **not** automatically prove that you are only spectating; it
-relies on user compliance. An automated spectator-only gate is deferred work.
-Never run the tool on a game you are participating in, and stop using it if a
-site or event rule prohibits spectator assistance.
+Release 0.3.0 intentionally does not classify a page as participant,
+spectator, bot, or test play. The same capture path remains available for bot
+games and local feature testing. Decide whether analysis is allowed in your
+context and follow the applicable site, event, and tournament rules.
 
 ## License
 

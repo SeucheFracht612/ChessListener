@@ -7,7 +7,6 @@ const PIECE_TO_CHARACTER = Object.freeze({
     wr: "R",
     wq: "Q",
     wk: "K",
-
     bp: "p",
     bn: "n",
     bb: "b",
@@ -16,118 +15,154 @@ const PIECE_TO_CHARACTER = Object.freeze({
     bk: "k"
 });
 
+const GAME_OVER_SELECTORS = [
+    '[data-cy="game-over-modal"]',
+    '[data-cy="game-over-dialog"]',
+    "game-over-modal",
+    ".game-over-modal-content",
+    ".game-over-modal"
+];
+
+const INITIAL_BOARD =
+    "rnbqkbnr" +
+    "pppppppp" +
+    "........" +
+    "........" +
+    "........" +
+    "........" +
+    "PPPPPPPP" +
+    "RNBQKBNR";
+
+function createPageInstanceId() {
+    if (typeof globalThis.crypto?.randomUUID === "function") {
+        return globalThis.crypto.randomUUID();
+    }
+    return `page-${Date.now().toString(36)}-${Math.random()
+        .toString(36)
+        .slice(2)}`;
+}
+
+const PAGE_INSTANCE_ID = createPageInstanceId();
+let routeGeneration = 0;
+let routeUrl = window.location.href;
+let gameKey = buildGameKey();
 let activeBoard = null;
 let boardObserver = null;
 let captureTimer = null;
-let lastSentPosition = null;
+let captureEpoch = 0;
+let forceNextCapture = false;
+let lastSubmittedIdentity = null;
 let pointerIsDown = false;
+let gameIsOver = false;
+let gameOverMarker = null;
 
-function IsGamePage() {
-    return (
-        window.location.pathname.startsWith("/play/") ||
-        window.location.pathname.startsWith("/game/")
-    );
+function isGamePage() {
+    return /^\/(play|game)(\/|$)/.test(window.location.pathname);
 }
 
-function FindActiveBoard() {
-    if (!IsGamePage()) {
+function buildGameKey() {
+    const url = new URL(window.location.href);
+    return `${url.origin}${url.pathname}${url.search}#${routeGeneration}`;
+}
+
+function pageIsVisible() {
+    return document.visibilityState === "visible";
+}
+
+function elementIsRendered(element) {
+    if (
+        element.hidden ||
+        element.getAttribute("aria-hidden") === "true"
+    ) {
+        return false;
+    }
+    const style = window.getComputedStyle(element);
+    if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        Number.parseFloat(style.opacity) === 0
+    ) {
+        return false;
+    }
+    const rectangle = element.getBoundingClientRect();
+    return rectangle.width > 0 && rectangle.height > 0;
+}
+
+function detectGameOver() {
+    return GAME_OVER_SELECTORS.some((selector) => {
+        const element = document.querySelector(selector);
+        return element !== null && elementIsRendered(element);
+    });
+}
+
+function findActiveBoard() {
+    if (!isGamePage()) {
         return null;
     }
 
     const boards = [...document.querySelectorAll("wc-chess-board")]
-    .filter((board) => {
-        const rectangle = board.getBoundingClientRect();
-
-        return (
-            rectangle.width >= 150 &&
-            rectangle.height >= 150 &&
-            rectangle.width > 0 &&
-            rectangle.height > 0
-        );
-    })
-    .sort((left, right) => {
-        const leftRectangle = left.getBoundingClientRect();
-        const rightRectangle = right.getBoundingClientRect();
-
-        const leftArea =
-        leftRectangle.width * leftRectangle.height;
-
-        const rightArea =
-        rightRectangle.width * rightRectangle.height;
-
-        return rightArea - leftArea;
-    });
+        .filter((board) => {
+            const rectangle = board.getBoundingClientRect();
+            return (
+                rectangle.width >= 150 &&
+                rectangle.height >= 150 &&
+                rectangle.width > 0 &&
+                rectangle.height > 0
+            );
+        })
+        .sort((left, right) => {
+            const leftRectangle = left.getBoundingClientRect();
+            const rightRectangle = right.getBoundingClientRect();
+            return (
+                rightRectangle.width * rightRectangle.height -
+                leftRectangle.width * leftRectangle.height
+            );
+        });
 
     return boards[0] ?? null;
 }
 
-function ReadPiece(element) {
+function readPiece(element) {
     const pieceClass = [...element.classList].find((className) =>
-    /^[wb][prnbqk]$/.test(className)
+        /^[wb][prnbqk]$/.test(className)
     );
-
     const squareClass = [...element.classList].find((className) =>
-    /^square-[1-8][1-8]$/.test(className)
+        /^square-[1-8][1-8]$/.test(className)
     );
-
     if (pieceClass === undefined || squareClass === undefined) {
         return null;
     }
 
-    const squareMatch =
-    /^square-([1-8])([1-8])$/.exec(squareClass);
-
+    const squareMatch = /^square-([1-8])([1-8])$/.exec(squareClass);
     if (squareMatch === null) {
         return null;
     }
 
-    const file = Number(squareMatch[1]);
-    const rank = Number(squareMatch[2]);
     const character = PIECE_TO_CHARACTER[pieceClass];
-
     if (character === undefined) {
         return null;
     }
-
     return {
         character,
-        file,
-        rank
+        file: Number(squareMatch[1]),
+        rank: Number(squareMatch[2])
     };
 }
 
-function ReadBoardPosition(board) {
+function readBoardPosition(board) {
     const squares = new Array(64).fill(".");
     let pieceCount = 0;
 
     for (const element of board.querySelectorAll(".piece")) {
-        const piece = ReadPiece(element);
-
-        /*
-         * Chess.com may temporarily create auxiliary piece elements
-         * during animations or dragging. Ignore elements without both
-         * a valid piece code and a valid square.
-         */
+        const piece = readPiece(element);
         if (piece === null) {
             continue;
         }
 
-        /*
-         * Our array starts at a8:
-         *
-         * index 0  = a8
-         * index 7  = h8
-         * index 56 = a1
-         * index 63 = h1
-         */
         const row = 8 - piece.rank;
         const column = piece.file - 1;
         const index = row * 8 + column;
-
-        /*
-         * Two pieces cannot occupy the same square. Seeing this means
-         * Chess.com is currently between DOM states.
-         */
         if (squares[index] !== ".") {
             return null;
         }
@@ -137,175 +172,354 @@ function ReadBoardPosition(board) {
     }
 
     const position = squares.join("");
-
-    /*
-     * Reject clearly incomplete animation states.
-     */
     if (!position.includes("K") || !position.includes("k")) {
         return null;
     }
+    return { position, pieceCount };
+}
 
+function currentPageState(reason) {
     return {
-        position,
-        pieceCount
+        type: "page_state",
+        page_instance_id: PAGE_INSTANCE_ID,
+        route_generation: routeGeneration,
+        game_key: gameKey,
+        url: window.location.href,
+        visible: pageIsVisible(),
+        eligible:
+            isGamePage() && activeBoard !== null && !gameIsOver,
+        reason
     };
 }
 
+function sendWithoutWaiting(message) {
+    try {
+        const pending = browser.runtime.sendMessage(message);
+        if (pending && typeof pending.catch === "function") {
+            pending.catch((error) => {
+                console.debug("[ChessListener] background unavailable:", error);
+            });
+        }
+    } catch (error) {
+        console.debug("[ChessListener] background unavailable:", error);
+    }
+}
 
-function ScheduleCapture() {
-    if (activeBoard === null || pointerIsDown) {
+function notifyPageState(reason) {
+    sendWithoutWaiting(currentPageState(reason));
+}
+
+function invalidateCaptures() {
+    captureEpoch += 1;
+    clearTimeout(captureTimer);
+    captureTimer = null;
+}
+
+function scheduleCapture(force = false) {
+    if (force) {
+        forceNextCapture = true;
+    }
+    if (
+        activeBoard === null ||
+        pointerIsDown ||
+        gameIsOver ||
+        !isGamePage()
+    ) {
         return;
     }
 
     clearTimeout(captureTimer);
-
+    const token = ++captureEpoch;
     captureTimer = setTimeout(() => {
-        CaptureStablePosition();
+        captureTimer = null;
+        const forced = forceNextCapture;
+        void captureStablePosition(token, forced);
     }, 120);
 }
 
-async function CaptureStablePosition() {
+async function captureStablePosition(token, forced) {
     const board = activeBoard;
-
-    if (board === null || !board.isConnected || pointerIsDown) {
+    const capturedGeneration = routeGeneration;
+    const capturedGameKey = gameKey;
+    if (
+        token !== captureEpoch ||
+        board === null ||
+        !board.isConnected ||
+        pointerIsDown ||
+        gameIsOver
+    ) {
         return;
     }
 
-    const firstReading = ReadBoardPosition(board);
-
+    const firstReading = readBoardPosition(board);
+    const firstFlip = board.classList.contains("flipped");
     if (firstReading === null) {
         return;
     }
 
-    /*
-     * Read twice to avoid capturing halfway through castling,
-     * promotion, capture animations, or DOM replacement.
-     */
-    await new Promise((resolve) => {
-        setTimeout(resolve, 75);
-    });
-
+    await new Promise((resolve) => setTimeout(resolve, 75));
     if (
+        token !== captureEpoch ||
         board !== activeBoard ||
         !board.isConnected ||
-        pointerIsDown
+        pointerIsDown ||
+        gameIsOver ||
+        capturedGeneration !== routeGeneration ||
+        capturedGameKey !== gameKey
     ) {
         return;
     }
 
-    const secondReading = ReadBoardPosition(board);
-
+    const secondReading = readBoardPosition(board);
+    const secondFlip = board.classList.contains("flipped");
     if (
         secondReading === null ||
-        firstReading.position !== secondReading.position
+        firstReading.position !== secondReading.position ||
+        firstFlip !== secondFlip
     ) {
-        ScheduleCapture();
+        scheduleCapture(forced);
         return;
     }
 
-    if (secondReading.position === lastSentPosition) {
+    const identity = [
+        PAGE_INSTANCE_ID,
+        capturedGeneration,
+        capturedGameKey,
+        secondReading.position,
+        secondFlip ? "flipped" : "normal"
+    ].join("|");
+    if (!forced && identity === lastSubmittedIdentity) {
         return;
     }
 
     const message = {
-        type: "position_snapshot",
+        type: "board_candidate",
+        page_instance_id: PAGE_INSTANCE_ID,
+        route_generation: capturedGeneration,
+        game_key: capturedGameKey,
         url: window.location.href,
-        captured_at: Date.now(),
+        visible: pageIsVisible(),
         board_id: board.id,
         board: secondReading.position,
         piece_count: secondReading.pieceCount,
-        visually_flipped:
-        board.classList.contains("flipped")
+        visually_flipped: secondFlip,
+        captured_at: Date.now(),
+        force: forced
     };
 
     try {
-        await browser.runtime.sendMessage(message);
-
-        /*
-         * Only mark it as sent after successful communication.
-         */
-        lastSentPosition = secondReading.position;
+        const reply = await browser.runtime.sendMessage(message);
+        if (
+            token === captureEpoch &&
+            capturedGeneration === routeGeneration &&
+            capturedGameKey === gameKey &&
+            reply?.accepted === true
+        ) {
+            lastSubmittedIdentity = identity;
+            if (forced) {
+                forceNextCapture = false;
+            }
+        }
     } catch (error) {
-        console.error(
-            "[ChessListener] could not send position:",
-            error
-        );
+        if (token === captureEpoch) {
+            console.error("[ChessListener] could not cache board:", error);
+            scheduleCapture(forced);
+        }
     }
 }
 
-function AttachToBoard(board) {
+function attachToBoard(board) {
     if (board === activeBoard) {
-        return;
+        return false;
     }
+    invalidateCaptures();
 
     if (boardObserver !== null) {
         boardObserver.disconnect();
         boardObserver = null;
     }
-
     activeBoard = board;
-    lastSentPosition = null;
 
-    if (activeBoard === null) {
-        return;
+    if (activeBoard !== null) {
+        boardObserver = new MutationObserver(() => scheduleCapture());
+        boardObserver.observe(activeBoard, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["class"]
+        });
+        scheduleCapture();
     }
-
-    boardObserver = new MutationObserver(() => {
-        ScheduleCapture();
-    });
-
-    boardObserver.observe(activeBoard, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["class"]
-    });
-
-    ScheduleCapture();
+    return true;
 }
 
-function RefreshActiveBoard() {
-    const board = FindActiveBoard();
+function markGameOver() {
+    const reading =
+        activeBoard === null ? null : readBoardPosition(activeBoard);
+    gameOverMarker = {
+        url: routeUrl,
+        board: activeBoard,
+        position: reading?.position ?? null
+    };
+}
 
-    if (board !== activeBoard) {
-        AttachToBoard(board);
+function isClearlyNewGame(boardChanged) {
+    if (gameOverMarker === null) {
+        return true;
+    }
+
+    if (routeUrl !== gameOverMarker.url) {
+        return true;
+    }
+
+    if (boardChanged && activeBoard !== gameOverMarker.board) {
+        return true;
+    }
+
+    const reading =
+        activeBoard === null ? null : readBoardPosition(activeBoard);
+    return (
+        reading !== null &&
+        reading.position === INITIAL_BOARD &&
+        reading.position !== gameOverMarker.position
+    );
+}
+
+function refreshContext(reason = "poll") {
+    let changed = false;
+    let routeChanged = false;
+    if (window.location.href !== routeUrl) {
+        invalidateCaptures();
+        routeGeneration += 1;
+        routeUrl = window.location.href;
+        gameKey = buildGameKey();
+        lastSubmittedIdentity = null;
+        changed = true;
+        routeChanged = true;
+        reason = "navigation";
+    }
+
+    const boardChanged = attachToBoard(findActiveBoard());
+    if (boardChanged) {
+        changed = true;
+        if (reason === "poll") {
+            reason = activeBoard === null ? "board_missing" : "board_changed";
+        }
+    }
+
+    const nowGameOver = detectGameOver();
+    if (nowGameOver && !gameIsOver) {
+        invalidateCaptures();
+        gameIsOver = true;
+        markGameOver();
+        changed = true;
+        reason = "game_end";
+    } else if (gameIsOver && !nowGameOver && isClearlyNewGame(boardChanged)) {
+        invalidateCaptures();
+        gameIsOver = false;
+        gameOverMarker = null;
+        changed = true;
+
+        if (!routeChanged) {
+            routeGeneration += 1;
+            gameKey = buildGameKey();
+        }
+        lastSubmittedIdentity = null;
+        reason = "new_game";
+    }
+
+    if (changed || reason !== "poll") {
+        notifyPageState(reason);
+    }
+    if (!gameIsOver && activeBoard !== null && changed) {
+        scheduleCapture(reason === "navigation" || reason === "new_game");
     }
 }
 
-/*
- * Avoid recording an incomplete state while the user is dragging
- * a piece around the board.
- */
 document.addEventListener(
     "pointerdown",
     (event) => {
-        if (
-            activeBoard !== null &&
-            activeBoard.contains(event.target)
-        ) {
+        if (activeBoard !== null && activeBoard.contains(event.target)) {
             pointerIsDown = true;
-            clearTimeout(captureTimer);
+            invalidateCaptures();
         }
     },
     true
 );
 
-document.addEventListener(
-    "pointerup",
-    () => {
-        if (!pointerIsDown) {
-            return;
-        }
+function finishPointerInteraction() {
+    if (!pointerIsDown) {
+        return;
+    }
+    pointerIsDown = false;
+    scheduleCapture();
+}
 
-        pointerIsDown = false;
-        ScheduleCapture();
-    },
-    true
-);
+document.addEventListener("pointerup", finishPointerInteraction, true);
+document.addEventListener("pointercancel", finishPointerInteraction, true);
 
-/*
- * Chess.com uses client-side navigation and may replace the entire
- * board without reloading the page.
- */
-RefreshActiveBoard();
-setInterval(RefreshActiveBoard, 1000);
+window.addEventListener("blur", () => {
+    pointerIsDown = false;
+    invalidateCaptures();
+    if (pageIsVisible()) {
+        scheduleCapture();
+    }
+});
+
+document.addEventListener("visibilitychange", () => {
+    pointerIsDown = false;
+    invalidateCaptures();
+    refreshContext("visibility");
+    if (pageIsVisible()) {
+        scheduleCapture();
+    }
+});
+
+window.addEventListener("pagehide", (event) => {
+    sendWithoutWaiting({
+        type: "page_unloading",
+        page_instance_id: PAGE_INSTANCE_ID,
+        route_generation: routeGeneration,
+        game_key: gameKey,
+        url: window.location.href,
+        bfcache: event.persisted === true
+    });
+});
+
+window.addEventListener("pageshow", (event) => {
+    if (event.persisted !== true) {
+        return;
+    }
+
+    /* A page restored from Firefox's back/forward cache keeps this content
+     * script and its page id. Re-announce it and force a fresh stable read;
+     * the background deliberately did not retire this restorable instance. */
+    invalidateCaptures();
+    refreshContext("bfcache_restore");
+    scheduleCapture(true);
+});
+
+browser.runtime.onMessage.addListener((message) => {
+    if (message?.type !== "content_command" || message.command !== "rescan") {
+        return undefined;
+    }
+    if (
+        typeof message.page_instance_id === "string" &&
+        message.page_instance_id !== PAGE_INSTANCE_ID
+    ) {
+        return Promise.resolve({ accepted: false, stale: true });
+    }
+
+    refreshContext("rescan");
+    if (!isGamePage() || activeBoard === null || gameIsOver) {
+        return Promise.resolve({
+            accepted: false,
+            reason: gameIsOver ? "game_ended" : "no_supported_board"
+        });
+    }
+    scheduleCapture(true);
+    return Promise.resolve({ accepted: true });
+});
+
+refreshContext("initial");
+setInterval(() => refreshContext(), 500);

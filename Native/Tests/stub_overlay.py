@@ -13,7 +13,15 @@ import sys
 
 LOG = os.environ.get("CHESSLISTENER_STUB_LOG", "/tmp/chess-listener-frames.jsonl")
 SET_AFTER = int(os.environ.get("CHESSLISTENER_STUB_SET_AFTER_POSITIONS", "0"))
-PROTOCOL = os.environ.get("CHESSLISTENER_STUB_PROTOCOL", "1")
+PROTOCOL = os.environ.get("CHESSLISTENER_STUB_PROTOCOL", "2")
+CONTROLS = [
+    command
+    for command in os.environ.get("CHESSLISTENER_STUB_CONTROLS", "").split("|")
+    if command
+]
+CONTROLS_AFTER = int(
+    os.environ.get("CHESSLISTENER_STUB_CONTROLS_AFTER_POSITIONS", "0")
+)
 
 
 def send(command):
@@ -23,12 +31,18 @@ def send(command):
 def main():
     budget = os.environ.get("BUDGET", "100")
     send(
-        f"START protocol={PROTOCOL} ui_version=0.2.1-test budget={budget} "
+        f"START protocol={PROTOCOL} ui_version=0.3.0-test budget={budget} "
         "maia=1900 threads=1 multipv=3"
     )
 
     positions = 0
     settings_sent = False
+    controls_sent = False
+
+    if CONTROLS and CONTROLS_AFTER <= 0:
+        for command in CONTROLS:
+            send(command)
+        controls_sent = True
 
     with open(LOG, "a", encoding="utf-8") as log:
         for line in sys.stdin:
@@ -52,6 +66,15 @@ def main():
                 # Exercise option changes while board snapshots are arriving.
                 send("SET budget=90 maia=1900 threads=1 multipv=2")
                 settings_sent = True
+
+            if (
+                CONTROLS and
+                positions >= CONTROLS_AFTER and
+                not controls_sent
+            ):
+                for command in CONTROLS:
+                    send(command)
+                controls_sent = True
 
     return 0
 

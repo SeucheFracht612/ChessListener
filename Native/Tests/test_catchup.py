@@ -7,7 +7,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from e2e import INITIAL, apply_move, recv, send, start_host, stop_host
+from e2e import INITIAL, apply_move, send_snapshot, start_host, stop_host
 
 
 OPENING = [
@@ -17,13 +17,8 @@ OPENING = [
 ]
 
 
-def snapshot(proc, board):
-    send(proc, {
-        "type": "position_snapshot",
-        "board": board,
-        "visually_flipped": False,
-    })
-    return recv(proc)
+def snapshot(proc, board, sequence):
+    return send_snapshot(proc, board, sequence)
 
 
 def run_case(gap_plies, moves_after_gap=4):
@@ -36,13 +31,15 @@ def run_case(gap_plies, moves_after_gap=4):
         try:
             board = INITIAL
             index = 0
-            snapshot(proc, board)
+            sequence = 1
+            snapshot(proc, board, sequence)
 
             # Two clean moves first, so the tracker is definitely locked on.
             for _ in range(2):
                 board = apply_move(board, OPENING[index])
                 index += 1
-                snapshot(proc, board)
+                sequence += 1
+                snapshot(proc, board, sequence)
 
             # Apply the gap, but send only its final board.
             for _ in range(gap_plies):
@@ -50,14 +47,16 @@ def run_case(gap_plies, moves_after_gap=4):
                 index += 1
 
             began = time.monotonic()
-            gap_reason = snapshot(proc, board)["reason"]
+            sequence += 1
+            gap_reason = snapshot(proc, board, sequence)["reason"]
             elapsed = time.monotonic() - began
 
             after = []
             for _ in range(moves_after_gap):
                 board = apply_move(board, OPENING[index])
                 index += 1
-                after.append(snapshot(proc, board)["reason"])
+                sequence += 1
+                after.append(snapshot(proc, board, sequence)["reason"])
 
             return gap_reason, after, elapsed
         finally:
@@ -110,7 +109,8 @@ def main():
         proc = start_host(os.path.join(temp, "frames.jsonl"))
         try:
             board = INITIAL
-            snapshot(proc, board)
+            sequence = 1
+            snapshot(proc, board, sequence)
             index = 0
             reasons = []
 
@@ -118,7 +118,8 @@ def main():
                 for _ in range(2):
                     board = apply_move(board, OPENING[index])
                     index += 1
-                reasons.append(snapshot(proc, board)["reason"])
+                sequence += 1
+                reasons.append(snapshot(proc, board, sequence)["reason"])
         finally:
             stop_host(proc)
 

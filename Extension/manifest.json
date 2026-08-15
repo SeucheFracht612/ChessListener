@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "ChessListener",
-  "version": "0.2.1",
-  "description": "Provides a local live-analysis overlay for Chess.com games you are spectating.",
+  "version": "0.3.0",
+  "description": "Provides a local live-analysis overlay for Chess.com games, including bot games.",
   "permissions": [
-    "nativeMessaging"
+    "nativeMessaging",
+    "storage"
   ],
   "host_permissions": [
     "https://www.chess.com/*"
@@ -13,6 +14,10 @@
     "scripts": [
       "background.js"
     ]
+  },
+  "action": {
+    "default_title": "ChessListener session",
+    "default_popup": "popup.html"
   },
   "content_scripts": [
     {
@@ -27,7 +32,8 @@
   ],
   "browser_specific_settings": {
     "gecko": {
-      "id": "chess-listener@local"
+      "id": "chess-listener@local",
+      "strict_min_version": "115.0"
     }
   }
 }

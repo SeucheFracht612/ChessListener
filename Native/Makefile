@@ -37,6 +37,9 @@ check-python:
 check-js:
 	$(NODE) --check ../Extension/background.js
 	$(NODE) --check ../Extension/content.js
+	@if [ -f ../Extension/popup.js ]; then \
+		$(NODE) --check ../Extension/popup.js; \
+	fi
 	@for file in ../Extension/Tests/*.js; do \
 		[ -e "$$file" ] || continue; \
 		$(NODE) --check "$$file"; \
@@ -48,12 +51,14 @@ check-shell:
 check: check-python check-js check-shell
 
 test-js:
-	@if [ -f ../Extension/Tests/test_background.js ]; then \
-		echo "Running Extension/Tests/test_background.js"; \
-		$(NODE) ../Extension/Tests/test_background.js; \
-	else \
-		echo "No extension tests found"; \
-	fi
+	@found=0; \
+	for file in ../Extension/Tests/*.js; do \
+		[ -e "$$file" ] || continue; \
+		found=1; \
+		echo "Running $$file"; \
+		$(NODE) "$$file" || exit $$?; \
+	done; \
+	if [ "$$found" -eq 0 ]; then echo "No extension tests found"; fi
 
 # -B is deliberate: tests must exercise objects compiled from the current
 # checkout, never old or accidentally committed build products.

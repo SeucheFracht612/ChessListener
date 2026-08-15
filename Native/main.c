@@ -1,4 +1,7 @@
+#include <errno.h>
 #include <ctype.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +15,10 @@
 #define BOARD_SQUARE_COUNT 64U
 #define MAX_LEGAL_MOVES 256U
 #define MAX_FEN_LENGTH 128U
-#define MAX_RESPONSE_LENGTH 256U
+#define MAX_RESPONSE_LENGTH 512U
+#define MAX_SESSION_ID_LENGTH 128U
+#define MAX_SESSION_LABEL_LENGTH 256U
+#define MAX_EVENT_LENGTH 512U
 
 #define CASTLE_WHITE_KINGSIDE  (1U << 0)
 #define CASTLE_WHITE_QUEENSIDE (1U << 1)
@@ -50,6 +56,25 @@ typedef struct {
     Move moves[MAX_LEGAL_MOVES];
     size_t count;
 } MoveList;
+
+typedef struct {
+    int active;
+    char id[MAX_SESSION_ID_LENGTH + 1U];
+    Position position;
+    int hasPosition;
+    char lastMove[6];
+    char pendingBoard[BOARD_SQUARE_COUNT];
+    int hasPendingBoard;
+    uint64_t lastSnapshotSequence;
+    int hasSnapshotSequence;
+    int visuallyFlipped;
+    int hasOrientation;
+} SessionState;
+
+/* Firefox native-messaging frames may originate on the browser thread or on
+ * analysis.c's overlay-control thread. Header and payload must be one atomic
+ * critical section or concurrent writes corrupt the byte stream. */
+static pthread_mutex_t nativeOutputLock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char INITIAL_BOARD[BOARD_SQUARE_COUNT + 1U] =
 "rnbqkbnr"
@@ -121,6 +146,8 @@ static int ReadNativeMessage(char **messageOut)
 
 static int WriteNativeMessage(const char *json)
 {
+    int result = 0;
+
     if (json == NULL) {
         return 0;
     }
@@ -133,15 +160,218 @@ static int WriteNativeMessage(const char *json)
 
     uint32_t messageLength = (uint32_t)stringLength;
 
-    if (fwrite(&messageLength, sizeof(messageLength), 1U, stdout) != 1U) {
+    if (pthread_mutex_lock(&nativeOutputLock) != 0) {
         return 0;
+    }
+
+    if (fwrite(&messageLength, sizeof(messageLength), 1U, stdout) != 1U) {
+        goto done;
     }
 
     if (fwrite(json, 1U, messageLength, stdout) != messageLength) {
+        goto done;
+    }
+
+    result = fflush(stdout) == 0;
+
+done:
+    (void)pthread_mutex_unlock(&nativeOutputLock);
+    return result;
+}
+
+static int AppendJsonEscaped(
+    char *output,
+    size_t outputSize,
+    size_t *offset,
+    const char *text)
+{
+    static const char hex[] = "0123456789abcdef";
+
+    if (output == NULL || offset == NULL || text == NULL) {
         return 0;
     }
 
-    return fflush(stdout) == 0;
+    for (const unsigned char *cursor = (const unsigned char *)text;
+         *cursor != '\0';
+         cursor += 1) {
+        unsigned char character = *cursor;
+
+        if (character == '"' || character == '\\') {
+            if (*offset + 2U >= outputSize) {
+                return 0;
+            }
+            output[(*offset)++] = '\\';
+            output[(*offset)++] = (char)character;
+        } else if (character < 0x20U) {
+            if (*offset + 6U >= outputSize) {
+                return 0;
+            }
+            output[(*offset)++] = '\\';
+            output[(*offset)++] = 'u';
+            output[(*offset)++] = '0';
+            output[(*offset)++] = '0';
+            output[(*offset)++] = hex[character >> 4U];
+            output[(*offset)++] = hex[character & 0x0fU];
+        } else {
+            if (*offset + 1U >= outputSize) {
+                return 0;
+            }
+            output[(*offset)++] = (char)character;
+        }
+    }
+
+    output[*offset] = '\0';
+    return 1;
+}
+
+static void ForwardAnalysisEvent(
+    const char *kind,
+    const char *name,
+    const char *payload,
+    const char *sessionId,
+    void *context)
+{
+    char message[MAX_EVENT_LENGTH];
+    size_t offset;
+    int written;
+
+    (void)context;
+
+    if (kind == NULL || name == NULL) {
+        return;
+    }
+
+    if (strcmp(kind, "command") == 0) {
+        if (strcmp(name, "rescan") != 0 &&
+            strcmp(name, "set_fen") != 0 &&
+            strcmp(name, "restart_engines") != 0 &&
+            strcmp(name, "stop_session") != 0) {
+            return;
+        }
+        if (sessionId == NULL || *sessionId == '\0') {
+            return;
+        }
+
+        written = snprintf(
+            message,
+            sizeof(message),
+            "{\"type\":\"overlay_command\",\"command\":\"%s\"",
+            name);
+    } else if (strcmp(kind, "event") == 0) {
+        if (strcmp(name, "dismissed") != 0) {
+            return;
+        }
+
+        written = snprintf(
+            message,
+            sizeof(message),
+            "{\"type\":\"overlay_event\",\"event\":\"%s\"",
+            name);
+    } else {
+        return;
+    }
+
+    if (written < 0 || (size_t)written >= sizeof(message)) {
+        return;
+    }
+    offset = (size_t)written;
+
+    if (sessionId != NULL && *sessionId != '\0') {
+        static const char prefix[] = ",\"session_id\":\"";
+        size_t prefixLength = sizeof(prefix) - 1U;
+
+        if (offset + prefixLength >= sizeof(message)) {
+            return;
+        }
+        memcpy(message + offset, prefix, prefixLength);
+        offset += prefixLength;
+        message[offset] = '\0';
+
+        if (!AppendJsonEscaped(message, sizeof(message), &offset, sessionId) ||
+            offset + 2U >= sizeof(message)) {
+            return;
+        }
+        message[offset++] = '"';
+        message[offset] = '\0';
+    }
+
+    if (payload != NULL) {
+        static const char prefix[] = ",\"payload\":\"";
+        size_t prefixLength = sizeof(prefix) - 1U;
+
+        if (offset + prefixLength >= sizeof(message)) {
+            return;
+        }
+        memcpy(message + offset, prefix, prefixLength);
+        offset += prefixLength;
+        message[offset] = '\0';
+
+        if (!AppendJsonEscaped(message, sizeof(message), &offset, payload) ||
+            offset + 2U >= sizeof(message)) {
+            return;
+        }
+        message[offset++] = '"';
+    }
+
+    if (offset + 1U >= sizeof(message)) {
+        return;
+    }
+    message[offset++] = '}';
+    message[offset] = '\0';
+
+    (void)WriteNativeMessage(message);
+}
+
+/* Locate a restricted JSON object's field value. Continue past matching text
+ * in string values (for example a game key literally equal to "force") and
+ * accept only a quoted name followed by a colon. */
+static const char *FindJsonFieldValue(
+    const char *json,
+    const char *fieldName)
+{
+    char key[64];
+    int keyLength;
+    const char *cursor;
+
+    if (json == NULL || fieldName == NULL) {
+        return NULL;
+    }
+
+    keyLength = snprintf(key, sizeof(key), "\"%s\"", fieldName);
+    if (keyLength < 0 || (size_t)keyLength >= sizeof(key)) {
+        return NULL;
+    }
+
+    cursor = json;
+    while ((cursor = strstr(cursor, key)) != NULL) {
+        const char *before = cursor;
+        const char *value = cursor + (size_t)keyLength;
+
+        while (before > json &&
+               isspace((unsigned char)before[-1]) != 0) {
+            before -= 1;
+        }
+
+        if (before == json || (before[-1] != '{' && before[-1] != ',')) {
+            cursor += (size_t)keyLength;
+            continue;
+        }
+
+        while (isspace((unsigned char)*value) != 0) {
+            value += 1;
+        }
+        if (*value == ':') {
+            value += 1;
+            while (isspace((unsigned char)*value) != 0) {
+                value += 1;
+            }
+            return value;
+        }
+
+        cursor += (size_t)keyLength;
+    }
+
+    return NULL;
 }
 
 /*
@@ -163,33 +393,10 @@ static int ExtractJsonStringField(
         return 0;
     }
 
-    char key[64];
-    int keyLength = snprintf(key, sizeof(key), "\"%s\"", fieldName);
-
-    if (keyLength < 0 || (size_t)keyLength >= sizeof(key)) {
-        return 0;
-    }
-
-    const char *cursor = strstr(json, key);
+    const char *cursor = FindJsonFieldValue(json, fieldName);
 
     if (cursor == NULL) {
         return 0;
-    }
-
-    cursor += (size_t)keyLength;
-
-    while (isspace((unsigned char)*cursor) != 0) {
-        cursor += 1;
-    }
-
-    if (*cursor != ':') {
-        return 0;
-    }
-
-    cursor += 1;
-
-    while (isspace((unsigned char)*cursor) != 0) {
-        cursor += 1;
     }
 
     if (*cursor != '"') {
@@ -226,40 +433,15 @@ static int ExtractJsonBoolField(
     const char *fieldName,
     int *valueOut)
 {
-    char key[64];
-    int keyLength;
     const char *cursor;
 
     if (json == NULL || fieldName == NULL || valueOut == NULL) {
         return 0;
     }
 
-    keyLength = snprintf(key, sizeof(key), "\"%s\"", fieldName);
-
-    if (keyLength < 0 || (size_t)keyLength >= sizeof(key)) {
-        return 0;
-    }
-
-    cursor = strstr(json, key);
-
+    cursor = FindJsonFieldValue(json, fieldName);
     if (cursor == NULL) {
         return 0;
-    }
-
-    cursor += (size_t)keyLength;
-
-    while (isspace((unsigned char)*cursor) != 0) {
-        cursor += 1;
-    }
-
-    if (*cursor != ':') {
-        return 0;
-    }
-
-    cursor += 1;
-
-    while (isspace((unsigned char)*cursor) != 0) {
-        cursor += 1;
     }
 
     if (strncmp(cursor, "true", 4U) == 0) {
@@ -281,8 +463,6 @@ static int ExtractJsonIntField(
     const char *fieldName,
     int *valueOut)
 {
-    char key[64];
-    int keyLength;
     const char *cursor;
     char *end;
     long value;
@@ -291,32 +471,9 @@ static int ExtractJsonIntField(
         return 0;
     }
 
-    keyLength = snprintf(key, sizeof(key), "\"%s\"", fieldName);
-
-    if (keyLength < 0 || (size_t)keyLength >= sizeof(key)) {
-        return 0;
-    }
-
-    cursor = strstr(json, key);
-
+    cursor = FindJsonFieldValue(json, fieldName);
     if (cursor == NULL) {
         return 0;
-    }
-
-    cursor += (size_t)keyLength;
-
-    while (isspace((unsigned char)*cursor) != 0) {
-        cursor += 1;
-    }
-
-    if (*cursor != ':') {
-        return 0;
-    }
-
-    cursor += 1;
-
-    while (isspace((unsigned char)*cursor) != 0) {
-        cursor += 1;
     }
 
     value = strtol(cursor, &end, 10);
@@ -334,6 +491,69 @@ static int ExtractJsonIntField(
     }
 
     *valueOut = (int)value;
+    return 1;
+}
+
+/* Same restricted parser, for a non-negative 64-bit sequence number. */
+static int ExtractJsonUint64Field(
+    const char *json,
+    const char *fieldName,
+    uint64_t *valueOut)
+{
+    const char *cursor;
+    char *end;
+    unsigned long long value;
+
+    if (json == NULL || fieldName == NULL || valueOut == NULL) {
+        return 0;
+    }
+
+    cursor = FindJsonFieldValue(json, fieldName);
+    if (cursor == NULL) {
+        return 0;
+    }
+    if (*cursor == '-' || *cursor == '+') {
+        return 0;
+    }
+
+    errno = 0;
+    value = strtoull(cursor, &end, 10);
+    if (end == cursor || errno == ERANGE || value > UINT64_MAX) {
+        return 0;
+    }
+
+    while (isspace((unsigned char)*end) != 0) {
+        end += 1;
+    }
+    if (*end != ',' && *end != '}') {
+        return 0;
+    }
+
+    *valueOut = (uint64_t)value;
+    return 1;
+}
+
+static int IsValidSessionId(const char *sessionId)
+{
+    size_t length;
+
+    if (sessionId == NULL) {
+        return 0;
+    }
+
+    length = strlen(sessionId);
+    if (length == 0U || length > MAX_SESSION_ID_LENGTH) {
+        return 0;
+    }
+
+    for (size_t index = 0U; index < length; index += 1U) {
+        unsigned char character = (unsigned char)sessionId[index];
+        if (isalnum(character) == 0 && character != '-' && character != '_' &&
+            character != '.' && character != ':') {
+            return 0;
+        }
+    }
+
     return 1;
 }
 
@@ -483,6 +703,215 @@ static void InitializePosition(Position *position)
     position->enPassantSquare = -1;
     position->halfmoveClock = 0U;
     position->fullmoveNumber = 1U;
+}
+
+static int ParseFenUnsigned(
+    const char **cursorInOut,
+    unsigned int minimum,
+    unsigned int *valueOut,
+    int finalField)
+{
+    const char *cursor;
+    char *end;
+    unsigned long value;
+
+    if (cursorInOut == NULL || *cursorInOut == NULL || valueOut == NULL) {
+        return 0;
+    }
+
+    cursor = *cursorInOut;
+    if (isdigit((unsigned char)*cursor) == 0) {
+        return 0;
+    }
+
+    errno = 0;
+    value = strtoul(cursor, &end, 10);
+    if (end == cursor || errno == ERANGE || value > UINT_MAX ||
+        value < minimum) {
+        return 0;
+    }
+
+    if (finalField) {
+        if (*end != '\0') {
+            return 0;
+        }
+    } else {
+        if (*end != ' ') {
+            return 0;
+        }
+        end += 1;
+    }
+
+    *valueOut = (unsigned int)value;
+    *cursorInOut = end;
+    return 1;
+}
+
+/* Parse the complete six-field FEN used by the authoritative state override.
+ * In addition to syntax, reject structurally impossible boards, castling
+ * rights without their home king/rook, and en-passant targets that cannot
+ * have resulted from the immediately preceding double pawn move. */
+static int PositionFromFen(const char *fen, Position *positionOut)
+{
+    Position position;
+    const char *cursor;
+    char validationBoard[BOARD_SQUARE_COUNT + 1U];
+
+    if (fen == NULL || positionOut == NULL || *fen == '\0' ||
+        strlen(fen) >= MAX_FEN_LENGTH) {
+        return 0;
+    }
+
+    memset(&position, 0, sizeof(position));
+    memset(position.board, '.', sizeof(position.board));
+    position.enPassantSquare = -1;
+    cursor = fen;
+
+    for (int row = 0; row < 8; row += 1) {
+        int file = 0;
+
+        while (*cursor != '\0' && *cursor != '/' && *cursor != ' ') {
+            if (*cursor >= '1' && *cursor <= '8') {
+                file += *cursor - '0';
+                if (file > 8) {
+                    return 0;
+                }
+            } else if (strchr("PNBRQKpnbrqk", *cursor) != NULL) {
+                if (file >= 8) {
+                    return 0;
+                }
+                position.board[SquareFromRowFile(row, file)] = *cursor;
+                file += 1;
+            } else {
+                return 0;
+            }
+            cursor += 1;
+        }
+
+        if (file != 8) {
+            return 0;
+        }
+
+        if (row < 7) {
+            if (*cursor != '/') {
+                return 0;
+            }
+        } else if (*cursor != ' ') {
+            return 0;
+        }
+        cursor += 1;
+    }
+
+    if (cursor[0] == 'w' && cursor[1] == ' ') {
+        position.sideToMove = COLOR_WHITE;
+    } else if (cursor[0] == 'b' && cursor[1] == ' ') {
+        position.sideToMove = COLOR_BLACK;
+    } else {
+        return 0;
+    }
+    cursor += 2;
+
+    if (*cursor == '-') {
+        cursor += 1;
+        if (*cursor != ' ') {
+            return 0;
+        }
+    } else {
+        int sawRight = 0;
+
+        while (*cursor != '\0' && *cursor != ' ') {
+            uint8_t right;
+
+            switch (*cursor) {
+                case 'K': right = CASTLE_WHITE_KINGSIDE; break;
+                case 'Q': right = CASTLE_WHITE_QUEENSIDE; break;
+                case 'k': right = CASTLE_BLACK_KINGSIDE; break;
+                case 'q': right = CASTLE_BLACK_QUEENSIDE; break;
+                default: return 0;
+            }
+
+            if ((position.castlingRights & right) != 0U) {
+                return 0;
+            }
+            position.castlingRights |= right;
+            sawRight = 1;
+            cursor += 1;
+        }
+
+        if (!sawRight || *cursor != ' ') {
+            return 0;
+        }
+    }
+    cursor += 1;
+
+    if (*cursor == '-') {
+        position.enPassantSquare = -1;
+        cursor += 1;
+        if (*cursor != ' ') {
+            return 0;
+        }
+    } else {
+        char fileName = cursor[0];
+        char rankName = cursor[1];
+        int row;
+        int file;
+
+        if (fileName < 'a' || fileName > 'h' || rankName == '\0' ||
+            (rankName != '3' && rankName != '6') || cursor[2] != ' ') {
+            return 0;
+        }
+
+        row = '8' - rankName;
+        file = fileName - 'a';
+        position.enPassantSquare = SquareFromRowFile(row, file);
+        cursor += 2;
+    }
+    cursor += 1;
+
+    memcpy(validationBoard, position.board, BOARD_SQUARE_COUNT);
+    validationBoard[BOARD_SQUARE_COUNT] = '\0';
+
+    if (!ParseFenUnsigned(&cursor, 0U, &position.halfmoveClock, 0) ||
+        !ParseFenUnsigned(&cursor, 1U, &position.fullmoveNumber, 1) ||
+        !ValidateBoardString(validationBoard, NULL)) {
+        return 0;
+    }
+
+    if (((position.castlingRights & CASTLE_WHITE_KINGSIDE) != 0U &&
+         (position.board[60] != 'K' || position.board[63] != 'R')) ||
+        ((position.castlingRights & CASTLE_WHITE_QUEENSIDE) != 0U &&
+         (position.board[60] != 'K' || position.board[56] != 'R')) ||
+        ((position.castlingRights & CASTLE_BLACK_KINGSIDE) != 0U &&
+         (position.board[4] != 'k' || position.board[7] != 'r')) ||
+        ((position.castlingRights & CASTLE_BLACK_QUEENSIDE) != 0U &&
+         (position.board[4] != 'k' || position.board[0] != 'r'))) {
+        return 0;
+    }
+
+    if (position.enPassantSquare >= 0) {
+        int square = position.enPassantSquare;
+        char rank = (char)('8' - RowOf(square));
+
+        if (position.board[square] != '.') {
+            return 0;
+        }
+
+        if (position.sideToMove == COLOR_WHITE) {
+            if (rank != '6' || square + 8 >= (int)BOARD_SQUARE_COUNT ||
+                square - 8 < 0 || position.board[square + 8] != 'p' ||
+                position.board[square - 8] != '.') {
+                return 0;
+            }
+        } else if (rank != '3' || square - 8 < 0 ||
+                   square + 8 >= (int)BOARD_SQUARE_COUNT ||
+                   position.board[square - 8] != 'P' ||
+                   position.board[square + 8] != '.') {
+            return 0;
+        }
+    }
+
+    *positionOut = position;
+    return 1;
 }
 
 static int FindKingSquare(const Position *position, Color color)
@@ -1774,7 +2203,8 @@ static int HandleHello(
         MAX_RESPONSE_LENGTH,
         "{\"type\":\"hello\",\"ok\":true,\"protocol_version\":%d,"
         "\"host_version\":\"%s\",\"capabilities\":["
-        "\"position_snapshot\",\"last_move\",\"streaming_analysis\"]}",
+        "\"session_v2\",\"state_override\",\"streaming_analysis\","
+        "\"last_move\"]}",
         CHESSLISTENER_PROTOCOL_VERSION,
         CHESSLISTENER_HOST_VERSION);
 
@@ -1791,38 +2221,113 @@ static int HandleHello(
     return HELLO_ACCEPTED;
 }
 
-/*
- * Holds the first frame seen when we join a game already in progress. See
- * InferMovedColor: two frames are needed before a position can be adopted.
- */
-static char pendingBoard[BOARD_SQUARE_COUNT];
-static int hasPendingBoard = 0;
+static void ResetSessionTracking(SessionState *session)
+{
+    memset(&session->position, 0, sizeof(session->position));
+    session->hasPosition = 0;
+    session->lastMove[0] = '\0';
+    memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
+    session->hasPendingBoard = 0;
+    session->lastSnapshotSequence = 0U;
+    session->hasSnapshotSequence = 0;
+    session->visuallyFlipped = 0;
+    session->hasOrientation = 0;
+}
 
-static void HandleMessage(
+static int RequireMatchingSession(
     const char *message,
-    FILE *logFile,
-    Position *position,
-    int *hasPosition,
+    const SessionState *session,
     char response[MAX_RESPONSE_LENGTH])
 {
-    char type[32];
-    int visuallyFlipped = 0;
+    char sessionId[MAX_SESSION_ID_LENGTH + 1U];
 
-    if (!ExtractJsonStringField(message, "type", type, sizeof(type))) {
-        fprintf(logFile, "Rejected message without a valid type field.\n");
-        fflush(logFile);
-        (void)WriteResponse(response, 0, "invalid_type", NULL, NULL);
+    if (!session->active) {
+        (void)WriteResponse(response, 0, "session_required", NULL, NULL);
+        return 0;
+    }
+
+    if (!ExtractJsonStringField(
+            message, "session_id", sessionId, sizeof(sessionId)) ||
+        !IsValidSessionId(sessionId)) {
+        (void)WriteResponse(response, 0, "invalid_session_id", NULL, NULL);
+        return 0;
+    }
+
+    if (strcmp(sessionId, session->id) != 0) {
+        (void)WriteResponse(response, 0, "session_mismatch", NULL, NULL);
+        return 0;
+    }
+
+    return 1;
+}
+
+static void HandleSessionStart(
+    const char *message,
+    FILE *logFile,
+    SessionState *session,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    char sessionId[MAX_SESSION_ID_LENGTH + 1U];
+    char label[MAX_SESSION_LABEL_LENGTH + 1U];
+
+    if (!ExtractJsonStringField(
+            message, "session_id", sessionId, sizeof(sessionId)) ||
+        !IsValidSessionId(sessionId)) {
+        (void)WriteResponse(response, 0, "invalid_session_id", NULL, NULL);
         return;
     }
 
-    if (strcmp(type, "position_snapshot") != 0) {
-        fprintf(logFile, "Ignored message type: %s\n", type);
-        fflush(logFile);
-        (void)WriteResponse(response, 0, "ignored_type", NULL, NULL);
-        return;
+    if (!ExtractJsonStringField(message, "game_key", label, sizeof(label)) &&
+        !ExtractJsonStringField(message, "url", label, sizeof(label))) {
+        (void)snprintf(label, sizeof(label), "%s", sessionId);
     }
 
+    if (session->active) {
+        AnalysisSessionEnd("replaced");
+    }
+
+    memset(session, 0, sizeof(*session));
+    session->active = 1;
+    (void)snprintf(session->id, sizeof(session->id), "%s", sessionId);
+    ResetSessionTracking(session);
+    AnalysisSessionStart(session->id, label);
+
+    fprintf(logFile, "\n=== Session started: %s (%s) ===\n", session->id, label);
+    fflush(logFile);
+    (void)WriteResponse(response, 1, "session_started", NULL, NULL);
+}
+
+static void HandlePositionSnapshot(
+    const char *message,
+    FILE *logFile,
+    SessionState *session,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    int visuallyFlipped;
+    int force = 0;
+    uint64_t snapshotSequence;
     char boardString[BOARD_SQUARE_COUNT + 1U];
+
+    if (!RequireMatchingSession(message, session, response)) {
+        return;
+    }
+
+    if (!ExtractJsonUint64Field(
+            message, "snapshot_seq", &snapshotSequence)) {
+        (void)WriteResponse(response, 0, "invalid_snapshot_seq", NULL, NULL);
+        return;
+    }
+
+    if (session->hasSnapshotSequence &&
+        snapshotSequence <= session->lastSnapshotSequence) {
+        (void)WriteResponse(response, 0, "stale_snapshot", NULL, NULL);
+        return;
+    }
+
+    /* Even a malformed snapshot consumes its sequence number. Otherwise a
+     * delayed, older-but-well-formed frame could roll the session backwards. */
+    session->lastSnapshotSequence = snapshotSequence;
+    session->hasSnapshotSequence = 1;
 
     if (!ExtractJsonStringField(
         message,
@@ -1835,7 +2340,17 @@ static void HandleMessage(
         return;
     }
 
-    (void)ExtractJsonBoolField(message, "visually_flipped", &visuallyFlipped);
+    if (!ExtractJsonBoolField(
+            message, "visually_flipped", &visuallyFlipped)) {
+        (void)WriteResponse(response, 0, "invalid_orientation", NULL, NULL);
+        return;
+    }
+
+    if (FindJsonFieldValue(message, "force") != NULL &&
+        !ExtractJsonBoolField(message, "force", &force)) {
+        (void)WriteResponse(response, 0, "invalid_force", NULL, NULL);
+        return;
+    }
 
     size_t pieceCount = 0U;
 
@@ -1846,31 +2361,74 @@ static void HandleMessage(
         return;
     }
 
+    int orientationChanged =
+        !session->hasOrientation ||
+        session->visuallyFlipped != visuallyFlipped;
+    session->visuallyFlipped = visuallyFlipped;
+    session->hasOrientation = 1;
+
+    if (orientationChanged) {
+        AnalysisUpdateOrientation(visuallyFlipped);
+    }
+
     if (
-        *hasPosition &&
-        memcmp(position->board, boardString, BOARD_SQUARE_COUNT) == 0
+        session->hasPosition &&
+        memcmp(
+            session->position.board,
+            boardString,
+            BOARD_SQUARE_COUNT) == 0
     ) {
-        fprintf(logFile, "Ignored duplicate position.\n");
+        if (force) {
+            char fen[MAX_FEN_LENGTH];
+
+            if (!PositionToFen(&session->position, fen)) {
+                (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
+                return;
+            }
+
+            AnalysisPublish(
+                fen,
+                visuallyFlipped,
+                session->lastMove[0] != '\0' ? session->lastMove : NULL);
+            fprintf(logFile, "Refreshed forced duplicate position.\n");
+            fflush(logFile);
+            (void)WriteResponse(
+                response, 1, "position_refreshed", fen, NULL);
+            return;
+        }
+
+        fprintf(
+            logFile,
+            orientationChanged
+                ? "Updated orientation for duplicate position.\n"
+                : "Ignored duplicate position.\n");
         fflush(logFile);
-        (void)WriteResponse(response, 0, "duplicate", NULL, NULL);
+        (void)WriteResponse(
+            response,
+            orientationChanged,
+            orientationChanged ? "orientation_updated" : "duplicate",
+            NULL,
+            NULL);
         return;
     }
 
-    if (memcmp(boardString, INITIAL_BOARD, BOARD_SQUARE_COUNT) == 0) {
+    if (!session->hasPosition &&
+        memcmp(boardString, INITIAL_BOARD, BOARD_SQUARE_COUNT) == 0) {
         char fen[MAX_FEN_LENGTH];
 
-        InitializePosition(position);
-        *hasPosition = 1;
+        InitializePosition(&session->position);
+        session->hasPosition = 1;
+        session->lastMove[0] = '\0';
 
-        if (!PositionToFen(position, fen)) {
+        if (!PositionToFen(&session->position, fen)) {
             (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
             return;
         }
 
-        hasPendingBoard = 0;
+        session->hasPendingBoard = 0;
 
         fprintf(logFile, "\n=== New standard game ===\n");
-        LogBoard(logFile, position->board, pieceCount);
+        LogBoard(logFile, session->position.board, pieceCount);
         fprintf(logFile, "FEN: %s\n", fen);
         fflush(logFile);
 
@@ -1880,31 +2438,36 @@ static void HandleMessage(
         return;
     }
 
-    if (!*hasPosition) {
+    if (!session->hasPosition) {
         Color movedColor;
 
         /*
-         * Spectating starts mid-game, so refusing everything but the
+         * Observation can start mid-game, so refusing everything but the
          * initial position would mean never locking on. Adopt instead,
          * once a second frame tells us whose turn it is.
          */
         if (
-            hasPendingBoard &&
-            InferMovedColor(pendingBoard, boardString, &movedColor)
+            session->hasPendingBoard &&
+            InferMovedColor(session->pendingBoard, boardString, &movedColor)
         ) {
             char fen[MAX_FEN_LENGTH];
 
-            AdoptPosition(position, pendingBoard, boardString, movedColor);
-            *hasPosition = 1;
-            hasPendingBoard = 0;
+            AdoptPosition(
+                &session->position,
+                session->pendingBoard,
+                boardString,
+                movedColor);
+            session->hasPosition = 1;
+            session->hasPendingBoard = 0;
+            session->lastMove[0] = '\0';
 
-            if (!PositionToFen(position, fen)) {
+            if (!PositionToFen(&session->position, fen)) {
                 (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
                 return;
             }
 
             fprintf(logFile, "\n=== Adopted game in progress ===\n");
-            LogBoard(logFile, position->board, pieceCount);
+            LogBoard(logFile, session->position.board, pieceCount);
             fprintf(
                 logFile,
                 "FEN: %s (castling rights are a best guess)\n",
@@ -1918,8 +2481,8 @@ static void HandleMessage(
             return;
         }
 
-        memcpy(pendingBoard, boardString, BOARD_SQUARE_COUNT);
-        hasPendingBoard = 1;
+        memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
+        session->hasPendingBoard = 1;
 
         fprintf(
             logFile,
@@ -1939,7 +2502,7 @@ static void HandleMessage(
     int plies = 1;
 
     if (!FindMatchingMove(
-        position,
+        &session->position,
         boardString,
         &matchingMove,
         &result,
@@ -1952,7 +2515,11 @@ static void HandleMessage(
         if (
             matchCount == 0U &&
             FindMoveSequence(
-                position, boardString, &matchingMove, &result, &plies)
+                &session->position,
+                boardString,
+                &matchingMove,
+                &result,
+                &plies)
         ) {
             fprintf(
                 logFile,
@@ -1968,7 +2535,8 @@ static void HandleMessage(
                 matchCount,
                 MAX_CATCHUP_PLIES
             );
-            LogBoardDifference(logFile, position->board, boardString);
+            LogBoardDifference(
+                logFile, session->position.board, boardString);
             LogBoard(logFile, boardString, pieceCount);
             fflush(logFile);
 
@@ -1980,34 +2548,194 @@ static void HandleMessage(
              * frame re-establishes whose turn it is. One move of downtime
              * rather than all of them.
              */
-            *hasPosition = 0;
-            memcpy(pendingBoard, boardString, BOARD_SQUARE_COUNT);
-            hasPendingBoard = 1;
+            session->hasPosition = 0;
+            session->lastMove[0] = '\0';
+            memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
+            session->hasPendingBoard = 1;
 
             (void)WriteResponse(response, 0, "resynchronising", NULL, NULL);
             return;
         }
     }
 
-    *position = result;
+    session->position = result;
 
     char fen[MAX_FEN_LENGTH];
     char uci[6];
     MoveToUci(matchingMove, uci);
+    (void)snprintf(session->lastMove, sizeof(session->lastMove), "%s", uci);
 
-    if (!PositionToFen(position, fen)) {
+    if (!PositionToFen(&session->position, fen)) {
         (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
         return;
     }
 
     fprintf(logFile, "\nMove: %s\n", uci);
-    LogBoard(logFile, position->board, pieceCount);
+    LogBoard(logFile, session->position.board, pieceCount);
     fprintf(logFile, "FEN: %s\n", fen);
     fflush(logFile);
 
     AnalysisPublish(fen, visuallyFlipped, uci);
 
     (void)WriteResponse(response, 1, "move_recorded", fen, uci);
+}
+
+static void HandleSessionCommand(
+    const char *message,
+    FILE *logFile,
+    SessionState *session,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    char command[32];
+
+    if (!RequireMatchingSession(message, session, response)) {
+        return;
+    }
+
+    if (!ExtractJsonStringField(
+            message, "command", command, sizeof(command))) {
+        (void)WriteResponse(response, 0, "invalid_command", NULL, NULL);
+        return;
+    }
+
+    if (strcmp(command, "set_fen") == 0) {
+        char suppliedFen[MAX_FEN_LENGTH];
+        char canonicalFen[MAX_FEN_LENGTH];
+        Position authoritative;
+
+        if (!ExtractJsonStringField(
+                message, "payload", suppliedFen, sizeof(suppliedFen)) ||
+            !PositionFromFen(suppliedFen, &authoritative) ||
+            !PositionToFen(&authoritative, canonicalFen)) {
+            AnalysisReportRecovery(
+                "set_fen",
+                0,
+                "Invalid FEN; check the board and all six fields.");
+            (void)WriteResponse(response, 0, "invalid_fen", NULL, NULL);
+            return;
+        }
+
+        session->position = authoritative;
+        session->hasPosition = 1;
+        session->lastMove[0] = '\0';
+        memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
+        session->hasPendingBoard = 0;
+
+        fprintf(
+            logFile,
+            "Authoritative FEN applied to session %s: %s\n",
+            session->id,
+            canonicalFen);
+        fflush(logFile);
+        AnalysisPublish(
+            canonicalFen,
+            session->hasOrientation ? session->visuallyFlipped : 0,
+            NULL);
+        AnalysisReportRecovery(
+            "set_fen", 1, "Authoritative position applied.");
+        (void)WriteResponse(
+            response, 1, "fen_applied", canonicalFen, NULL);
+        return;
+    }
+
+    if (strcmp(command, "restart_engines") == 0) {
+        AnalysisRestartEngines();
+        fprintf(logFile, "Engine restart requested for session %s.\n", session->id);
+        fflush(logFile);
+        (void)WriteResponse(response, 1, "engines_restarted", NULL, NULL);
+        return;
+    }
+
+    if (strcmp(command, "rescan_result") == 0) {
+        char result[32];
+        const char *messageText;
+
+        if (!ExtractJsonStringField(
+                message, "payload", result, sizeof(result))) {
+            (void)WriteResponse(
+                response, 0, "invalid_rescan_result", NULL, NULL);
+            return;
+        }
+
+        if (strcmp(result, "game_ended") == 0) {
+            messageText =
+                "The Chess.com game has ended; there is no active board "
+                "to re-read.";
+        } else if (strcmp(result, "no_supported_board") == 0) {
+            messageText =
+                "No supported Chess.com board is visible in the owning tab.";
+        } else if (strcmp(result, "content_unavailable") == 0) {
+            messageText =
+                "The owning Chess.com tab is unavailable; reload it and "
+                "try again.";
+        } else {
+            (void)WriteResponse(
+                response, 0, "invalid_rescan_result", NULL, NULL);
+            return;
+        }
+
+        AnalysisReportRecovery("rescan", 0, messageText);
+        fprintf(
+            logFile,
+            "Board re-read failed for session %s: %s.\n",
+            session->id,
+            result);
+        fflush(logFile);
+        (void)WriteResponse(response, 1, "rescan_failed", NULL, NULL);
+        return;
+    }
+
+    (void)WriteResponse(response, 0, "unknown_command", NULL, NULL);
+}
+
+static void HandleSessionEnd(
+    const char *message,
+    FILE *logFile,
+    SessionState *session,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    char reason[64];
+
+    if (!RequireMatchingSession(message, session, response)) {
+        return;
+    }
+
+    if (!ExtractJsonStringField(message, "reason", reason, sizeof(reason))) {
+        (void)snprintf(reason, sizeof(reason), "browser_session_end");
+    }
+
+    fprintf(logFile, "=== Session ended: %s (%s) ===\n", session->id, reason);
+    fflush(logFile);
+    AnalysisSessionEnd(reason);
+    memset(session, 0, sizeof(*session));
+    (void)WriteResponse(response, 1, "session_ended", NULL, NULL);
+}
+
+static void HandleMessage(
+    const char *message,
+    FILE *logFile,
+    SessionState *session,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    char type[32];
+
+    if (!ExtractJsonStringField(message, "type", type, sizeof(type))) {
+        fprintf(logFile, "Rejected message without a valid type field.\n");
+        fflush(logFile);
+        (void)WriteResponse(response, 0, "invalid_type", NULL, NULL);
+    } else if (strcmp(type, "session_start") == 0) {
+        HandleSessionStart(message, logFile, session, response);
+    } else if (strcmp(type, "position_snapshot") == 0) {
+        HandlePositionSnapshot(message, logFile, session, response);
+    } else if (strcmp(type, "session_command") == 0) {
+        HandleSessionCommand(message, logFile, session, response);
+    } else if (strcmp(type, "session_end") == 0) {
+        HandleSessionEnd(message, logFile, session, response);
+    } else {
+        fprintf(logFile, "Ignored message type: %s\n", type);
+        fflush(logFile);
+        (void)WriteResponse(response, 0, "ignored_type", NULL, NULL);
+    }
 }
 
 int main(void)
@@ -2063,7 +2791,7 @@ int main(void)
         }
     }
 
-    int analysisStatus = AnalysisStart(logFile);
+    int analysisStatus = AnalysisStart(logFile, ForwardAnalysisEvent, NULL);
 
     if (analysisStatus <= 0) {
         if (analysisStatus < 0) {
@@ -2086,8 +2814,7 @@ int main(void)
         return analysisStatus < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
-    Position position = {0};
-    int hasPosition = 0;
+    SessionState session = {0};
 
     for (;;) {
         char *message = NULL;
@@ -2097,7 +2824,7 @@ int main(void)
         }
 
         char response[MAX_RESPONSE_LENGTH];
-        HandleMessage(message, logFile, &position, &hasPosition, response);
+        HandleMessage(message, logFile, &session, response);
 
         if (!WriteNativeMessage(response)) {
             free(message);
@@ -2107,6 +2834,9 @@ int main(void)
         free(message);
     }
 
+    if (session.active) {
+        AnalysisSessionEnd("browser_disconnected");
+    }
     AnalysisStop();
 
     fclose(logFile);
