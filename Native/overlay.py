@@ -123,6 +123,29 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+
+class ScrollSafeComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+        else:
+            super().wheelEvent(event)
+
+class ScrollSafeSpinBox(QSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+        else:
+            super().wheelEvent(event)
+
 APP_ID = "chess-overlay"
 ORGANIZATION = "ChessListener"
 APPLICATION = "ChessListener"
@@ -2434,11 +2457,11 @@ class Overlay(QWidget):
             QFrame#disclosurePanel {{
                 background: transparent; border-top: 1px solid {COLOR_LINE.name()};
             }}
-            QComboBox, QSpinBox, QLineEdit, QTextEdit {{
+            QComboBox, QSpinBox, ScrollSafeComboBox, ScrollSafeSpinBox, QLineEdit, QTextEdit {{
                 background: #181b18; border: 1px solid {COLOR_LINE_STRONG.name()};
-                border-radius: 5px; padding: 5px 6px 5px 8px; min-height: 22px;
+                border-radius: 5px; padding: 5px 6px 5px 8px; min-height: 24px;
             }}
-            QComboBox:focus, QSpinBox:focus, QLineEdit:focus, QTextEdit:focus {{
+            QComboBox:focus, QSpinBox:focus, ScrollSafeComboBox:focus, ScrollSafeSpinBox:focus, QLineEdit:focus, QTextEdit:focus {{
                 border: 2px solid {COLOR_FOCUS.name()};
             }}
             QLineEdit[invalid="true"] {{
@@ -2451,7 +2474,7 @@ class Overlay(QWidget):
             QPushButton {{
                 background: {COLOR_CONTROL.name()}; border: 1px solid {COLOR_LINE_STRONG.name()};
                 border-radius: 5px; color: {COLOR_TEXT_SECONDARY.name()};
-                font-weight: 500; padding: 6px 10px; min-height: 20px;
+                font-weight: 500; padding: 6px 10px; min-height: 24px;
             }}
             QPushButton:hover {{ background: #2b302b; color: {COLOR_TEXT.name()}; border-color: #687266; }}
             QPushButton:pressed {{ background: #1a1d1a; }}
@@ -2948,7 +2971,7 @@ class Overlay(QWidget):
         header = QGridLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
-        self.review_library_combo = QComboBox()
+        self.review_library_combo = ScrollSafeComboBox()
         self.review_library_combo.setAccessibleName("Saved local game")
         self.review_library_combo.setToolTip("Saved local reviews")
         self.review_library_combo.currentIndexChanged.connect(self.load_library_selection)
@@ -2964,7 +2987,7 @@ class Overlay(QWidget):
         import_fen_action.triggered.connect(self.import_review_fen)
         self.review_import_button.setMenu(import_menu)
         header.addWidget(self.review_import_button, 0, 2)
-        self.review_close_button = self.make_small_button("Live", "Return to live analysis")
+        self.review_close_button = self.make_small_button("Back", "Return to live analysis")
         self.review_close_button.clicked.connect(self.close_review)
         header.addWidget(self.review_close_button, 0, 3)
 
@@ -3048,7 +3071,7 @@ class Overlay(QWidget):
         self.review_progress.hide()
         right_layout.addWidget(self.review_progress)
 
-        self.review_filter = QComboBox()
+        self.review_filter = ScrollSafeComboBox()
         for label, value in (
             ("All moves", "all"), ("Turning points", "turning"),
             ("Inaccuracies +", "errors"), ("Blunders only", "major"),
@@ -3123,7 +3146,7 @@ class Overlay(QWidget):
         self.study_search.textChanged.connect(self.filter_study_library)
         header.addWidget(self.study_search, 0, 0, 1, 3)
 
-        self.study_library_combo = QComboBox()
+        self.study_library_combo = ScrollSafeComboBox()
         self.study_library_combo.setAccessibleName("Saved study")
         self.study_library_combo.setToolTip("Saved local variation trees")
         self.study_library_combo.currentIndexChanged.connect(
@@ -3309,12 +3332,12 @@ class Overlay(QWidget):
 
         self.live_budget = self.make_budget_combo()
         self.live_maia = self.make_maia_combo()
-        self.live_threads = QSpinBox()
+        self.live_threads = ScrollSafeSpinBox()
         self.live_threads.setRange(1, max(1, os.cpu_count() or 1))
-        self.live_multipv = QSpinBox()
+        self.live_multipv = ScrollSafeSpinBox()
         self.live_multipv.setRange(1, 5)
 
-        self.live_explore_budget = QComboBox()
+        self.live_explore_budget = ScrollSafeComboBox()
         self.live_explore_budget.addItem("Same as live", -1)
         for name, milliseconds, description in BUDGET_PRESETS:
             label = name if milliseconds == 0 else f"{name} · {milliseconds}ms"
@@ -3325,31 +3348,31 @@ class Overlay(QWidget):
                 Qt.ItemDataRole.ToolTipRole,
             )
 
-        self.live_pv_length = QComboBox()
+        self.live_pv_length = ScrollSafeComboBox()
         for value, label in PV_LENGTH_CHOICES:
             self.live_pv_length.addItem(label, value)
 
-        self.live_follow = QComboBox()
+        self.live_follow = ScrollSafeComboBox()
         for value, label in FOLLOW_LIVE_CHOICES:
             self.live_follow.addItem(label, value)
 
-        self.live_explanation = QComboBox()
+        self.live_explanation = ScrollSafeComboBox()
         for value, label in EXPLANATION_CHOICES:
             self.live_explanation.addItem(label, value)
 
-        self.live_eval_pov = QComboBox()
+        self.live_eval_pov = ScrollSafeComboBox()
         for value, label in EVAL_POV_CHOICES:
             self.live_eval_pov.addItem(label, value)
 
-        self.live_line_expansion = QComboBox()
+        self.live_line_expansion = ScrollSafeComboBox()
         for value, label in LINE_EXPANSION_CHOICES:
             self.live_line_expansion.addItem(label, value)
 
-        self.live_opacity = QComboBox()
+        self.live_opacity = ScrollSafeComboBox()
         for percent, label in OPACITY_CHOICES:
             self.live_opacity.addItem(label, percent)
 
-        self.live_review_strength = QComboBox()
+        self.live_review_strength = ScrollSafeComboBox()
         for label, milliseconds in (
             ("Quick · 150ms/position", 150),
             ("Balanced · 350ms/position", 350),
@@ -3357,7 +3380,7 @@ class Overlay(QWidget):
             ("Maximum · 1800ms/position", 1800),
         ):
             self.live_review_strength.addItem(label, milliseconds)
-        self.live_review_lines = QSpinBox()
+        self.live_review_lines = ScrollSafeSpinBox()
         self.live_review_lines.setRange(1, 5)
         self.live_auto_save_completed = QCheckBox(
             "Auto-save completed games"
@@ -3365,17 +3388,17 @@ class Overlay(QWidget):
         self.live_review_auto = QCheckBox(
             "Auto-review completed games"
         )
-        self.live_review_sensitivity = QComboBox()
+        self.live_review_sensitivity = ScrollSafeComboBox()
         self.live_review_sensitivity.addItem("Strict", "strict")
         self.live_review_sensitivity.addItem("Standard", "standard")
         self.live_review_sensitivity.addItem("Lenient", "lenient")
         self.live_study_auto = QCheckBox("Analyze selected study positions")
         self.live_study_snapshots = QCheckBox("Save study evaluation snapshots")
 
-        self.live_piece_style = QComboBox()
+        self.live_piece_style = ScrollSafeComboBox()
         self.live_piece_style.addItem("Outline set", "outline")
         self.live_piece_style.addItem("Solid silhouettes", "solid")
-        self.live_workspace_orientation = QComboBox()
+        self.live_workspace_orientation = ScrollSafeComboBox()
         for value, label in WORKSPACE_ORIENTATION_CHOICES:
             self.live_workspace_orientation.addItem(label, value)
         self.live_coordinates = QCheckBox("Show board coordinates")
@@ -3627,7 +3650,7 @@ class Overlay(QWidget):
         advanced_help.setWordWrap(True)
         advanced.addWidget(advanced_help)
 
-        self.recovery_side = QComboBox()
+        self.recovery_side = ScrollSafeComboBox()
         self.recovery_side.addItem("White to move", "w")
         self.recovery_side.addItem("Black to move", "b")
         advanced.addWidget(labelled_field("Side to move", self.recovery_side))
@@ -3666,10 +3689,10 @@ class Overlay(QWidget):
         counters_layout = QGridLayout(counters)
         counters_layout.setContentsMargins(0, 0, 0, 0)
         counters_layout.setSpacing(6)
-        self.recovery_halfmove = QSpinBox()
+        self.recovery_halfmove = ScrollSafeSpinBox()
         self.recovery_halfmove.setRange(0, 9999)
         self.recovery_halfmove.setAccessibleName("Halfmove clock")
-        self.recovery_fullmove = QSpinBox()
+        self.recovery_fullmove = ScrollSafeSpinBox()
         self.recovery_fullmove.setRange(1, 9999)
         self.recovery_fullmove.setAccessibleName("Fullmove number")
         half_label = QLabel("Halfmove clock")
@@ -3738,7 +3761,7 @@ class Overlay(QWidget):
         return page
 
     def make_budget_combo(self):
-        combo = QComboBox()
+        combo = ScrollSafeComboBox()
 
         for name, milliseconds, description in BUDGET_PRESETS:
             label = (
@@ -3752,7 +3775,7 @@ class Overlay(QWidget):
         return combo
 
     def make_maia_combo(self):
-        combo = QComboBox()
+        combo = ScrollSafeComboBox()
 
         combo.addItem("Maia Off", 0)
 
@@ -4577,9 +4600,17 @@ class Overlay(QWidget):
         self.update_page_chrome()
 
     def leave_workspace(self, target):
-        self.save_geometry()
-        if target is self.analysis_page and self.isVisible():
-            saved = self.settings.value("window/geometry")
+        if target is self.analysis_page:
+            kind = "geometry"
+        elif target is self.review_page:
+            kind = "review_geometry"
+        elif target is self.study_page:
+            kind = "study_geometry"
+        else:
+            kind = None
+
+        if kind and self.isVisible():
+            saved = self.settings.value(f"window/{kind}")
             if saved is not None:
                 try:
                     self.restoreGeometry(saved)
@@ -5126,6 +5157,7 @@ class Overlay(QWidget):
         ):
             target = self.review_page if self.local_mode else self.analysis_page
         self.study_return_page = None
+        self.save_geometry()
         self.stack.setCurrentWidget(target)
         self.leave_workspace(target)
         return True
@@ -6090,6 +6122,7 @@ class Overlay(QWidget):
         if self.local_mode:
             self.close()
             return
+        self.save_geometry()
         self.stack.setCurrentWidget(self.analysis_page)
         self.leave_workspace(self.analysis_page)
 
