@@ -1,0 +1,2203 @@
+<!doctype html>
+<html lang="en" data-visualize-standalone>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ChessListener 0.9.5 UI Concept</title>
+<style>:root {
+  color-scheme: light dark;
+  background-color: transparent !important;
+
+  /* Agent-facing contract; keep in sync with SKILL.md. */
+  --background: var(
+    --main-surface-primary,
+    light-dark(rgb(255 255 255), rgb(24 24 24))
+  );
+  --foreground: light-dark(rgb(26 28 31), rgb(255 255 255));
+  --card: color-mix(in oklab, var(--foreground) 5%, transparent);
+  --card-foreground: var(--foreground);
+  --popover: light-dark(rgb(255 255 255), rgb(45 45 45));
+  --popover-foreground: var(--foreground);
+  --primary: light-dark(rgb(51 156 255), rgb(131 195 255));
+  --primary-foreground: light-dark(rgb(255 255 255), rgb(13 13 13));
+  --secondary: light-dark(rgb(255 255 255 / 96%), rgb(54 54 54 / 96%));
+  --secondary-foreground: var(--foreground);
+  --muted: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --muted-foreground: light-dark(
+    rgb(26 28 31 / 49.4%),
+    rgb(255 255 255 / 49.8%)
+  );
+  --accent: light-dark(rgb(229 242 255), rgb(13 39 63));
+  --accent-foreground: var(--primary);
+  --destructive: light-dark(rgb(226 85 7), rgb(255 133 73));
+  --border: light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%));
+  --input: light-dark(
+    rgb(26 28 31 / 11.8%),
+    color-mix(in oklab, rgb(0 0 0) 10%, transparent)
+  );
+  --ring: light-dark(rgb(51 156 255), rgb(131 195 255 / 76%));
+  --font-size-base: 14px;
+  --red: light-dark(rgb(186 38 35), rgb(250 66 62));
+  --green: light-dark(rgb(0 162 64), rgb(64 201 119));
+
+  /* Internal implementation variables; not part of the agent contract. */
+  --font-sans: -apple-system, system-ui, "Segoe UI", sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  --font-size-normal: max(11px, var(--font-size-base));
+  --font-size-tooltip: calc(var(--font-size-base) - 1px);
+  --font-size-small: max(11px, calc(var(--font-size-base) - 2px));
+  --font-size-h1: calc(var(--font-size-normal) * 1.7142857143);
+  --font-size-h2: calc(var(--font-size-normal) * 1.4285714286);
+  --font-size-h3: calc(var(--font-size-normal) * 1.2857142857);
+  --font-weight-normal: 430;
+  --font-weight-medium: 500;
+  --line-height-normal: calc(var(--font-size-normal) * 1.5);
+  --line-height-tooltip: calc(var(--font-size-tooltip) * 1.4285714286);
+  --line-height-small: calc(var(--font-size-small) + 4px);
+  --radius: 10px;
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-2xl: calc(var(--radius) * 1.6);
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 8%);
+  --checkmark-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 17 17'%3E%3Cpath d='M12.8961 3.64101C13.1297 3.41418 13.4984 3.37523 13.7779 3.56581C14.0571 3.75635 14.1554 4.11331 14.0299 4.41347L13.9615 4.53847L7.71151 13.7045C7.59411 13.8767 7.4063 13.9877 7.19881 14.0072C6.99136 14.0267 6.78564 13.9533 6.63826 13.806L2.88826 10.056L2.79842 9.9457C2.6192 9.67407 2.64927 9.30496 2.88826 9.06581C3.12738 8.82669 3.49647 8.79676 3.76815 8.97597L3.8785 9.06581L7.03084 12.2182L12.8053 3.74941L12.8961 3.64101Z'/%3E%3C/svg%3E");
+
+  /* Legacy aliases; not part of the current agent contract. */
+  --viz-bg: transparent;
+  --viz-panel: var(--card);
+  --viz-border: var(--border);
+  --viz-text: var(--foreground);
+  --viz-muted: var(--muted-foreground);
+  --viz-accent: var(--primary);
+  --viz-accent-text: var(--primary-foreground);
+  --viz-accent-bg: var(--accent);
+  --viz-font-size: var(--font-size-base);
+  --viz-warning: var(--destructive);
+  --color-background-primary: var(--background);
+  --color-text-primary: var(--foreground);
+  --color-border-secondary: var(--border);
+}
+
+:root[data-visualize-standalone] {
+  background-color: var(--background) !important;
+}
+
+/* Generic mobile code-block hosts provide light/dark mode but no series palette.
+   AppBlock hosts set all six variables themselves. */
+:root:not([data-app-block-surface]) {
+  --viz-series-1: var(--primary);
+  --viz-series-2: light-dark(#f3883b, #f59a56);
+  --viz-series-3: light-dark(#5dc977, #74d58b);
+  --viz-series-4: light-dark(#eb77b1, #f08fc0);
+  --viz-series-5: light-dark(#9b79ec, #aa91ef);
+  --viz-series-6: light-dark(#3ab9b1, #5acbc2);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html > body {
+  margin: 0;
+  padding: 5px;
+  color: var(--foreground);
+  background: transparent !important;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-normal);
+  font-weight: var(--font-weight-normal);
+  line-height: var(--line-height-normal);
+}
+
+:root:not([data-app-block-surface]) > body {
+  padding: 12px;
+}
+
+a {
+  color: color-mix(in srgb, var(--viz-accent) 80%, var(--viz-text) 20%);
+  cursor: pointer;
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+
+a:is(:hover, :focus-visible) {
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
+  text-decoration-thickness: 0.5px;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-block: 0;
+}
+
+h1 {
+  font-size: var(--font-size-h1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h3,
+h4,
+h5,
+h6 {
+  font-size: var(--font-size-h3);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.3;
+}
+
+b,
+strong,
+th {
+  font-weight: var(--font-weight-medium);
+}
+
+code:not(pre code) {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  word-break: break-word;
+}
+
+.table-responsive {
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--foreground);
+  font: inherit;
+  text-align: start;
+}
+
+.table :is(th, td) {
+  padding-block: 10px;
+  padding-inline: 0 24px;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--border);
+  text-align: start;
+  vertical-align: top;
+}
+
+.table-responsive > .table :is(th, td) {
+  overflow-wrap: break-word;
+}
+
+.table :is(th, td):last-child {
+  padding-inline-end: 0;
+}
+
+.table :is(caption, thead th) {
+  font-weight: 600;
+}
+
+.table thead th {
+  padding-block: 8px;
+  border-bottom-color: color-mix(in srgb, var(--foreground) 16%, transparent);
+}
+
+.table tbody tr:last-child :is(th, td) {
+  border-bottom: 0;
+}
+
+.table.table-sm :is(th, td) {
+  padding-block: 6px;
+}
+
+.table.table-sm :is(th, td):not(:last-child) {
+  padding-inline-end: 16px;
+}
+
+.table :is(.text-end, [align="right"]) {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.table :is(.text-center, [align="center"]) {
+  text-align: center;
+}
+
+.table .text-nowrap {
+  white-space: nowrap;
+}
+
+#widget {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  background: transparent !important;
+}
+
+.card {
+  min-width: 0;
+  padding: 12px;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  border-radius: var(--radius-2xl);
+  color: var(--card-foreground);
+  background: var(--card);
+}
+
+#widget > :not(.card) {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 50;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: min(
+    20rem,
+    var(--tooltip-available-width, calc(100vw - 10px)),
+    calc(100vw - 10px)
+  );
+  max-height: min(
+    var(--tooltip-available-height, calc(100vh - 10px)),
+    calc(100vh - 10px)
+  );
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  color: var(--popover-foreground);
+  background: var(--popover);
+  box-shadow: none;
+  font-size: var(--font-size-tooltip);
+  line-height: var(--line-height-tooltip);
+  overflow-wrap: break-word;
+  white-space: normal;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* The bundled tooltip runtime owns [data-tooltip]. AppBlock's CSS-only
+   pseudo-tooltip can widen dense grids even while hidden. */
+main [data-tooltip]::after {
+  content: none;
+}
+
+.viz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(max(180px, 24%), 1fr));
+  gap: 10px;
+}
+
+.viz-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.viz-stat-value {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+.viz-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.viz-badge {
+  padding: 3px 8px;
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  background: var(--accent);
+  font-weight: var(--font-weight-medium);
+}
+
+small,
+.text-small,
+.viz-badge {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.text-muted {
+  color: var(--muted-foreground);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.viz-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.viz-controls > .form-label {
+  display: grid;
+  min-width: min(100%, 260px);
+  flex: 1 1 280px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin-bottom: 0;
+}
+
+.viz-controls > .form-label > :is(.form-control, .form-range, .form-select) {
+  grid-column: 1 / -1;
+}
+
+.btn,
+.form-check-input,
+.form-control,
+.form-range,
+.form-select {
+  font: inherit;
+}
+
+.btn {
+  appearance: button;
+  display: inline-flex;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: var(--cursor-interaction, pointer);
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.btn:is(.btn-block, .viz-tile) {
+  inline-size: 100%;
+}
+
+.btn.viz-tile {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+a.btn {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn-primary {
+  border-color: transparent;
+  color: var(--interactive-label-primary-default, var(--primary-foreground));
+  background: var(--interactive-bg-primary-default, var(--foreground));
+  background-clip: padding-box;
+}
+
+.btn-primary .text-muted {
+  color: color-mix(
+    in srgb,
+    var(--interactive-label-primary-default, var(--primary-foreground)) 50%,
+    transparent
+  );
+}
+
+.btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 80%, transparent);
+  background-clip: padding-box;
+}
+
+.btn-ghost {
+  border-color: transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+.btn-ghost:not(:disabled):hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+[data-lucide] {
+  stroke-width: 1.6;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--foreground);
+}
+
+.form-control {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  color: var(--foreground);
+  background: var(--secondary);
+}
+
+.form-control::placeholder {
+  color: var(--muted-foreground);
+}
+
+.form-control[type="file"] {
+  padding: 0;
+  overflow: hidden;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control[type="file"]::file-selector-button {
+  min-height: 26px;
+  margin-right: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--input);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: inherit;
+  font: inherit;
+}
+
+.form-control[type="file"]:not(:disabled):hover::file-selector-button {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-control-color[type="color"] {
+  width: 40px;
+  height: 28px;
+  padding: 3px;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control-color[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.form-control-color[type="color"]::-webkit-color-swatch {
+  border: 0;
+  border-radius: calc(var(--radius-lg) - 4px);
+}
+
+textarea.form-control {
+  height: auto;
+  min-height: 72px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.form-control:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-control:disabled,
+.form-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.form-select {
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 32px 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  color: var(--foreground);
+  background-color: var(--secondary);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 10px) 50%;
+  background-repeat: no-repeat;
+  background-size: 4px 4px;
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-select:not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-check {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  gap: 6px;
+}
+
+.form-check-input {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  border: 1px solid var(--input);
+  color: var(--primary-foreground);
+  background-color: transparent;
+  cursor: var(--cursor-interaction, default);
+  transition:
+    background-color 150ms,
+    border-color 150ms,
+    box-shadow 150ms;
+}
+
+.form-check:not(.form-switch) .form-check-input[type="checkbox"] {
+  border-color: var(--input);
+  border-radius: var(--radius-sm);
+  background-color: var(--secondary);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input:not(:disabled):not(:checked):hover {
+  background-color: var(--card);
+}
+
+.form-check:not(.form-switch) .form-check-input[type="checkbox"]:checked {
+  border-color: var(--primary);
+  background-color: var(--primary);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input[type="checkbox"]:checked::before {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--primary-foreground);
+  content: "";
+  mask: var(--checkmark-image) center / 12px 12px no-repeat;
+}
+
+.form-check-input[type="radio"] {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+}
+
+.form-check-input[type="radio"]:checked {
+  border: 2px solid var(--primary);
+  background:
+    radial-gradient(circle, var(--primary-foreground) 0 2.5px, transparent 3px),
+    var(--primary);
+}
+
+.form-check:not(.form-switch) .form-check-input:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+}
+
+.form-switch .form-check-input:disabled,
+.form-switch .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.form-check-label {
+  color: var(--foreground);
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-switch .form-check-input {
+  position: relative;
+  width: 32px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--muted);
+  box-shadow: none;
+  transition: background-color 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 1px solid light-dark(var(--primary-foreground), var(--foreground));
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+  box-shadow: var(--shadow-sm);
+  content: "";
+  transform: translate(2px, -50%);
+  transition: transform 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input:checked {
+  background: var(--primary);
+}
+
+.form-switch .form-check-input:checked::before {
+  transform: translate(14px, -50%);
+}
+
+.form-switch .form-check-input:focus-visible {
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+.form-range {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 28px;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  outline: none;
+  border: 0;
+  accent-color: var(--primary);
+  background: linear-gradient(
+      color-mix(in srgb, var(--foreground) 7%, transparent),
+      color-mix(in srgb, var(--foreground) 7%, transparent)
+    )
+    center / 100% 2px no-repeat;
+}
+
+.form-range::-webkit-slider-runnable-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-webkit-slider-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range::-moz-range-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-moz-range-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.btn:not(.btn-primary, .viz-tile):is(
+    [aria-pressed="true"],
+    [aria-selected="true"],
+    .is-selected
+  ) {
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.btn.viz-tile:is([aria-pressed="true"], [aria-selected="true"], .is-selected) {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+#widget > svg {
+  width: 100%;
+}
+
+.text-warning,
+.text-destructive {
+  color: var(--destructive);
+}
+</style>
+</head>
+<body>
+<div id="cl095" data-piece-style="outline">
+  <style>
+    #cl095 {
+      --cl-ink-950: #151714;
+      --cl-ink-925: #181b18;
+      --cl-ink-900: #1c1f1c;
+      --cl-ink-850: #242824;
+      --cl-ink-800: #2b302b;
+      --cl-line: #3a4039;
+      --cl-line-strong: #535b52;
+      --cl-paper-100: #f0ede5;
+      --cl-paper-300: #cbd0c8;
+      --cl-paper-400: #aeb5ac;
+      --cl-paper-550: #7f887e;
+      --cl-board-light: #e8d5b4;
+      --cl-board-dark: #987652;
+      --cl-piece-dark: #1e201c;
+      --cl-piece-light: #faf7ef;
+      --cl-sf: #5b8fc9;
+      --cl-sf-soft: #22364a;
+      --cl-maia: #d4914f;
+      --cl-maia-soft: #473321;
+      --cl-played: #d4b84f;
+      --cl-played-soft: #423b22;
+      --cl-exact: #7db58f;
+      --cl-exact-soft: #23392b;
+      --cl-warning: #d8a35b;
+      --cl-danger: #d36b70;
+      --cl-danger-soft: #42262a;
+      --cl-focus: #8eb9e5;
+      --cl-radius-panel: 8px;
+      --cl-radius-control: 5px;
+      width: 100%;
+      color: var(--cl-paper-100);
+      font-family: Inter, "Noto Sans", "DejaVu Sans", system-ui, sans-serif;
+      font-size: 13px;
+    }
+
+    #cl095 * { box-sizing: border-box; }
+    #cl095 button,
+    #cl095 input,
+    #cl095 select,
+    #cl095 textarea { font: inherit; }
+
+    #cl095 button:focus-visible,
+    #cl095 input:focus-visible,
+    #cl095 select:focus-visible,
+    #cl095 textarea:focus-visible,
+    #cl095 summary:focus-visible {
+      outline: 2px solid var(--cl-focus);
+      outline-offset: 2px;
+    }
+
+    #cl095 .prototype-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 0 0 14px;
+    }
+
+    #cl095 .prototype-label {
+      color: var(--muted-foreground, #71717a);
+      font-size: 11px;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+      margin-right: 4px;
+    }
+
+    #cl095 .view-select {
+      min-width: 190px;
+      border: 1px solid var(--border, #d4d4d8);
+      border-radius: 6px;
+      background: var(--card, #fff);
+      color: var(--card-foreground, #18181b);
+      padding: 7px 28px 7px 9px;
+    }
+
+    #cl095 .prototype-button {
+      border: 1px solid var(--border, #d4d4d8);
+      border-radius: 6px;
+      background: var(--card, #fff);
+      color: var(--card-foreground, #18181b);
+      padding: 7px 10px;
+      cursor: pointer;
+    }
+
+    #cl095 .stage {
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 8px 0 18px;
+    }
+
+    #cl095 .app-window {
+      position: relative;
+      width: min(396px, 100%);
+      overflow: hidden;
+      border: 1px solid var(--cl-line-strong);
+      border-radius: 9px;
+      background: var(--cl-ink-950);
+      color: var(--cl-paper-100);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, .30), 0 2px 8px rgba(0, 0, 0, .28);
+      color-scheme: dark;
+    }
+
+    #cl095 .app-window::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 2px;
+      z-index: 5;
+      background: linear-gradient(90deg, var(--cl-sf) 0 52%, var(--cl-played) 52% 55%, var(--cl-maia) 55% 100%);
+    }
+
+    #cl095 .app-window.is-popup { width: min(320px, 100%); }
+    #cl095 .app-window.is-popup .app-titlebar { display: none; }
+    #cl095 .app-window.is-popup::before { background: var(--cl-sf); }
+
+    #cl095 .app-titlebar {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 6px 5px 9px;
+      border-bottom: 1px solid var(--cl-line);
+      background: var(--cl-ink-900);
+    }
+
+    #cl095 .mark {
+      display: grid;
+      width: 18px;
+      height: 18px;
+      grid-template-columns: repeat(2, 9px);
+      grid-template-rows: repeat(2, 9px);
+      flex: 0 0 auto;
+      overflow: hidden;
+      border: 1px solid var(--cl-line-strong);
+      border-radius: 2px;
+      font: 500 6px/9px "DejaVu Sans Mono", monospace;
+      text-align: center;
+    }
+
+    #cl095 .mark span:nth-child(1),
+    #cl095 .mark span:nth-child(4) { background: var(--cl-board-light); color: var(--cl-ink-950); }
+    #cl095 .mark span:nth-child(2),
+    #cl095 .mark span:nth-child(3) { background: var(--cl-board-dark); color: var(--cl-paper-100); }
+
+    #cl095 .title-copy { min-width: 0; flex: 1; }
+    #cl095 .title-status {
+      display: block;
+      overflow: hidden;
+      color: var(--cl-paper-300);
+      font-size: 12px;
+      line-height: 1.2;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #cl095 .source-tag {
+      flex: 0 0 auto;
+      border: 1px solid color-mix(in srgb, var(--cl-exact) 42%, transparent);
+      border-radius: 3px;
+      padding: 2px 5px;
+      background: var(--cl-exact-soft);
+      color: #a8d8b6;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    #cl095 .source-tag.lab { border-color: color-mix(in srgb, var(--cl-maia) 44%, transparent); background: var(--cl-maia-soft); color: #efbf89; }
+
+    #cl095 .title-action,
+    #cl095 .icon-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      flex: 0 0 auto;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--cl-paper-400);
+      cursor: pointer;
+    }
+
+    #cl095 .title-action:hover,
+    #cl095 .icon-action:hover { background: var(--cl-ink-800); color: var(--cl-paper-100); }
+
+    #cl095 .screen { display: none; padding: 10px; }
+    #cl095 .screen.is-active { display: block; }
+    #cl095 .screen.flush { padding: 0; }
+
+    #cl095 .page-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 9px;
+    }
+
+    #cl095 .page-head h2,
+    #cl095 .section-title {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 1.3;
+    }
+
+    #cl095 .page-head h2 { flex: 1; }
+    #cl095 .eyebrow {
+      margin: 0 0 3px;
+      color: var(--cl-paper-550);
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    #cl095 .muted { color: var(--cl-paper-400); }
+    #cl095 .quiet { color: var(--cl-paper-550); }
+    #cl095 .mono { font-family: "DejaVu Sans Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+    #cl095 .spacer { flex: 1; }
+
+    #cl095 .board-stage {
+      position: relative;
+      width: 100%;
+      padding: 0 0 14px 14px;
+    }
+
+    #cl095 .rank-axis {
+      position: absolute;
+      inset: 0 auto 14px 0;
+      width: 14px;
+      display: grid;
+      grid-template-rows: repeat(8, 1fr);
+      pointer-events: none;
+    }
+
+    #cl095 .file-axis {
+      position: absolute;
+      inset: auto 0 0 14px;
+      height: 14px;
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      pointer-events: none;
+    }
+
+    #cl095 .rank-axis span,
+    #cl095 .file-axis span {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--cl-paper-550);
+      font: 10px/1 "DejaVu Sans Mono", monospace;
+    }
+
+    #cl095 .chess-board {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      aspect-ratio: 1;
+      overflow: visible;
+      border: 1px solid #736047;
+      background: var(--cl-board-dark);
+    }
+
+    #cl095 .square {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 0;
+      color: var(--cl-piece-dark);
+      font-family: "DejaVu Sans", serif;
+      font-size: clamp(24px, 9.5vw, 42px);
+      line-height: 1;
+      user-select: none;
+    }
+
+    #cl095 .square.light { background: var(--cl-board-light); }
+    #cl095 .square.dark { background: var(--cl-board-dark); }
+    #cl095 .square.last { box-shadow: inset 0 0 0 100px rgba(212, 184, 79, .32); }
+    #cl095 .square.selected { box-shadow: inset 0 0 0 3px var(--cl-sf); }
+    #cl095 .square .white-piece { color: var(--cl-piece-light); }
+    #cl095 .square .black-piece { color: var(--cl-piece-dark); }
+    #cl095[data-piece-style="solid"] .square .white-piece {
+      text-shadow: -1px -1px 0 #302e27, 1px -1px 0 #302e27, -1px 1px 0 #302e27, 1px 1px 0 #302e27;
+    }
+    #cl095[data-piece-style="solid"] .square .black-piece { text-shadow: 0 1px 0 rgba(255, 255, 255, .18); }
+    #cl095[data-piece-style="outline"] .square .white-piece {
+      text-shadow: -1px -1px 0 #302e27, 1px -1px 0 #302e27, -1px 1px 0 #302e27, 1px 1px 0 #302e27;
+    }
+    #cl095[data-piece-style="outline"] .square .black-piece {
+      text-shadow: -1px -1px 0 rgba(245, 231, 204, .22), 1px 1px 0 rgba(245, 231, 204, .18);
+    }
+
+    #cl095 .board-arrows { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+    #cl095 .board-arrows .arrow-halo { stroke: #151714; stroke-width: 4.2; stroke-linecap: round; opacity: .52; }
+    #cl095 .board-arrows .arrow-line { stroke-width: 2.15; stroke-linecap: round; opacity: .88; }
+
+    #cl095 .game-complete {
+      margin-top: 9px;
+      border-top: 1px solid var(--cl-line);
+      border-bottom: 1px solid var(--cl-line);
+      padding: 11px 0;
+    }
+
+    #cl095 .game-complete h2 { margin: 0 0 3px; font-size: 16px; font-weight: 500; }
+    #cl095 .game-complete p { margin: 0; color: var(--cl-paper-400); line-height: 1.45; }
+    #cl095 .postgame-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 10px; }
+    #cl095 .postgame-actions .primary { grid-column: 1 / -1; min-height: 40px; }
+    #cl095 .autosave-row { margin-top: 9px; border-top: 1px solid var(--cl-line); padding-top: 8px; }
+
+    #cl095 .score-strip {
+      position: relative;
+      display: grid;
+      grid-template-columns: 62% 38%;
+      height: 24px;
+      overflow: hidden;
+      margin-top: 7px;
+      border: 1px solid var(--cl-line);
+      border-radius: 4px;
+      background: #24241f;
+      font: 500 11px/22px "DejaVu Sans Mono", monospace;
+    }
+
+    #cl095 .score-strip::after {
+      content: "";
+      position: absolute;
+      left: 50%; top: 0; bottom: 0;
+      width: 1px;
+      background: rgba(107, 105, 95, .75);
+    }
+
+    #cl095 .score-white { padding-left: 7px; background: #eee8da; color: #26251f; }
+    #cl095 .score-black { padding-right: 7px; color: #e7e4db; text-align: right; }
+
+    #cl095 .move-context {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 2px 5px;
+      border-bottom: 1px solid var(--cl-line);
+      color: var(--cl-paper-300);
+    }
+
+    #cl095 .marker { display: inline-block; flex: 0 0 auto; }
+    #cl095 .marker.sf { width: 8px; height: 8px; background: var(--cl-sf); }
+    #cl095 .marker.maia { width: 8px; height: 8px; background: var(--cl-maia); transform: rotate(45deg); }
+    #cl095 .marker.played { width: 11px; height: 3px; background: var(--cl-played); }
+
+    #cl095 .candidate-list { margin: 2px 0 0; border-bottom: 1px solid var(--cl-line); }
+    #cl095 .candidate {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 13px minmax(72px, 1fr) 58px 34px;
+      gap: 6px;
+      align-items: center;
+      min-height: 34px;
+      border: 0;
+      border-left: 2px solid transparent;
+      border-top: 1px solid var(--cl-line);
+      border-radius: 0;
+      padding: 5px 5px 5px 7px;
+      background: transparent;
+      color: var(--cl-paper-300);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    #cl095 .candidate:first-child { border-top: 0; }
+    #cl095 .candidate:hover { background: var(--cl-ink-900); }
+    #cl095 .candidate.is-selected { border-left-color: var(--cl-sf); background: var(--cl-sf-soft); }
+    #cl095 .candidate .marker { grid-column: 1; }
+    #cl095 .candidate .move { grid-column: 2; color: var(--cl-paper-100); font-weight: 500; }
+    #cl095 .candidate .eval { grid-column: 3; color: var(--cl-paper-100); text-align: right; }
+    #cl095 .candidate .pv { display: none; grid-column: 2 / 5; grid-row: 2; overflow: hidden; color: var(--cl-paper-400); text-overflow: ellipsis; white-space: nowrap; }
+    #cl095 .candidate.is-selected .pv { display: block; }
+    #cl095 .candidate .depth { grid-column: 4; color: var(--cl-paper-550); font-size: 11px; text-align: right; }
+
+    #cl095 .ruled-note {
+      margin: 8px 2px;
+      border-left: 2px solid var(--cl-sf);
+      padding: 1px 0 1px 9px;
+      color: var(--cl-paper-300);
+      line-height: 1.45;
+    }
+
+    #cl095 .ruled-note.amber { border-left-color: var(--cl-maia); }
+    #cl095 .ruled-note.ochre { border-left-color: var(--cl-played); }
+    #cl095 .ruled-note strong { color: var(--cl-paper-100); font-weight: 500; }
+
+    #cl095 .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    #cl095 .button {
+      min-height: 32px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border: 1px solid var(--cl-line-strong);
+      border-radius: var(--cl-radius-control);
+      padding: 6px 10px;
+      background: var(--cl-ink-850);
+      color: var(--cl-paper-300);
+      cursor: pointer;
+    }
+
+    #cl095 .button:hover { border-color: #687266; background: var(--cl-ink-800); color: var(--cl-paper-100); }
+    #cl095 .button.primary { border-color: var(--cl-sf); background: var(--cl-sf); color: #101820; font-weight: 500; }
+    #cl095 .button.primary:hover { background: #6b9bd1; }
+    #cl095 .button.ghost { background: transparent; }
+    #cl095 .button.danger { border-color: color-mix(in srgb, var(--cl-danger) 55%, var(--cl-line)); background: transparent; color: #efa7aa; }
+    #cl095 .button.icon { width: 32px; padding: 0; }
+    #cl095 .button[disabled] { opacity: .42; cursor: default; }
+
+    #cl095 .context-ribbon {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin: -2px 0 8px;
+      border: 1px solid #5b472f;
+      border-radius: 4px;
+      padding: 6px 8px;
+      background: #2c241a;
+      color: #e7c28f;
+      font-size: 11px;
+    }
+
+    #cl095 .live-count { margin-left: auto; border: 0; background: transparent; color: #f0cb93; cursor: pointer; font-weight: 500; }
+    #cl095 .breadcrumb { margin: 7px 2px 0; color: var(--cl-paper-400); font: 11px/1.4 "DejaVu Sans Mono", monospace; }
+
+    #cl095 .compact-view { padding: 4px 0 1px; }
+    #cl095 .compact-view .score-strip { margin-top: 0; }
+    #cl095 .compact-line {
+      display: grid;
+      grid-template-columns: 14px 56px 55px 1fr;
+      gap: 6px;
+      align-items: center;
+      min-height: 31px;
+      border-bottom: 1px solid var(--cl-line);
+      color: var(--cl-paper-400);
+    }
+    #cl095 .compact-line .move,
+    #cl095 .compact-line .eval { color: var(--cl-paper-100); }
+
+    #cl095 .library-row,
+    #cl095 .field-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 8px;
+    }
+
+    #cl095 .control,
+    #cl095 .select-control,
+    #cl095 .text-control {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--cl-line-strong);
+      border-radius: var(--cl-radius-control);
+      padding: 6px 8px;
+      background: var(--cl-ink-925);
+      color: var(--cl-paper-100);
+    }
+
+    #cl095 textarea.text-control { min-height: 72px; resize: vertical; line-height: 1.4; }
+    #cl095 .field { margin-bottom: 9px; }
+    #cl095 .field label,
+    #cl095 .field-label { display: block; margin-bottom: 4px; color: var(--cl-paper-400); font-size: 11px; }
+    #cl095 .field-hint { margin: 4px 0 0; color: var(--cl-paper-550); font-size: 11px; line-height: 1.35; }
+
+    #cl095 .graph {
+      position: relative;
+      height: 86px;
+      margin: 8px 0;
+      border-top: 1px solid var(--cl-line);
+      border-bottom: 1px solid var(--cl-line);
+      background: var(--cl-ink-925);
+    }
+    #cl095 .graph svg { width: 100%; height: 100%; display: block; }
+    #cl095 .graph .zero { stroke: var(--cl-line-strong); stroke-width: 1; }
+    #cl095 .graph .eval-line { fill: none; stroke: var(--cl-sf); stroke-width: 2; vector-effect: non-scaling-stroke; }
+    #cl095 .graph .cursor { stroke: var(--cl-played); stroke-width: 2; vector-effect: non-scaling-stroke; }
+    #cl095 .graph text { fill: var(--cl-paper-550); font: 9px "DejaVu Sans Mono", monospace; }
+
+    #cl095 .segmented {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid var(--cl-line-strong);
+      border-radius: 5px;
+      background: var(--cl-line);
+    }
+    #cl095 .segmented button { min-height: 30px; border: 0; background: var(--cl-ink-925); color: var(--cl-paper-400); cursor: pointer; }
+    #cl095 .segmented button.is-selected { background: var(--cl-sf-soft); color: #c8def3; }
+
+    #cl095 .review-summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      margin: 8px 0;
+      border-top: 1px solid var(--cl-line);
+      border-bottom: 1px solid var(--cl-line);
+    }
+    #cl095 .review-stat { padding: 7px 4px; text-align: center; }
+    #cl095 .review-stat + .review-stat { border-left: 1px solid var(--cl-line); }
+    #cl095 .review-stat strong { display: block; font: 500 14px/1.2 "DejaVu Sans Mono", monospace; }
+    #cl095 .review-stat span { color: var(--cl-paper-550); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
+
+    #cl095 .move-list { margin: 8px 0 0; border-top: 1px solid var(--cl-line); }
+    #cl095 .move-row {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 34px 62px 1fr auto;
+      gap: 7px;
+      align-items: center;
+      min-height: 34px;
+      border: 0;
+      border-bottom: 1px solid var(--cl-line);
+      padding: 5px 3px;
+      background: transparent;
+      color: var(--cl-paper-400);
+      text-align: left;
+      cursor: pointer;
+    }
+    #cl095 .move-row:hover,
+    #cl095 .move-row.is-selected { background: var(--cl-ink-900); }
+    #cl095 .move-row.is-selected { box-shadow: inset 2px 0 var(--cl-played); }
+    #cl095 .move-row .notation { color: var(--cl-paper-100); font-weight: 500; }
+    #cl095 .classification { border-radius: 3px; padding: 2px 4px; font-size: 10px; }
+    #cl095 .classification.good { background: var(--cl-exact-soft); color: #a8d8b6; }
+    #cl095 .classification.warn { background: var(--cl-played-soft); color: #e7d181; }
+    #cl095 .classification.bad { background: var(--cl-danger-soft); color: #efa7aa; }
+
+    #cl095 .variation-tree { margin: 8px 0; border-top: 1px solid var(--cl-line); }
+    #cl095 .tree-row {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 16px 1fr auto;
+      gap: 6px;
+      align-items: center;
+      min-height: 31px;
+      border: 0;
+      border-bottom: 1px solid var(--cl-line);
+      padding: 4px 5px;
+      background: transparent;
+      color: var(--cl-paper-300);
+      text-align: left;
+      cursor: pointer;
+    }
+    #cl095 .tree-row.level-1 { padding-left: 21px; }
+    #cl095 .tree-row.level-2 { padding-left: 38px; }
+    #cl095 .tree-row.is-selected { background: var(--cl-sf-soft); box-shadow: inset 2px 0 var(--cl-sf); }
+    #cl095 .tree-row .tree-eval { color: var(--cl-paper-400); }
+
+    #cl095 details.settings-group,
+    #cl095 details.recovery-advanced {
+      border-top: 1px solid var(--cl-line);
+    }
+    #cl095 details:last-of-type { border-bottom: 1px solid var(--cl-line); }
+    #cl095 details summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 39px;
+      color: var(--cl-paper-300);
+      cursor: pointer;
+      list-style: none;
+    }
+    #cl095 details summary::-webkit-details-marker { display: none; }
+    #cl095 details summary::after { content: "+"; margin-left: auto; color: var(--cl-paper-550); font: 14px monospace; }
+    #cl095 details[open] summary::after { content: "−"; }
+    #cl095 .settings-body { padding: 2px 0 8px; }
+    #cl095 .setting-row {
+      display: grid;
+      grid-template-columns: minmax(112px, 1fr) minmax(132px, 1.2fr);
+      gap: 10px;
+      align-items: center;
+      margin: 0 0 8px;
+    }
+    #cl095 .setting-name { color: var(--cl-paper-300); }
+    #cl095 .setting-name small { display: block; margin-top: 2px; color: var(--cl-paper-550); font-size: 10px; line-height: 1.25; }
+    #cl095 .check-row { display: flex; align-items: center; gap: 8px; min-height: 31px; color: var(--cl-paper-300); }
+    #cl095 input[type="checkbox"] { accent-color: var(--cl-sf); width: 16px; height: 16px; }
+
+    #cl095 .recovery-primary {
+      margin: 4px 0 10px;
+      border: 1px solid #4b5f4e;
+      border-radius: var(--cl-radius-panel);
+      padding: 11px;
+      background: #1e2920;
+    }
+    #cl095 .recovery-primary h3 { margin: 0 0 4px; font-size: 13px; font-weight: 500; }
+    #cl095 .recovery-primary p { margin: 0 0 9px; color: #b4c2b4; line-height: 1.4; }
+    #cl095 .advanced-box { padding: 2px 0 10px; }
+
+    #cl095 .startup {
+      padding: 22px 16px 18px;
+    }
+    #cl095 .startup-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; }
+    #cl095 .startup-brand .mark { width: 24px; height: 24px; grid-template-columns: repeat(2, 12px); grid-template-rows: repeat(2, 12px); font-size: 8px; line-height: 12px; }
+    #cl095 .startup-brand h1 { margin: 0; font-size: 20px; font-weight: 500; }
+    #cl095 .startup-lead { margin: 0 0 15px; color: var(--cl-paper-400); line-height: 1.5; }
+    #cl095 .setup-block { margin-bottom: 14px; border-top: 1px solid var(--cl-line); padding-top: 11px; }
+    #cl095 .setup-choice { display: grid; grid-template-columns: 1fr 150px; gap: 10px; align-items: center; margin-bottom: 6px; }
+
+    #cl095 .popup { padding: 14px; }
+    #cl095 .popup-head { display: flex; align-items: center; gap: 9px; margin-bottom: 13px; }
+    #cl095 .popup-head h1 { flex: 1; margin: 0; font-size: 15px; font-weight: 500; }
+    #cl095 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cl-exact); box-shadow: 0 0 0 3px var(--cl-exact-soft); }
+    #cl095 .session-block { margin-bottom: 11px; border-top: 1px solid var(--cl-line); border-bottom: 1px solid var(--cl-line); padding: 10px 0; }
+    #cl095 .session-block strong { display: block; margin-bottom: 3px; font-weight: 500; }
+    #cl095 .session-block p { margin: 0; color: var(--cl-paper-400); font-size: 11px; line-height: 1.4; }
+    #cl095 .popup-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+    #cl095 .popup-actions .primary { grid-column: 1 / -1; }
+    #cl095 .popup-foot { margin-top: 9px; color: var(--cl-paper-550); font: 9px "DejaVu Sans Mono", monospace; text-align: right; }
+
+    #cl095 .toast {
+      display: none;
+      margin: 8px 0 0;
+      border-left: 2px solid var(--cl-exact);
+      padding: 5px 8px;
+      background: var(--cl-exact-soft);
+      color: #b8dec3;
+      font-size: 11px;
+    }
+    #cl095 .toast.is-visible { display: block; }
+
+    @media (max-width: 440px) {
+      #cl095 .stage { padding-inline: 0; }
+      #cl095 .app-window { border-radius: 6px; }
+      #cl095 .square { font-size: clamp(22px, 10vw, 38px); }
+      #cl095 .candidate { grid-template-columns: 13px minmax(64px, 1fr) 51px; }
+      #cl095 .candidate .depth { display: none; }
+      #cl095 .candidate .pv { grid-column: 2 / 4; }
+      #cl095 .review-summary { grid-template-columns: repeat(2, 1fr); }
+      #cl095 .review-stat:nth-child(3) { border-left: 0; border-top: 1px solid var(--cl-line); }
+      #cl095 .review-stat:nth-child(4) { border-top: 1px solid var(--cl-line); }
+      #cl095 .setting-row { grid-template-columns: 1fr; gap: 4px; }
+      #cl095 .setup-choice { grid-template-columns: 1fr; }
+      #cl095 .postgame-actions { grid-template-columns: 1fr; }
+      #cl095 .postgame-actions .primary { grid-column: auto; }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      #cl095 .screen.is-active { animation: cl-screen-in 120ms ease-out; }
+      @keyframes cl-screen-in { from { opacity: .72; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+    }
+  </style>
+
+  <div class="prototype-toolbar" aria-label="Prototype screen controls">
+    <span class="prototype-label">0.9.5 screen</span>
+    <button type="button" class="prototype-button" id="cl-prev" aria-label="Previous screen">Previous</button>
+    <select class="view-select" id="cl-view-select" aria-label="Choose a ChessListener screen">
+      <option value="live">Live analysis</option>
+      <option value="postgame">Game finished</option>
+      <option value="compact">Live compact</option>
+      <option value="lab">Analysis Lab</option>
+      <option value="review">Local Review</option>
+      <option value="studies">Saved Studies</option>
+      <option value="settings">Settings</option>
+      <option value="recovery">Recovery</option>
+      <option value="startup">Startup</option>
+      <option value="popup">Firefox popup</option>
+    </select>
+    <button type="button" class="prototype-button" id="cl-next" aria-label="Next screen">Next</button>
+  </div>
+
+  <div class="stage">
+    <section class="app-window" id="cl-app-window" aria-label="ChessListener 0.9.5 interface proposal">
+      <header class="app-titlebar">
+        <span class="mark" aria-label="ChessListener"><span>C</span><span></span><span></span><span>L</span></span>
+        <span class="title-copy"><span class="title-status" id="cl-title-status">Live · White</span></span>
+        <span class="source-tag" id="cl-source-tag">Exact</span>
+        <button type="button" class="title-action" data-goto="compact" aria-label="Toggle compact mode" data-tooltip="Compact mode"><i data-lucide="panel-top-close" aria-hidden="true"></i></button>
+        <button type="button" class="title-action" data-goto="recovery" aria-label="Open recovery" data-tooltip="Recovery"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
+        <button type="button" class="title-action" data-goto="review" aria-label="Open local review" data-tooltip="Local review"><i data-lucide="sparkles" aria-hidden="true"></i></button>
+        <button type="button" class="title-action" data-goto="studies" aria-label="Open saved studies" data-tooltip="Saved studies"><i data-lucide="book-marked" aria-hidden="true"></i></button>
+        <button type="button" class="title-action" data-goto="settings" aria-label="Open settings" data-tooltip="Settings"><i data-lucide="sliders-horizontal" aria-hidden="true"></i></button>
+      </header>
+
+      <section class="screen is-active" data-view="live" aria-label="Live analysis">
+        <div class="board-stage"><div class="chess-board" data-fen="r1bqkb1r/1ppp1ppp/p1n2n2/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R" data-last="g8f6" data-arrows="f3e5:sf,f3g5:maia"></div></div>
+        <div class="score-strip" aria-label="White evaluation plus 0.42 at depth 18"><span class="score-white">+0.42</span><span class="score-black">d18</span></div>
+        <div class="move-context"><span class="marker played" aria-hidden="true"></span><span class="quiet">Played</span><strong class="mono">4…Nf6</strong><span class="spacer"></span><span class="quiet mono">5 / 44</span></div>
+        <div class="candidate-list" aria-label="Candidate moves">
+          <button type="button" class="candidate is-selected" data-explanation="Pressure on e5 without committing the centre. After 5.O-O, Black usually develops with Be7 before castling." aria-pressed="true"><span class="marker sf" aria-hidden="true"></span><span class="move mono">5.O-O</span><span class="eval mono">+0.42</span><span class="pv mono">Be7 6.Re1 b5 7.Bb3</span><span class="depth mono">d18</span></button>
+          <button type="button" class="candidate" data-explanation="The immediate capture is playable, but it releases some central tension and gives Black a simple recapture." aria-pressed="false"><span class="marker sf" aria-hidden="true"></span><span class="move mono">5.Bxc6</span><span class="eval mono">+0.31</span><span class="pv mono">dxc6 6.O-O Bd6</span><span class="depth mono">d18</span></button>
+          <button type="button" class="candidate" data-explanation="Maia expects this retreat most often at the selected rating. It is natural, though slightly less testing than castling." aria-pressed="false"><span class="marker maia" aria-hidden="true"></span><span class="move mono">5.Bb3</span><span class="eval mono">+0.20</span><span class="pv mono">Bc5 6.O-O d6</span><span class="depth mono">M1600</span></button>
+        </div>
+        <div class="ruled-note" id="cl-live-explanation"><strong>5.O-O</strong> keeps every central option open. The point is not an immediate tactic; it finishes development before Black can challenge the bishop.</div>
+        <div class="toolbar"><button type="button" class="button icon" aria-label="Previous continuation"><i data-lucide="chevron-left" aria-hidden="true"></i></button><span class="quiet mono">Line 1/7</span><button type="button" class="button icon" aria-label="Next continuation"><i data-lucide="chevron-right" aria-hidden="true"></i></button><span class="spacer"></span><button type="button" class="button" data-goto="lab"><i data-lucide="flask-conical" aria-hidden="true"></i>Explore line</button></div>
+      </section>
+
+      <section class="screen" data-view="postgame" aria-label="Game finished">
+        <div class="board-stage"><div class="chess-board" data-fen="6k1/5pp1/7p/8/8/5Q2/5PPP/6K1" data-last="f7f8"></div></div>
+        <div class="game-complete">
+          <p class="eyebrow">Game finished</p>
+          <h2>White won · 1–0</h2>
+          <p>Keep the game in your local library, review the turning points, or explore the final position.</p>
+          <div class="postgame-actions">
+            <button type="button" class="button primary" data-save-toast="postgame-toast"><i data-lucide="archive" aria-hidden="true"></i>Save game</button>
+            <button type="button" class="button" data-goto="review"><i data-lucide="sparkles" aria-hidden="true"></i>Run local review</button>
+            <button type="button" class="button" data-goto="lab"><i data-lucide="flask-conical" aria-hidden="true"></i>Explore final position</button>
+            <button type="button" class="button"><i data-lucide="download" aria-hidden="true"></i>Export PGN</button>
+          </div>
+          <label class="check-row autosave-row"><input class="cl-auto-save-games" type="checkbox">Automatically save completed games</label>
+          <div class="toast" id="postgame-toast" role="status">Saved to your local game library.</div>
+        </div>
+      </section>
+
+      <section class="screen" data-view="compact" aria-label="Compact live analysis">
+        <div class="compact-view">
+          <div class="score-strip" aria-label="White evaluation plus 0.42 at depth 18"><span class="score-white">+0.42</span><span class="score-black">d18</span></div>
+          <div class="move-context"><span class="marker played" aria-hidden="true"></span><span class="quiet">Played</span><strong class="mono">4…Nf6</strong><span class="spacer"></span><span class="quiet">White</span></div>
+          <div class="compact-line"><span class="marker sf" aria-hidden="true"></span><span class="move mono">5.O-O</span><span class="eval mono">+0.42</span><span class="mono quiet">Be7 6.Re1</span></div>
+          <div class="compact-line"><span class="marker maia" aria-hidden="true"></span><span class="move mono">5.Bb3</span><span class="eval mono">+0.20</span><span class="quiet">Maia 1600</span></div>
+          <div class="toolbar"><button type="button" class="button" data-goto="live"><i data-lucide="panel-top-open" aria-hidden="true"></i>Expand</button><span class="spacer"></span><button type="button" class="button" data-goto="lab">Explore</button></div>
+        </div>
+      </section>
+
+      <section class="screen" data-view="lab" aria-label="Analysis Lab">
+        <div class="context-ribbon"><i data-lucide="flask-conical" aria-hidden="true"></i><span>Private branch · real game unchanged</span><button type="button" class="live-count" data-goto="live">Live +2</button></div>
+        <div class="board-stage"><div class="chess-board" data-fen="r1bq1rk1/1pp1bppp/p1np1n2/8/B3P3/2N2N2/PPPP1PPP/R1BQR1K1" data-last="f8g8" data-arrows="c3d5:sf,c3e2:maia"></div></div>
+        <div class="score-strip" aria-label="White evaluation plus 0.58 at depth 22"><span class="score-white">+0.58</span><span class="score-black">d22</span></div>
+        <p class="breadcrumb">root / 5.O-O Be7 / 6.Re1 b5 / 7.Bb3 O-O</p>
+        <div class="candidate-list">
+          <button type="button" class="candidate is-selected" aria-pressed="true"><span class="marker sf" aria-hidden="true"></span><span class="move mono">8.c3</span><span class="eval mono">+0.58</span><span class="pv mono">d5 9.exd5 Nxd5 10.Nxe5</span><span class="depth mono">d22</span></button>
+          <button type="button" class="candidate" aria-pressed="false"><span class="marker sf" aria-hidden="true"></span><span class="move mono">8.d3</span><span class="eval mono">+0.46</span><span class="pv mono">Na5 9.Nbd2 c5</span><span class="depth mono">d22</span></button>
+        </div>
+        <div class="ruled-note"><strong>8.c3</strong> prepares d4 and gives the bishop a retreat square. The main drawback is spending a tempo before developing the queenside.</div>
+        <div class="toolbar"><button type="button" class="button">Root</button><button type="button" class="button icon" aria-label="Undo explored move"><i data-lucide="undo-2" aria-hidden="true"></i></button><button type="button" class="button icon" aria-label="Redo explored move"><i data-lucide="redo-2" aria-hidden="true"></i></button><button type="button" class="button" data-save-toast="lab-toast"><i data-lucide="bookmark-plus" aria-hidden="true"></i>Save study</button><span class="spacer"></span><button type="button" class="button primary" data-goto="live">Go live</button></div>
+        <div class="toast" id="lab-toast" role="status">Branch saved to Studies.</div>
+      </section>
+
+      <section class="screen" data-view="review" aria-label="Local Review">
+        <div class="page-head"><h2>Local Review</h2><button type="button" class="icon-action" aria-label="Import PGN or FEN" data-tooltip="Import"><i data-lucide="folder-open" aria-hidden="true"></i></button><button type="button" class="icon-action" aria-label="Export annotated PGN" data-tooltip="Export PGN"><i data-lucide="download" aria-hidden="true"></i></button><button type="button" class="icon-action" data-goto="live" aria-label="Return to live analysis"><i data-lucide="x" aria-hidden="true"></i></button></div>
+        <div class="library-row"><select class="select-control" aria-label="Saved local review"><option>vs Martin Bot · 14 Aug · 1-0</option><option>Imported: rapid-training.pgn</option></select><button type="button" class="button icon danger" aria-label="Delete this review"><i data-lucide="trash-2" aria-hidden="true"></i></button></div>
+        <div class="board-stage"><div class="chess-board" data-fen="r2q1rk1/ppp2ppp/2npbn2/8/2B1P3/2N2N2/PPP2PPP/R1BQR1K1" data-last="c4e6"></div></div>
+        <div class="graph" role="img" aria-label="White evaluation over 44 plies; move 17 selected at plus 2.3">
+          <svg viewBox="0 0 360 84" preserveAspectRatio="none"><line class="zero" x1="0" y1="42" x2="360" y2="42"></line><polyline class="eval-line" points="0,42 18,39 36,43 54,37 72,35 90,40 108,32 126,31 144,36 162,28 180,24 198,29 216,18 234,21 252,16 270,25 288,17 306,13 324,20 342,12 360,10"></polyline><line class="cursor" x1="252" y1="0" x2="252" y2="84"></line><text x="4" y="12">+5</text><text x="4" y="78">−5</text><text x="334" y="79">44</text></svg>
+        </div>
+        <div class="review-summary"><div class="review-stat"><strong>88%</strong><span>Accuracy</span></div><div class="review-stat"><strong>1</strong><span>Great</span></div><div class="review-stat"><strong>2</strong><span>Errors</span></div><div class="review-stat"><strong>0</strong><span>Blunders</span></div></div>
+        <div class="segmented" aria-label="Review filter"><button type="button" class="is-selected">All moves</button><button type="button">Turning points</button><button type="button">Mistakes</button></div>
+        <div class="ruled-note ochre" id="cl-review-detail"><strong>17.Bxe6 — Great move</strong><br>Removing the defender works because 17…fxe6 leaves the f-file and dark squares exposed. Best continuation: 18.e5 dxe5 19.Qxd8.</div>
+        <div class="toolbar"><button type="button" class="button icon" aria-label="Previous reviewed move"><i data-lucide="chevron-left" aria-hidden="true"></i></button><button type="button" class="button icon" aria-label="Next reviewed move"><i data-lucide="chevron-right" aria-hidden="true"></i></button><button type="button" class="button">Final position</button><span class="spacer"></span><button type="button" class="button" data-goto="lab">Explore here</button></div>
+        <div class="move-list" aria-label="Reviewed moves">
+          <button type="button" class="move-row" data-detail="15.Re1 was best. It centralises the rook and keeps the position flexible."><span class="mono quiet">15.</span><span class="notation mono">Re1</span><span>+0.7 → +0.8</span><span class="classification good">Best</span></button>
+          <button type="button" class="move-row" data-detail="16.h3 is harmless but slightly slow. Developing the bishop would have asked Black a more immediate question."><span class="mono quiet">16.</span><span class="notation mono">h3?!</span><span>+0.8 → +0.3</span><span class="classification warn">Inaccuracy</span></button>
+          <button type="button" class="move-row is-selected" data-detail="17.Bxe6 is a strong tactical simplification. Removing the defender works because the f-file and dark squares become vulnerable."><span class="mono quiet">17.</span><span class="notation mono">Bxe6!</span><span>+0.4 → +2.3</span><span class="classification good">Great</span></button>
+          <button type="button" class="move-row" data-detail="18.e5 keeps the initiative and opens the queen toward d8."><span class="mono quiet">18.</span><span class="notation mono">e5</span><span>+2.3 → +2.5</span><span class="classification good">Best</span></button>
+        </div>
+      </section>
+
+      <section class="screen" data-view="studies" aria-label="Saved Studies">
+        <div class="page-head"><h2>Saved Studies</h2><button type="button" class="icon-action" aria-label="Create new study" data-tooltip="New study"><i data-lucide="file-plus-2" aria-hidden="true"></i></button><button type="button" class="icon-action" data-goto="live" aria-label="Return to analysis"><i data-lucide="x" aria-hidden="true"></i></button></div>
+        <div class="field-row"><input class="text-control" type="search" placeholder="Search titles, branches, notes" aria-label="Search saved studies"><button type="button" class="button icon" aria-label="Export annotated PGN"><i data-lucide="download" aria-hidden="true"></i></button></div>
+        <div class="library-row"><select class="select-control" aria-label="Saved study"><option>Ruy López — early d4 ideas</option><option>French defence exchange sacrifice</option><option>Endgame: rook behind passer</option></select><button type="button" class="button icon danger" aria-label="Delete this study"><i data-lucide="trash-2" aria-hidden="true"></i></button></div>
+        <div class="board-stage"><div class="chess-board" data-fen="r1bq1rk1/1pp1bppp/p1np1n2/8/B3P3/2N2N2/PPPP1PPP/R1BQR1K1" data-last="f8g8"></div></div>
+        <div class="toolbar"><button type="button" class="button">Root</button><button type="button" class="button icon" aria-label="Go to parent"><i data-lucide="undo-2" aria-hidden="true"></i></button><button type="button" class="button icon" aria-label="Go to first continuation"><i data-lucide="redo-2" aria-hidden="true"></i></button><span class="spacer"></span><button type="button" class="button"><i data-lucide="refresh-cw" aria-hidden="true"></i>Analyze position</button></div>
+        <div class="variation-tree" aria-label="Study variation tree">
+          <button type="button" class="tree-row"><span>▾</span><span class="mono">5.O-O Be7</span><span class="tree-eval mono">+0.42</span></button>
+          <button type="button" class="tree-row level-1"><span>▾</span><span><span class="mono">6.Re1 b5</span> <span class="quiet">Main plan</span></span><span class="tree-eval mono">+0.51</span></button>
+          <button type="button" class="tree-row level-2 is-selected" data-study-name="Quiet centre" data-study-note="Let Black commit to the queenside before playing d4. Compare this with the immediate 8.d4 branch."><span>•</span><span><span class="mono">7.Bb3 O-O</span> <span class="quiet">Quiet centre</span></span><span class="tree-eval mono">+0.58</span></button>
+          <button type="button" class="tree-row level-2" data-study-name="Immediate break" data-study-note="The direct d4 break is more forcing, but it permits ...Bg4 and can simplify sooner than desired."><span>•</span><span><span class="mono">7.d4 exd4</span> <span class="quiet">Immediate break</span></span><span class="tree-eval mono">+0.33</span></button>
+          <button type="button" class="tree-row level-1" data-study-name="Exchange structure" data-study-note="Bxc6 changes the pawn structure. Focus on Black's doubled c-pawns and bishop pair."><span>•</span><span><span class="mono">6.Bxc6 dxc6</span> <span class="quiet">Exchange structure</span></span><span class="tree-eval mono">+0.29</span></button>
+        </div>
+        <div class="field"><label for="cl-study-title">Study title</label><input id="cl-study-title" class="text-control" value="Ruy López — early d4 ideas"></div>
+        <div class="field"><label for="cl-variation-name">Selected branch name</label><input id="cl-variation-name" class="text-control" value="Quiet centre"></div>
+        <div class="field"><label for="cl-study-note">Position note</label><textarea id="cl-study-note" class="text-control">Let Black commit to the queenside before playing d4. Compare this with the immediate 8.d4 branch.</textarea></div>
+        <div class="toolbar"><span class="quiet" id="cl-study-status">Saved locally</span><span class="spacer"></span><button type="button" class="button primary" data-save-toast="study-toast">Save note</button></div>
+        <div class="toast" id="study-toast" role="status">Title, branch name, and note saved.</div>
+      </section>
+
+      <section class="screen" data-view="settings" aria-label="Settings">
+        <div class="page-head"><h2>Settings</h2><button type="button" class="button ghost" id="cl-reset-settings">Reset defaults</button><button type="button" class="icon-action" data-goto="live" aria-label="Return to analysis"><i data-lucide="x" aria-hidden="true"></i></button></div>
+        <p class="eyebrow">Everyday analysis</p>
+        <div class="setting-row"><span class="setting-name">Live strength<small>Time spent after each board update</small></span><select class="select-control" data-default="400"><option value="150">Fast · 150 ms</option><option value="400" selected>Balanced · 400 ms</option><option value="900">Strong · 900 ms</option><option value="1800">Deep · 1.8 s</option><option value="0">Continuous</option></select></div>
+        <div class="setting-row"><span class="setting-name">Candidate lines<small>More lines use more space and engine time</small></span><select class="select-control" data-default="3"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></div>
+        <div class="setting-row"><span class="setting-name">Maia human-move model<small>Human-like prediction; Stockfish is unchanged</small></span><select class="select-control" data-default="1600"><option value="0">Off</option><option value="1400">Maia 1400</option><option value="1600" selected>Maia 1600</option><option value="1800">Maia 1800</option></select></div>
+        <div class="setting-row"><span class="setting-name">When the game advances<small>Behavior while you explore a line</small></span><select class="select-control" data-default="notify"><option value="notify" selected>Notify me</option><option value="auto">Return to live automatically</option></select></div>
+        <div class="setting-row"><span class="setting-name">Move explanations<small>How much reasoning appears below a line</small></span><select class="select-control" data-default="compact"><option>Off</option><option selected>Compact</option><option>Detailed</option></select></div>
+
+        <details class="settings-group">
+          <summary>Analysis Lab</summary>
+          <div class="settings-body">
+            <div class="setting-row"><span class="setting-name">Explore strength<small>Can be deeper than live search</small></span><select class="select-control" data-default="same"><option value="same" selected>Same as live</option><option>Strong · 900 ms</option><option>Continuous</option></select></div>
+            <div class="setting-row"><span class="setting-name">Continuation length<small>Plies shown in a candidate row</small></span><select class="select-control" data-default="6"><option>4 plies</option><option selected>6 plies</option><option>8 plies</option><option>12 plies</option><option>Full line</option></select></div>
+            <div class="setting-row"><span class="setting-name">Expanded continuations<small>Keep only the active line open, or show all</small></span><select class="select-control" data-default="selected"><option value="selected" selected>Selected line only</option><option value="all">All candidate lines</option></select></div>
+          </div>
+        </details>
+        <details class="settings-group">
+          <summary>Local Review &amp; Studies</summary>
+          <div class="settings-body">
+            <div class="setting-row"><span class="setting-name">Review strength<small>Time per historical position</small></span><select class="select-control" data-default="350"><option>Quick · 150 ms</option><option selected>Balanced · 350 ms</option><option>Deep · 800 ms</option></select></div>
+            <div class="setting-row"><span class="setting-name">Review alternatives</span><select class="select-control" data-default="2"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option></select></div>
+            <div class="setting-row"><span class="setting-name">Classification sensitivity</span><select class="select-control" data-default="standard"><option>Strict</option><option selected>Standard</option><option>Lenient</option></select></div>
+            <label class="check-row"><input class="cl-auto-save-games" type="checkbox">Automatically save completed games</label>
+            <label class="check-row"><input type="checkbox">Start a local review after saving</label>
+            <label class="check-row"><input type="checkbox" checked>Analyze a selected study position</label>
+            <label class="check-row"><input type="checkbox" checked>Save evaluation snapshots with studies</label>
+          </div>
+        </details>
+        <details class="settings-group">
+          <summary>Board &amp; display</summary>
+          <div class="settings-body">
+            <div class="setting-row"><span class="setting-name">Evaluation perspective</span><select class="select-control" data-default="white"><option selected>White</option><option>Black</option><option>Side to move</option></select></div>
+            <div class="setting-row"><span class="setting-name">Piece style<small>Applied consistently to both colors</small></span><select class="select-control" id="cl-piece-style" data-default="outline"><option value="outline" selected>Outline set</option><option value="solid">Solid silhouettes</option></select></div>
+            <div class="setting-row"><span class="setting-name">Window opacity</span><select class="select-control" data-default="100"><option selected>Opaque</option><option>94%</option><option>86%</option><option>78%</option></select></div>
+            <label class="check-row"><input type="checkbox" checked>Stockfish arrow</label><label class="check-row"><input type="checkbox" checked>Maia arrow</label><label class="check-row"><input type="checkbox" checked>Played-move highlight</label>
+          </div>
+        </details>
+        <details class="settings-group">
+          <summary>Advanced engine</summary>
+          <div class="settings-body">
+            <div class="setting-row"><span class="setting-name">Stockfish threads<small>Higher values compete more with the browser</small></span><select class="select-control" data-default="4"><option>1</option><option>2</option><option selected>4</option><option>8</option></select></div>
+          </div>
+        </details>
+        <p class="field-hint">Engine changes apply to the next search. Display and explanation changes apply immediately.</p>
+      </section>
+
+      <section class="screen" data-view="recovery" aria-label="Recovery">
+        <div class="page-head"><h2>Recovery</h2><button type="button" class="icon-action" data-goto="live" aria-label="Return to analysis"><i data-lucide="x" aria-hidden="true"></i></button></div>
+        <p class="muted">Use this when the Chess.com board and ChessListener no longer show the same position.</p>
+        <div class="recovery-primary"><h3>Try this first</h3><p>ChessListener will read the visible board again and keep your current engine settings.</p><button type="button" class="button primary" data-save-toast="recovery-toast"><i data-lucide="scan-line" aria-hidden="true"></i>Re-read visible board</button><div class="toast" id="recovery-toast" role="status">Board re-read requested. Waiting for Chess.com…</div></div>
+        <div class="toolbar"><button type="button" class="button"><i data-lucide="rotate-ccw" aria-hidden="true"></i>Restart engines</button><span class="quiet">Position stays unchanged</span></div>
+        <details class="recovery-advanced">
+          <summary>Advanced manual repair</summary>
+          <div class="advanced-box">
+            <p class="field-hint">Use only when a re-read cannot reconstruct turn, castling, or en-passant rights. Every replacement is validated before it is applied.</p>
+            <div class="setting-row"><span class="setting-name">Side to move</span><select class="select-control"><option>White to move</option><option>Black to move</option></select></div>
+            <span class="field-label">Castling rights</span><div class="field-row"><label class="check-row"><input type="checkbox" checked>White O-O</label><label class="check-row"><input type="checkbox" checked>White O-O-O</label></div><div class="field-row"><label class="check-row"><input type="checkbox" checked>Black O-O</label><label class="check-row"><input type="checkbox" checked>Black O-O-O</label></div>
+            <div class="setting-row"><span class="setting-name">En-passant square<small>Use “—” when none is available</small></span><input class="text-control mono" value="—" maxlength="2"></div>
+            <div class="field-row"><div class="field"><label>Halfmove clock</label><input class="text-control mono" type="number" value="4" min="0"></div><div class="field"><label>Fullmove number</label><input class="text-control mono" type="number" value="5" min="1"></div></div>
+            <button type="button" class="button">Validate and apply visible board</button>
+            <div class="field" style="margin-top: 12px"><label for="cl-fen">Or enter exact six-field FEN</label><input id="cl-fen" class="text-control mono" placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"></div>
+            <button type="button" class="button">Validate and apply FEN</button>
+          </div>
+        </details>
+        <div class="toolbar" style="margin-top: 13px"><button type="button" class="button danger"><i data-lucide="square" aria-hidden="true"></i>Stop session</button><span class="quiet">Closes the overlay and native session</span></div>
+      </section>
+
+      <section class="screen startup" data-view="startup" aria-label="ChessListener startup">
+        <div class="startup-brand"><span class="mark" aria-label="ChessListener"><span>C</span><span></span><span></span><span>L</span></span><div><p class="eyebrow">Local chess analysis</p><h1>ChessListener</h1></div></div>
+        <p class="startup-lead">A small analysis desk for the Chess.com board in front of you. Your games and studies stay on this computer.</p>
+        <div class="setup-block"><div class="setup-choice"><div><span class="section-title">Analysis strength</span><p class="field-hint">Balanced follows rapid games without making the browser feel heavy.</p></div><select class="select-control"><option>Fast · 150 ms</option><option selected>Balanced · 400 ms</option><option>Strong · 900 ms</option><option>Deep · 1.8 s</option></select></div></div>
+        <div class="setup-block"><div class="setup-choice"><div><span class="section-title">Human move comparison</span><p class="field-hint">Maia predicts what a player near the chosen rating might play. Stockfish stays independent.</p></div><select class="select-control"><option>Off</option><option>Maia 1400</option><option selected>Maia 1600</option><option>Maia 1800</option></select></div></div>
+        <label class="check-row"><input type="checkbox" checked>Use these choices next time</label>
+        <button type="button" class="button primary" style="width: 100%; min-height: 40px; margin-top: 10px" data-goto="live"><i data-lucide="play" aria-hidden="true"></i>Start analysis</button>
+        <p class="field-hint" style="text-align: center">Everything remains adjustable from Settings.</p>
+      </section>
+
+      <section class="screen popup" data-view="popup" aria-label="Firefox extension popup">
+        <div class="popup-head"><span class="mark" aria-label="ChessListener"><span>C</span><span></span><span></span><span>L</span></span><h1>ChessListener</h1><span class="status-dot" aria-hidden="true"></span><span class="quiet">Active</span></div>
+        <div class="session-block"><p class="eyebrow">Current board</p><strong>Martin Bot · Chess.com</strong><p>Position synced · overlay running locally</p></div>
+        <div class="popup-actions"><button type="button" class="button primary">Refresh this board</button><button type="button" class="button"><i data-lucide="panel-top-open" aria-hidden="true"></i>Reopen overlay</button><button type="button" class="button danger"><i data-lucide="square" aria-hidden="true"></i>Stop</button></div>
+        <div class="popup-foot">v0.9.5 · protocol 4</div>
+      </section>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var root = document.getElementById("cl095");
+      var select = root.querySelector("#cl-view-select");
+      var appWindow = root.querySelector("#cl-app-window");
+      var titleStatus = root.querySelector("#cl-title-status");
+      var sourceTag = root.querySelector("#cl-source-tag");
+      var screenOrder = Array.from(select.options).map(function (option) { return option.value; });
+      var screenMeta = {
+        live: ["Live · White", "Exact", false],
+        postgame: ["Game finished · 1–0", "Final", false],
+        compact: ["Live · White", "Exact", false],
+        lab: ["Lab · White", "Lab", false],
+        review: ["Review · move 17", "Local", false],
+        studies: ["Studies · 3 local", "Local", false],
+        settings: ["Settings", "Local", false],
+        recovery: ["Recovery", "Exact", false],
+        startup: ["ChessListener", "Local", false],
+        popup: ["ChessListener", "Active", true]
+      };
+
+      function setView(view) {
+        if (!screenMeta[view]) { return; }
+        root.querySelectorAll(".screen").forEach(function (screen) {
+          screen.classList.toggle("is-active", screen.getAttribute("data-view") === view);
+        });
+        select.value = view;
+        titleStatus.textContent = screenMeta[view][0];
+        sourceTag.textContent = screenMeta[view][1];
+        sourceTag.classList.toggle("lab", view === "lab");
+        appWindow.classList.toggle("is-popup", screenMeta[view][2]);
+        appWindow.setAttribute("aria-label", "ChessListener 0.9.5 " + select.options[select.selectedIndex].text + " proposal");
+      }
+
+      select.addEventListener("change", function () { setView(select.value); });
+      root.querySelector("#cl-prev").addEventListener("click", function () {
+        var index = screenOrder.indexOf(select.value);
+        setView(screenOrder[(index - 1 + screenOrder.length) % screenOrder.length]);
+      });
+      root.querySelector("#cl-next").addEventListener("click", function () {
+        var index = screenOrder.indexOf(select.value);
+        setView(screenOrder[(index + 1) % screenOrder.length]);
+      });
+      root.querySelectorAll("[data-goto]").forEach(function (button) {
+        button.addEventListener("click", function () { setView(button.getAttribute("data-goto")); });
+      });
+
+      var outlineGlyphs = {
+        K: "♔", Q: "♕", R: "♖", B: "♗", N: "♘", P: "♙",
+        k: "♔", q: "♕", r: "♖", b: "♗", n: "♘", p: "♙"
+      };
+      var solidGlyphs = {
+        K: "♚", Q: "♛", R: "♜", B: "♝", N: "♞", P: "♟",
+        k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟"
+      };
+      var files = "abcdefgh";
+
+      function updatePieceGlyphs() {
+        var glyphs = root.getAttribute("data-piece-style") === "solid" ? solidGlyphs : outlineGlyphs;
+        root.querySelectorAll("[data-piece]").forEach(function (piece) {
+          piece.textContent = glyphs[piece.getAttribute("data-piece")];
+        });
+      }
+
+      function boardIndex(square) {
+        var file = files.indexOf(square.charAt(0));
+        var rank = Number(square.charAt(1));
+        return (8 - rank) * 8 + file;
+      }
+
+      function parseFenBoard(boardPart) {
+        var result = [];
+        boardPart.split("/").forEach(function (rank) {
+          rank.split("").forEach(function (character) {
+            if (/\d/.test(character)) {
+              for (var count = 0; count < Number(character); count += 1) { result.push("."); }
+            } else {
+              result.push(character);
+            }
+          });
+        });
+        return result;
+      }
+
+      function addArrowSvg(board, arrowText, boardNumber) {
+        if (!arrowText) { return; }
+        var svgNs = "http://www.w3.org/2000/svg";
+        var svg = document.createElementNS(svgNs, "svg");
+        svg.setAttribute("class", "board-arrows");
+        svg.setAttribute("viewBox", "0 0 100 100");
+        svg.setAttribute("aria-hidden", "true");
+        var defs = document.createElementNS(svgNs, "defs");
+        ["sf", "maia"].forEach(function (kind) {
+          var marker = document.createElementNS(svgNs, "marker");
+          marker.setAttribute("id", "cl-arrow-" + boardNumber + "-" + kind);
+          marker.setAttribute("viewBox", "0 0 10 10");
+          marker.setAttribute("refX", "8.5");
+          marker.setAttribute("refY", "5");
+          marker.setAttribute("markerWidth", "4.2");
+          marker.setAttribute("markerHeight", "4.2");
+          marker.setAttribute("orient", "auto-start-reverse");
+          var path = document.createElementNS(svgNs, "path");
+          path.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+          path.setAttribute("fill", kind === "sf" ? "#5b8fc9" : "#d4914f");
+          path.setAttribute("stroke", "#151714");
+          path.setAttribute("stroke-width", ".8");
+          path.setAttribute("paint-order", "stroke fill");
+          marker.appendChild(path);
+          defs.appendChild(marker);
+        });
+        svg.appendChild(defs);
+        arrowText.split(",").forEach(function (entry) {
+          var parts = entry.split(":");
+          var move = parts[0];
+          var kind = parts[1] === "maia" ? "maia" : "sf";
+          var fromFile = files.indexOf(move.charAt(0));
+          var fromRank = Number(move.charAt(1));
+          var toFile = files.indexOf(move.charAt(2));
+          var toRank = Number(move.charAt(3));
+          var fromX = (fromFile + .5) * 12.5;
+          var fromY = (8 - fromRank + .5) * 12.5;
+          var toX = (toFile + .5) * 12.5;
+          var toY = (8 - toRank + .5) * 12.5;
+          var dx = toX - fromX;
+          var dy = toY - fromY;
+          var distance = Math.max(1, Math.hypot(dx, dy));
+          var ux = dx / distance;
+          var uy = dy / distance;
+          var side = kind === "maia" ? .75 : -.75;
+          var offsetX = -uy * side;
+          var offsetY = ux * side;
+          var x1 = fromX + ux * 2.4 + offsetX;
+          var y1 = fromY + uy * 2.4 + offsetY;
+          var x2 = toX - ux * 4.6 + offsetX;
+          var y2 = toY - uy * 4.6 + offsetY;
+          var halo = document.createElementNS(svgNs, "line");
+          halo.setAttribute("class", "arrow-halo");
+          halo.setAttribute("x1", String(x1));
+          halo.setAttribute("y1", String(y1));
+          halo.setAttribute("x2", String(x2));
+          halo.setAttribute("y2", String(y2));
+          svg.appendChild(halo);
+          var line = document.createElementNS(svgNs, "line");
+          line.setAttribute("class", "arrow-line");
+          line.setAttribute("x1", String(x1));
+          line.setAttribute("y1", String(y1));
+          line.setAttribute("x2", String(x2));
+          line.setAttribute("y2", String(y2));
+          line.setAttribute("stroke", kind === "sf" ? "#5b8fc9" : "#d4914f");
+          line.setAttribute("marker-end", "url(#cl-arrow-" + boardNumber + "-" + kind + ")");
+          svg.appendChild(line);
+        });
+        board.appendChild(svg);
+      }
+
+      root.querySelectorAll(".chess-board").forEach(function (board, boardNumber) {
+        var position = parseFenBoard(board.getAttribute("data-fen"));
+        var last = board.getAttribute("data-last") || "";
+        var lastSquares = last.length >= 4 ? [boardIndex(last.slice(0, 2)), boardIndex(last.slice(2, 4))] : [];
+        position.forEach(function (piece, index) {
+          var square = document.createElement("span");
+          var row = Math.floor(index / 8);
+          var column = index % 8;
+          square.className = "square " + ((row + column) % 2 === 0 ? "light" : "dark");
+          if (lastSquares.indexOf(index) !== -1) { square.classList.add("last"); }
+          if (piece !== ".") {
+            var glyph = document.createElement("span");
+            glyph.className = piece === piece.toUpperCase() ? "white-piece" : "black-piece";
+            glyph.setAttribute("data-piece", piece);
+            square.appendChild(glyph);
+          }
+          board.appendChild(square);
+        });
+        var stage = board.parentElement;
+        var rankAxis = document.createElement("span");
+        rankAxis.className = "rank-axis";
+        rankAxis.setAttribute("aria-hidden", "true");
+        var fileAxis = document.createElement("span");
+        fileAxis.className = "file-axis";
+        fileAxis.setAttribute("aria-hidden", "true");
+        for (var coordinate = 0; coordinate < 8; coordinate += 1) {
+          var rankCoordinate = document.createElement("span");
+          rankCoordinate.textContent = String(8 - coordinate);
+          rankAxis.appendChild(rankCoordinate);
+          var fileCoordinate = document.createElement("span");
+          fileCoordinate.textContent = files.charAt(coordinate);
+          fileAxis.appendChild(fileCoordinate);
+        }
+        stage.appendChild(rankAxis);
+        stage.appendChild(fileAxis);
+        addArrowSvg(board, board.getAttribute("data-arrows"), boardNumber);
+      });
+      updatePieceGlyphs();
+
+      var pieceStyle = root.querySelector("#cl-piece-style");
+      pieceStyle.addEventListener("change", function () {
+        root.setAttribute("data-piece-style", pieceStyle.value);
+        updatePieceGlyphs();
+      });
+
+      root.querySelectorAll(".cl-auto-save-games").forEach(function (control) {
+        control.addEventListener("change", function () {
+          root.querySelectorAll(".cl-auto-save-games").forEach(function (peer) {
+            peer.checked = control.checked;
+          });
+        });
+      });
+
+      root.querySelectorAll("[data-view='live'] .candidate").forEach(function (candidate) {
+        candidate.addEventListener("click", function () {
+          root.querySelectorAll("[data-view='live'] .candidate").forEach(function (peer) {
+            var selected = peer === candidate;
+            peer.classList.toggle("is-selected", selected);
+            peer.setAttribute("aria-pressed", selected ? "true" : "false");
+          });
+          var move = candidate.querySelector(".move").textContent;
+          root.querySelector("#cl-live-explanation").innerHTML = "<strong>" + move + "</strong> " + candidate.getAttribute("data-explanation");
+        });
+      });
+
+      root.querySelectorAll(".segmented button").forEach(function (button) {
+        button.addEventListener("click", function () {
+          button.parentElement.querySelectorAll("button").forEach(function (peer) { peer.classList.toggle("is-selected", peer === button); });
+        });
+      });
+
+      root.querySelectorAll(".move-row").forEach(function (row) {
+        row.addEventListener("click", function () {
+          root.querySelectorAll(".move-row").forEach(function (peer) { peer.classList.toggle("is-selected", peer === row); });
+          root.querySelector("#cl-review-detail").innerHTML = "<strong>" + row.querySelector(".notation").textContent + "</strong><br>" + row.getAttribute("data-detail");
+        });
+      });
+
+      root.querySelectorAll(".tree-row[data-study-note]").forEach(function (row) {
+        row.addEventListener("click", function () {
+          root.querySelectorAll(".tree-row").forEach(function (peer) { peer.classList.toggle("is-selected", peer === row); });
+          root.querySelector("#cl-variation-name").value = row.getAttribute("data-study-name");
+          root.querySelector("#cl-study-note").value = row.getAttribute("data-study-note");
+          root.querySelector("#cl-study-status").textContent = "Unsaved changes";
+        });
+      });
+
+      root.querySelectorAll("[data-save-toast]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var toast = root.querySelector("#" + button.getAttribute("data-save-toast"));
+          toast.classList.add("is-visible");
+          if (button.getAttribute("data-save-toast") === "study-toast") { root.querySelector("#cl-study-status").textContent = "Saved locally"; }
+          window.setTimeout(function () { toast.classList.remove("is-visible"); }, 2600);
+        });
+      });
+
+      root.querySelector("#cl-reset-settings").addEventListener("click", function () {
+        root.querySelectorAll("[data-view='settings'] select[data-default]").forEach(function (control) {
+          var wanted = control.getAttribute("data-default");
+          var matching = Array.from(control.options).find(function (option) { return option.value === wanted || option.textContent.toLowerCase().indexOf(wanted.toLowerCase()) !== -1; });
+          if (matching) { control.value = matching.value; }
+        });
+        root.setAttribute("data-piece-style", pieceStyle.value);
+        updatePieceGlyphs();
+        root.querySelectorAll(".cl-auto-save-games").forEach(function (control) { control.checked = false; });
+      });
+
+      setView("live");
+    }());
+  </script>
+</div>
+
+<script id="codex-visualization-floating-ui-core" src="https://unpkg.com/@floating-ui/core@1.7.3/dist/floating-ui.core.umd.min.js"></script>
+<script id="codex-visualization-floating-ui-dom" src="https://unpkg.com/@floating-ui/dom@1.7.4/dist/floating-ui.dom.umd.min.js"></script>
+<script id="codex-visualization-lucide" async src="https://unpkg.com/lucide@1.17.0/dist/umd/lucide.js"></script>
+<script id="codex-visualization-tooltip">/* oxlint-disable typescript/no-unsafe-argument, typescript/no-unsafe-call, typescript/no-unsafe-return */
+// Runs inside the visualization sandbox, not the host webview.
+(() => {
+  if (window.FloatingUIDOM == null) {
+    return;
+  }
+  const { autoUpdate, computePosition, flip, offset, shift, size } =
+    window.FloatingUIDOM;
+  const tooltipPlacements = new Set(["top", "right", "bottom", "left"]);
+  const tooltipId = `codex-visualization-tooltip-${
+    window.crypto?.randomUUID?.() ?? Date.now().toString(36)
+  }`;
+  const tooltipGap = 5;
+  const hoverDelay = 700;
+  const skipDelay = 300;
+  let activeTrigger = null;
+  let pendingTrigger = null;
+  let tooltip = null;
+  let openTimeout = null;
+  let autoUpdateCleanup = null;
+  let positionRequest = 0;
+  let skipDelayUntil = 0;
+
+  const getTrigger = (target) =>
+    target?.nodeType === Node.ELEMENT_NODE
+      ? target.closest("[data-tooltip]")
+      : null;
+  const containsTarget = (trigger, target) =>
+    target?.nodeType != null && trigger.contains(target);
+  const getContent = (trigger) =>
+    trigger.getAttribute("data-tooltip")?.trim() ?? "";
+  const getPlacement = (trigger) => {
+    const placement = trigger.getAttribute("data-tooltip-placement");
+    return tooltipPlacements.has(placement) ? placement : "top";
+  };
+  const getTooltip = () => {
+    if (tooltip == null) {
+      tooltip = document.createElement("div");
+      tooltip.id = tooltipId;
+      tooltip.className = "tooltip";
+      tooltip.setAttribute("role", "tooltip");
+    }
+    return tooltip;
+  };
+  const setDescribedBy = (trigger, described) => {
+    const ids = new Set(
+      (trigger.getAttribute("aria-describedby") ?? "")
+        .split(/\s+/)
+        .filter(Boolean),
+    );
+    if (described) {
+      ids.add(tooltipId);
+    } else {
+      ids.delete(tooltipId);
+    }
+    if (ids.size === 0) {
+      trigger.removeAttribute("aria-describedby");
+    } else {
+      trigger.setAttribute("aria-describedby", [...ids].join(" "));
+    }
+  };
+  const clearOpenTimeout = () => {
+    if (openTimeout != null) {
+      window.clearTimeout(openTimeout);
+      openTimeout = null;
+    }
+    pendingTrigger = null;
+  };
+  const closeTooltip = (activateSkipDelay = true) => {
+    clearOpenTimeout();
+    positionRequest += 1;
+    autoUpdateCleanup?.();
+    autoUpdateCleanup = null;
+    if (activeTrigger == null) {
+      return;
+    }
+    setDescribedBy(activeTrigger, false);
+    activeTrigger = null;
+    tooltip?.remove();
+    if (activateSkipDelay) {
+      skipDelayUntil = Date.now() + skipDelay;
+    }
+  };
+  const updatePosition = (trigger, floating) => {
+    const request = ++positionRequest;
+    void computePosition(trigger, floating, {
+      middleware: [
+        offset(tooltipGap),
+        flip({ padding: tooltipGap }),
+        shift({ padding: tooltipGap }),
+        size({
+          padding: tooltipGap,
+          apply({ availableHeight, availableWidth, elements }) {
+            elements.floating.style.setProperty(
+              "--tooltip-available-width",
+              `${Math.max(0, availableWidth)}px`,
+            );
+            elements.floating.style.setProperty(
+              "--tooltip-available-height",
+              `${Math.max(0, availableHeight)}px`,
+            );
+          },
+        }),
+      ],
+      placement: getPlacement(trigger),
+      strategy: "fixed",
+    })
+      .then(({ x, y }) => {
+        if (activeTrigger !== trigger || request !== positionRequest) {
+          return;
+        }
+        const scale = window.devicePixelRatio || 1;
+        floating.style.transform = `translate(${Math.round(x * scale) / scale}px, ${Math.round(y * scale) / scale}px)`;
+        floating.style.visibility = "visible";
+      })
+      .catch(() => {
+        if (activeTrigger === trigger && request === positionRequest) {
+          closeTooltip(false);
+        }
+      });
+  };
+  const openTooltip = (trigger) => {
+    const content = getContent(trigger);
+    if (!trigger.isConnected || content.length === 0) {
+      return;
+    }
+    clearOpenTimeout();
+    if (activeTrigger === trigger) {
+      return;
+    }
+    closeTooltip();
+    const floating = getTooltip();
+    floating.textContent = content;
+    floating.style.visibility = "hidden";
+    floating.style.transform = "translate(0, 0)";
+    document.body.appendChild(floating);
+    activeTrigger = trigger;
+    setDescribedBy(trigger, true);
+    autoUpdateCleanup = autoUpdate(trigger, floating, () => {
+      updatePosition(trigger, floating);
+    });
+  };
+  const requestOpen = (trigger, immediate = false) => {
+    if (
+      getContent(trigger).length === 0 ||
+      activeTrigger === trigger ||
+      pendingTrigger === trigger
+    ) {
+      return;
+    }
+    clearOpenTimeout();
+    pendingTrigger = trigger;
+    const delay =
+      immediate || activeTrigger != null || Date.now() < skipDelayUntil
+        ? 0
+        : hoverDelay;
+    if (delay === 0) {
+      openTooltip(trigger);
+      return;
+    }
+    openTimeout = window.setTimeout(() => {
+      openTimeout = null;
+      pendingTrigger = null;
+      openTooltip(trigger);
+    }, delay);
+  };
+  const handlePointerOpen = (event) => {
+    if (event.pointerType === "touch") {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    requestOpen(trigger);
+  };
+  const handleLeave = (event) => {
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const handleFocusIn = (event) => {
+    const trigger = getTrigger(event.target);
+    if (trigger?.matches(":focus-visible")) {
+      requestOpen(trigger, true);
+    }
+  };
+  const handleKeyDown = (event) => {
+    if (event.key === "Escape") {
+      closeTooltip();
+    }
+  };
+  const handleContextMenu = (event) => {
+    const trigger = getTrigger(event.target);
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const destroy = () => {
+    closeTooltip(false);
+    document.removeEventListener("pointerover", handlePointerOpen);
+    document.removeEventListener("pointerout", handleLeave);
+    document.removeEventListener("focusin", handleFocusIn);
+    document.removeEventListener("focusout", handleLeave);
+    document.removeEventListener("keydown", handleKeyDown);
+    document.removeEventListener("contextmenu", handleContextMenu);
+    tooltip = null;
+  };
+
+  document.addEventListener("pointerover", handlePointerOpen);
+  document.addEventListener("pointerout", handleLeave);
+  document.addEventListener("focusin", handleFocusIn);
+  document.addEventListener("focusout", handleLeave);
+  document.addEventListener("keydown", handleKeyDown);
+  document.addEventListener("contextmenu", handleContextMenu);
+  window.addEventListener("pagehide", destroy, { once: true });
+})();
+</script>
+<script id="codex-visualization-lucide-initialization">(() => {
+  const initialize = () => {
+    globalThis.lucide?.createIcons({ attrs: { width: 16, height: 16 } });
+  };
+  if (globalThis.lucide != null) {
+    initialize();
+    return;
+  }
+  document
+    .getElementById("codex-visualization-lucide")
+    ?.addEventListener("load", initialize, { once: true });
+})();
+</script>
+</body>
+</html>

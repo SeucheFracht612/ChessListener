@@ -2814,7 +2814,7 @@ static void HandleSessionStart(
         if (session->explorer.active) {
             AnalysisExploreDestroy(session->explorer.id, "session_replaced");
         }
-        AnalysisSessionEnd("replaced");
+        AnalysisSessionEnd("replaced", "*");
     }
 
     memset(session, 0, sizeof(*session));
@@ -3260,6 +3260,7 @@ static void HandleHistoryReconcile(
     char lastMove[6];
     char canonicalMoves[MAX_HISTORY_TEXT_LENGTH + 1U];
     char canonicalInitialFen[MAX_FEN_LENGTH];
+    char gameResult[16] = "*";
     size_t moveCount = 0U;
     int associated = 0;
     int sameFen = 0;
@@ -3308,6 +3309,17 @@ static void HandleHistoryReconcile(
             return;
         }
         initialFenValue = initialFen;
+    }
+    if (FindJsonFieldValue(message, "game_result") != NULL) {
+        if (!ExtractJsonStringField(
+                message, "game_result", gameResult, sizeof(gameResult)) ||
+            (strcmp(gameResult, "*") != 0 &&
+             strcmp(gameResult, "1-0") != 0 &&
+             strcmp(gameResult, "0-1") != 0 &&
+             strcmp(gameResult, "1/2-1/2") != 0)) {
+            (void)WriteResponse(response, 0, "invalid_game_result", NULL, NULL);
+            return;
+        }
     }
 
     /* A history result is useful only for the exact DOM snapshot it was
@@ -3393,7 +3405,7 @@ static void HandleHistoryReconcile(
         }
     }
     AnalysisUpdateGameRecord(
-        canonicalInitialFen, canonicalMoves, moveCount, "*");
+        canonicalInitialFen, canonicalMoves, moveCount, gameResult);
 
     if (sameFen) {
         /* Provenance changed, but chess state did not. Preserve the running
@@ -3976,6 +3988,7 @@ static void HandleSessionEnd(
     char response[MAX_RESPONSE_LENGTH])
 {
     char reason[64];
+    char gameResult[16] = "*";
 
     if (!RequireMatchingSession(message, session, response)) {
         return;
@@ -3984,13 +3997,26 @@ static void HandleSessionEnd(
     if (!ExtractJsonStringField(message, "reason", reason, sizeof(reason))) {
         (void)snprintf(reason, sizeof(reason), "browser_session_end");
     }
+    if (FindJsonFieldValue(message, "game_result") != NULL &&
+        (!ExtractJsonStringField(
+            message, "game_result", gameResult, sizeof(gameResult)) ||
+         (strcmp(gameResult, "*") != 0 &&
+          strcmp(gameResult, "1-0") != 0 &&
+          strcmp(gameResult, "0-1") != 0 &&
+          strcmp(gameResult, "1/2-1/2") != 0))) {
+        (void)WriteResponse(response, 0, "invalid_game_result", NULL, NULL);
+        return;
+    }
+    if (strcmp(reason, "game_end") != 0) {
+        (void)snprintf(gameResult, sizeof(gameResult), "*");
+    }
 
     fprintf(logFile, "=== Session ended: %s (%s) ===\n", session->id, reason);
     fflush(logFile);
     if (session->explorer.active) {
         AnalysisExploreDestroy(session->explorer.id, reason);
     }
-    AnalysisSessionEnd(reason);
+    AnalysisSessionEnd(reason, gameResult);
     memset(session, 0, sizeof(*session));
     (void)WriteResponse(response, 1, "session_ended", NULL, NULL);
 }
@@ -4125,7 +4151,7 @@ int main(void)
             AnalysisExploreDestroy(
                 session.explorer.id, "browser_disconnected");
         }
-        AnalysisSessionEnd("browser_disconnected");
+        AnalysisSessionEnd("browser_disconnected", "*");
     }
     AnalysisStop();
 

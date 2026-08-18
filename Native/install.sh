@@ -19,6 +19,7 @@ REQUIRE_MAIA=0
 REQUIRED_FAILURES=0
 MAIA_SOURCE=""
 MAIA_REASON="not checked"
+MAIA_LAYOUT_REASON="not checked"
 
 usage() {
     cat <<'EOF'
@@ -109,6 +110,25 @@ required_missing() {
     REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
 }
 
+check_user_library() {
+    echo "Saved games and studies"
+    if ! python3 "$SCRIPT_DIR/study_store.py" --migrate-legacy \
+        --legacy "$INSTALL_PREFIX/reviews.json" --dry-run; then
+        required_missing "legacy saved games/studies could not be preserved safely"
+        return 1
+    fi
+}
+
+migrate_user_library() {
+    echo "Saved games and studies"
+    if ! python3 "$SCRIPT_DIR/study_store.py" --migrate-legacy \
+        --legacy "$INSTALL_PREFIX/reviews.json"; then
+        echo "error: installation stopped before changing the managed runtime" >&2
+        echo "Resolve the reported library path problem, then run install again." >&2
+        return 1
+    fi
+}
+
 is_managed_install_prefix() {
     [ -d "$INSTALL_PREFIX" ] &&
         [ ! -L "$INSTALL_PREFIX" ] &&
@@ -116,6 +136,64 @@ is_managed_install_prefix() {
         [ ! -L "$INSTALL_PREFIX/.chess-listener-install" ] &&
         [ "$(cat "$INSTALL_PREFIX/.chess-listener-install")" = \
             "ChessListener user installation" ]
+}
+
+maia_layout_is_safe_at() {
+    local base="$1"
+    local path
+    local rating
+
+    MAIA_LAYOUT_REASON=""
+
+    for path in \
+        "$base/Engine" \
+        "$base/Engine/lib" \
+        "$base/Engine/maia-chess" \
+        "$base/Engine/maia-chess/maia_weights"; do
+        if [ -L "$path" ]; then
+            MAIA_LAYOUT_REASON="symbolic link is not allowed in the Maia runtime: $path"
+            return 1
+        fi
+        if [ -e "$path" ] && [ ! -d "$path" ]; then
+            MAIA_LAYOUT_REASON="expected a directory in the Maia runtime: $path"
+            return 1
+        fi
+    done
+
+    path="$base/Engine/lc0"
+    if [ -L "$path" ]; then
+        MAIA_LAYOUT_REASON="symbolic link is not allowed for the Maia executable: $path"
+        return 1
+    fi
+    if [ -e "$path" ] && [ ! -f "$path" ]; then
+        MAIA_LAYOUT_REASON="expected a regular Maia executable: $path"
+        return 1
+    fi
+
+    for rating in 1100 1200 1300 1400 1500 1600 1700 1800 1900; do
+        path="$base/Engine/maia-chess/maia_weights/maia-$rating.pb.gz"
+        if [ -L "$path" ]; then
+            MAIA_LAYOUT_REASON="symbolic link is not allowed for a Maia weight: $path"
+            return 1
+        fi
+        if [ -e "$path" ] && [ ! -f "$path" ]; then
+            MAIA_LAYOUT_REASON="expected a regular Maia weight: $path"
+            return 1
+        fi
+    done
+
+    MAIA_LAYOUT_REASON="safe regular paths"
+    return 0
+}
+
+refuse_unsafe_managed_maia_layout() {
+    if is_managed_install_prefix && \
+       ! maia_layout_is_safe_at "$INSTALL_PREFIX"; then
+        echo "error: refusing unsafe managed Maia layout" >&2
+        echo "  $MAIA_LAYOUT_REASON" >&2
+        echo "Replace the symlink or non-regular path, then run install again." >&2
+        return 1
+    fi
 }
 
 find_stockfish() {
@@ -165,6 +243,11 @@ validate_maia_at() {
     local dependencies
     local output
     local library_path="$base/Engine/lib"
+
+    if ! maia_layout_is_safe_at "$base"; then
+        MAIA_REASON="$MAIA_LAYOUT_REASON"
+        return 1
+    fi
 
     if [ ! -x "$lc0" ]; then
         MAIA_REASON="lc0 is not executable at $lc0"
@@ -294,6 +377,15 @@ check_platform_and_runtime() {
 
 check_optional_maia() {
     echo "Optional human-move model"
+    if is_managed_install_prefix && \
+       ! maia_layout_is_safe_at "$INSTALL_PREFIX"; then
+        MAIA_REASON="$MAIA_LAYOUT_REASON"
+        optional "Maia disabled: $MAIA_REASON"
+        optional "Stockfish-only mode remains fully usable"
+        required_missing "unsafe managed Maia layout"
+        return
+    fi
+
     if [ -x "$SCRIPT_DIR/Engine/lc0" ] || \
        [ -x "$INSTALL_PREFIX/Engine/lc0" ]; then
         echo "  Checking gzip integrity and UCI startup for all nine nets; this may take several minutes."
@@ -401,6 +493,8 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     check_installed_files
     echo
     check_optional_maia
+    echo
+    check_user_library || true
     print_result
     exit $?
 fi
@@ -416,6 +510,10 @@ echo "  source:  $PROJECT_ROOT"
 echo "  target:  $INSTALL_PREFIX"
 echo "  Firefox: $MANIFEST_PATH"
 echo
+
+if ! refuse_unsafe_managed_maia_layout; then
+    exit 1
+fi
 
 check_platform_and_runtime
 echo
@@ -433,11 +531,28 @@ if [ -e "$INSTALL_PREFIX" ] && [ ! -d "$INSTALL_PREFIX" ]; then
     echo "error: install prefix exists but is not a directory: $INSTALL_PREFIX" >&2
     exit 1
 fi
+LIBRARY_MIGRATED=0
+if [ -d "$INSTALL_PREFIX" ] && \
+   ! is_managed_install_prefix && \
+   [ -n "$(find "$INSTALL_PREFIX" -mindepth 1 -maxdepth 1 -print -quit)" ] && \
+   [ "$INSTALL_PREFIX" = "$DEFAULT_DATA_HOME/chess-listener" ] && \
+   [ -f "$INSTALL_PREFIX/reviews.json" ] && \
+   [ ! -L "$INSTALL_PREFIX/reviews.json" ] && \
+   [ "$(find "$INSTALL_PREFIX" -mindepth 1 -maxdepth 1 -print | wc -l)" -eq 1 ]; then
+    echo
+    migrate_user_library
+    LIBRARY_MIGRATED=1
+fi
 if [ -d "$INSTALL_PREFIX" ] && \
    ! is_managed_install_prefix && \
    [ -n "$(find "$INSTALL_PREFIX" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
     echo "error: refusing to overwrite an unmarked non-empty directory: $INSTALL_PREFIX" >&2
     exit 1
+fi
+
+if [ "$LIBRARY_MIGRATED" -eq 0 ]; then
+    echo
+    migrate_user_library
 fi
 
 echo
@@ -451,6 +566,11 @@ fi
 
 echo
 echo "Copying runtime files"
+if ! maia_layout_is_safe_at "$INSTALL_PREFIX"; then
+    echo "error: refusing unsafe Maia install target" >&2
+    echo "  $MAIA_LAYOUT_REASON" >&2
+    exit 1
+fi
 install -d -m 0755 "$INSTALL_PREFIX" "$INSTALL_PREFIX/Engine" "$MANIFEST_DIR"
 printf '%s\n' "ChessListener user installation" > "$INSTALL_PREFIX/.chess-listener-install"
 printf '%s\n' "$SCRIPT_DIR" > "$INSTALL_PREFIX/.install-source"
@@ -467,12 +587,26 @@ install -m 0755 "$SCRIPT_DIR/install.sh" "$INSTALL_PREFIX/install.sh"
 install -m 0755 "$SCRIPT_DIR/update.sh" "$INSTALL_PREFIX/update.sh"
 install -m 0755 "$SCRIPT_DIR/uninstall.sh" "$INSTALL_PREFIX/uninstall.sh"
 
+if ! maia_layout_is_safe_at "$INSTALL_PREFIX"; then
+    echo "error: refusing unsafe Maia install target before payload update" >&2
+    echo "  $MAIA_LAYOUT_REASON" >&2
+    exit 1
+fi
+
 if [ -n "$MAIA_SOURCE" ]; then
     if [ "$MAIA_SOURCE" = "$INSTALL_PREFIX" ]; then
         echo "  preserved validated installed Maia runtime"
     else
+        if ! maia_layout_is_safe_at "$MAIA_SOURCE"; then
+            echo "error: Maia source layout became unsafe before payload copy" >&2
+            echo "  $MAIA_LAYOUT_REASON" >&2
+            exit 1
+        fi
         install -d -m 0755 \
             "$INSTALL_PREFIX/Engine/maia-chess/maia_weights"
+        # Engine/lib is a managed part of one validated Maia payload.  Never
+        # mix libraries from the previous backend/build with a replacement.
+        rm -rf -- "$INSTALL_PREFIX/Engine/lib"
         install -m 0755 "$MAIA_SOURCE/Engine/lc0" "$INSTALL_PREFIX/Engine/lc0"
         for rating in 1100 1200 1300 1400 1500 1600 1700 1800 1900; do
             install -m 0644 \
@@ -494,6 +628,7 @@ else
         rm -f -- \
             "$INSTALL_PREFIX/Engine/maia-chess/maia_weights/maia-$rating.pb.gz"
     done
+    rm -rf -- "$INSTALL_PREFIX/Engine/lib"
     echo "  optional Maia runtime not installed (invalid managed payload removed)"
 fi
 

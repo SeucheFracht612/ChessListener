@@ -69,6 +69,14 @@ clean:
     )
 
 
+def snapshot_regular_files(root):
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="chess-listener-lifecycle-") as raw:
         root = Path(raw)
@@ -118,9 +126,20 @@ def main():
             "# lifecycle fixture\n", encoding="utf-8"
         )
         (runtime / "review.py").write_text("# lifecycle fixture\n", encoding="utf-8")
-        (runtime / "study_store.py").write_text("# lifecycle fixture\n", encoding="utf-8")
+        shutil.copy2(NATIVE / "study_store.py", runtime / "study_store.py")
         (runtime / "study.py").write_text("# lifecycle fixture\n", encoding="utf-8")
         (runtime / "pgn_import.py").write_text("# lifecycle fixture\n", encoding="utf-8")
+        legacy_library = runtime / "reviews.json"
+        legacy_library_bytes = json.dumps(
+            {
+                "version": 2,
+                "games": [{"id": "uninstall-preservation-fixture"}],
+                "studies": [],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        legacy_library.write_bytes(legacy_library_bytes)
+        separated_library = root / "current-data" / "chess-listener-library" / "reviews.json"
 
         manifest_path = manifest_dir / "local.chess_listener.json"
         manifest_path.write_text(
@@ -173,6 +192,10 @@ printf 'arguments=%s\n' "$*"
         environment.update(
             {
                 "HOME": str(home),
+                # Deliberately differs from the recorded install prefix.  The
+                # installed scripts must protect runtime/reviews.json even if
+                # XDG_DATA_HOME changed since the older release wrote it.
+                "XDG_DATA_HOME": str(root / "current-data"),
                 "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
                 "PYTHONPATH": (
                     f"{fake_python}{os.pathsep}{environment['PYTHONPATH']}"
@@ -219,6 +242,7 @@ for raw in sys.stdin:
         reinstall_environment = environment | {
             "CHESSLISTENER_PREFIX": str(reinstall_runtime),
             "CHESSLISTENER_MANIFEST_DIR": str(reinstall_manifest_dir),
+            "XDG_DATA_HOME": str(root / "reinstall-data"),
         }
 
         preserved = run([reinstall_source / "install.sh"], reinstall_environment)
@@ -264,6 +288,68 @@ for raw in sys.stdin:
             not (installed_weights / f"maia-{rating}.pb.gz").exists()
             for rating in MAIA_RATINGS
         )
+        assert not (reinstall_runtime / "Engine" / "lib").exists()
+
+        # Replacing Maia from a newly validated source must replace Engine/lib
+        # as one payload too; a stale backend library must not remain on the
+        # installed LD_LIBRARY_PATH.
+        create_maia_payload(
+            reinstall_source,
+            """#!/usr/bin/env python3
+import sys
+for raw in sys.stdin:
+    if raw.strip() == "uci":
+        print("id name replacement Maia", flush=True)
+        print("uciok", flush=True)
+    elif raw.strip() == "quit":
+        break
+""",
+        )
+        source_library = reinstall_source / "Engine" / "lib" / "libnew.so"
+        source_library.parent.mkdir(parents=True)
+        source_library.write_bytes(b"replacement shared-library fixture\n")
+        stale_library = reinstall_runtime / "Engine" / "lib" / "libstale.so"
+        stale_library.parent.mkdir(parents=True)
+        stale_library.write_bytes(b"must be removed\n")
+        replaced = run([reinstall_source / "install.sh"], reinstall_environment)
+        assert "installed optional Maia runtime" in replaced, replaced
+        assert not stale_library.exists()
+        assert (
+            reinstall_runtime / "Engine" / "lib" / "libnew.so"
+        ).read_bytes() == source_library.read_bytes()
+        shutil.rmtree(reinstall_source / "Engine")
+
+        # Before 0.9.5 the default user library shared the install prefix.  A
+        # pre-install library-only directory must be migrated out atomically
+        # rather than making a first install look like an unsafe foreign tree.
+        preinstall_data = root / "preinstall-data"
+        preinstall_runtime = preinstall_data / "chess-listener"
+        preinstall_manifest_dir = root / "preinstall-manifests"
+        preinstall_runtime.mkdir(parents=True)
+        preinstall_bytes = json.dumps(
+            {
+                "version": 2,
+                "games": [{"id": "preinstall-library"}],
+                "studies": [],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        (preinstall_runtime / "reviews.json").write_bytes(preinstall_bytes)
+        preinstall_environment = environment | {
+            "XDG_DATA_HOME": str(preinstall_data),
+            "CHESSLISTENER_PREFIX": str(preinstall_runtime),
+            "CHESSLISTENER_MANIFEST_DIR": str(preinstall_manifest_dir),
+        }
+        preinstalled = run(
+            [reinstall_source / "install.sh"], preinstall_environment
+        )
+        preinstall_library = (
+            preinstall_data / "chess-listener-library" / "reviews.json"
+        )
+        assert "Migrated saved games and studies:" in preinstalled, preinstalled
+        assert preinstall_library.read_bytes() == preinstall_bytes
+        assert (preinstall_runtime / ".chess-listener-install").is_file()
+        assert not (preinstall_runtime / "reviews.json").exists()
 
         # Never execute an apparent lc0 from an unmarked target while deciding
         # whether a previous Maia installation may be preserved.
@@ -323,12 +409,148 @@ for raw in sys.stdin:
         assert "refusing to install through symlink" in symlink_refused
         assert not symlink_sentinel.exists(), symlink_refused
 
+        # A valid installation marker does not make symlinked Engine paths
+        # trustworthy.  Normal installs must stop before build/copy/removal,
+        # while --check must report the unsafe layout without launching lc0.
+        safe_lc0 = """#!/usr/bin/env python3
+import sys
+for raw in sys.stdin:
+    if raw.strip() == "uci":
+        print("id name safe lifecycle Maia", flush=True)
+        print("uciok", flush=True)
+    elif raw.strip() == "quit":
+        break
+"""
+        for unsafe_part in (
+            "Engine",
+            "lc0",
+            "lib",
+            "maia-chess",
+            "maia_weights",
+            "weight",
+        ):
+            unsafe_engine_runtime = (
+                root / f"unsafe-engine-{unsafe_part}" / "chess-listener"
+            )
+            unsafe_external = root / f"external-engine-{unsafe_part}"
+            unsafe_engine_manifest = root / f"unsafe-engine-manifest-{unsafe_part}"
+            unsafe_engine_sentinel = unsafe_external / "lc0-was-executed"
+            unsafe_engine_runtime.mkdir(parents=True)
+            unsafe_external.mkdir(parents=True)
+            (unsafe_engine_runtime / ".chess-listener-install").write_text(
+                "ChessListener user installation\n", encoding="utf-8"
+            )
+            shutil.copy2(NATIVE / "install.sh", unsafe_engine_runtime / "install.sh")
+            shutil.copy2(
+                NATIVE / "study_store.py", unsafe_engine_runtime / "study_store.py"
+            )
+            create_maia_payload(unsafe_engine_runtime, safe_lc0)
+
+            malicious_lc0 = f"""#!/usr/bin/env python3
+from pathlib import Path
+import sys
+Path({str(unsafe_engine_sentinel)!r}).write_text("executed\\n")
+for raw in sys.stdin:
+    if raw.strip() == "uci":
+        print("uciok", flush=True)
+    elif raw.strip() == "quit":
+        break
+"""
+            if unsafe_part == "Engine":
+                shutil.rmtree(unsafe_engine_runtime / "Engine")
+                create_maia_payload(unsafe_external, malicious_lc0)
+                (unsafe_engine_runtime / "Engine").symlink_to(
+                    unsafe_external / "Engine", target_is_directory=True
+                )
+            elif unsafe_part == "lc0":
+                (unsafe_engine_runtime / "Engine" / "lc0").unlink()
+                write_executable(unsafe_external / "lc0", malicious_lc0)
+                (unsafe_engine_runtime / "Engine" / "lc0").symlink_to(
+                    unsafe_external / "lc0"
+                )
+            elif unsafe_part == "lib":
+                external_lib = unsafe_external / "lib"
+                external_lib.mkdir()
+                (external_lib / "liboutside.so").write_bytes(b"outside library\n")
+                (unsafe_engine_runtime / "Engine" / "lib").symlink_to(
+                    external_lib, target_is_directory=True
+                )
+            elif unsafe_part == "maia-chess":
+                create_maia_payload(unsafe_external, malicious_lc0)
+                shutil.rmtree(unsafe_engine_runtime / "Engine" / "maia-chess")
+                (unsafe_engine_runtime / "Engine" / "maia-chess").symlink_to(
+                    unsafe_external / "Engine" / "maia-chess",
+                    target_is_directory=True,
+                )
+            elif unsafe_part == "maia_weights":
+                create_maia_payload(unsafe_external, malicious_lc0)
+                shutil.rmtree(
+                    unsafe_engine_runtime
+                    / "Engine"
+                    / "maia-chess"
+                    / "maia_weights"
+                )
+                (
+                    unsafe_engine_runtime
+                    / "Engine"
+                    / "maia-chess"
+                    / "maia_weights"
+                ).symlink_to(
+                    unsafe_external
+                    / "Engine"
+                    / "maia-chess"
+                    / "maia_weights",
+                    target_is_directory=True,
+                )
+            else:
+                external_weight = unsafe_external / "maia-1500.pb.gz"
+                with gzip.open(external_weight, "wb") as output:
+                    output.write(b"outside weight\n")
+                runtime_weight = (
+                    unsafe_engine_runtime
+                    / "Engine"
+                    / "maia-chess"
+                    / "maia_weights"
+                    / "maia-1500.pb.gz"
+                )
+                runtime_weight.unlink()
+                runtime_weight.symlink_to(external_weight)
+
+            external_before = snapshot_regular_files(unsafe_external)
+            unsafe_engine_environment = environment | {
+                "CHESSLISTENER_PREFIX": str(unsafe_engine_runtime),
+                "CHESSLISTENER_MANIFEST_DIR": str(unsafe_engine_manifest),
+                "XDG_DATA_HOME": str(root / f"unsafe-engine-data-{unsafe_part}"),
+            }
+
+            unsafe_normal = run(
+                [reinstall_source / "install.sh"],
+                unsafe_engine_environment,
+                expected=1,
+            )
+            assert "refusing unsafe managed Maia layout" in unsafe_normal
+            assert not unsafe_engine_sentinel.exists(), unsafe_normal
+            assert snapshot_regular_files(unsafe_external) == external_before
+
+            unsafe_check = run(
+                [unsafe_engine_runtime / "install.sh", "--check"],
+                unsafe_engine_environment,
+                expected=1,
+            )
+            assert "MISSING  unsafe managed Maia layout" in unsafe_check
+            assert "Diagnostics failed:" in unsafe_check
+            assert not unsafe_engine_sentinel.exists(), unsafe_check
+            assert snapshot_regular_files(unsafe_external) == external_before
+
         checked = run([runtime / "install.sh", "--check"], environment)
         assert "Diagnostics passed." in checked
         assert str(runtime) in checked
         assert "persisted Firefox manifest directory" in checked
         assert checked.count("Maia disabled:") == 1, checked
         assert checked.count("Stockfish-only mode remains fully usable") == 1, checked
+        assert "Would migrate saved games and studies:" in checked, checked
+        assert legacy_library.read_bytes() == legacy_library_bytes
+        assert not separated_library.exists(), "--check must remain read-only"
 
         delegated = run([runtime / "update.sh", "--check"], environment)
         assert f"prefix={runtime}" in delegated, delegated
@@ -336,6 +558,7 @@ for raw in sys.stdin:
         assert "arguments=--check" in delegated, delegated
 
         dry_run = run([runtime / "uninstall.sh", "--dry-run"], environment)
+        assert "Would migrate saved games and studies:" in dry_run, dry_run
         assert f"Would remove installation: {runtime}" in dry_run
         assert f"Would remove Firefox manifest: {manifest_path}" in dry_run
         assert runtime.exists() and manifest_path.exists()
@@ -354,11 +577,13 @@ for raw in sys.stdin:
         assert unmarked.exists() and manifest_path.exists()
 
         removed = run([runtime / "uninstall.sh"], environment)
+        assert "Migrated saved games and studies:" in removed, removed
         assert f"Removed installation: {runtime}" in removed
         assert f"Removed Firefox manifest: {manifest_path}" in removed
         assert not runtime.exists()
         assert not manifest_path.exists()
         assert source.exists(), "uninstall must never remove the source checkout"
+        assert separated_library.read_bytes() == legacy_library_bytes
 
     print("install lifecycle: OK")
 

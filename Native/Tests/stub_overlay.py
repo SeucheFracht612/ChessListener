@@ -39,7 +39,7 @@ def main():
         f"budget={budget} explore_budget=-1 maia=1900 threads=1 multipv=3"
     )
     send(
-        f"START protocol={PROTOCOL} ui_version=0.9.0-test {settings}"
+        f"START protocol={PROTOCOL} ui_version=0.9.5-test {settings}"
     )
 
     positions = 0

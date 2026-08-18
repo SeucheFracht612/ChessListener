@@ -721,13 +721,18 @@ int overlay_publish_session_start(Overlay *overlay, const char *session_id,
     return publish_buffer(overlay, buffer, length);
 }
 
-int overlay_publish_session_end(Overlay *overlay, const char *reason)
+int overlay_publish_session_end(Overlay *overlay, const char *reason,
+                                const char *result)
 {
     char buffer[512];
     size_t length = 0U;
 
     APPEND("{\"type\":\"session\",\"event\":\"ended\",\"reason\":");
     if (append_json_string(buffer, sizeof(buffer), &length, reason) < 0) {
+        return -1;
+    }
+    APPEND(",\"result\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, result) < 0) {
         return -1;
     }
     APPEND("}\n");

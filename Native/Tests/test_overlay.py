@@ -10,6 +10,9 @@ import os
 import sys
 import tempfile
 import unittest
+import queue
+import json
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="chesslistener-qt-")
@@ -19,7 +22,9 @@ os.environ["CHESSLISTENER_LIBRARY"] = os.path.join(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from PyQt6.QtCore import QSettings
+    from PyQt6.QtCore import QPoint, QSettings, Qt
+    from PyQt6.QtGui import QCloseEvent
+    from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
 except ImportError:
     print("SKIP overlay interaction tests: PyQt6 is not installed")
@@ -31,6 +36,7 @@ import overlay
 START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 AFTER_E4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
 AFTER_E5 = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2"
+AFTER_D4 = "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1"
 
 
 def analysis_frame(mode="live", revision=1, branch=None, node=None):
@@ -95,6 +101,123 @@ class OverlayLabTests(unittest.TestCase):
             "node_id": len(path), "fen": fen,
             "last": path[-1] if path else None,
         })
+
+    def test_corrupt_library_is_preserved_and_surfaces_without_startup_crash(self):
+        self.window.deleteLater()
+        path = Path(os.environ["CHESSLISTENER_LIBRARY"])
+        original = b'{"version":2,"games":[{"id":"truncated"}'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(original)
+
+        self.window = overlay.Overlay()
+
+        self.assertIn("Local library unavailable", self.window.status_text)
+        self.assertIn("left unchanged", self.window.status_text)
+        self.assertEqual(
+            self.window.review_library_combo.currentText(),
+            "Library unavailable — file preserved",
+        )
+        self.window.open_review()
+        self.window.open_study()
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_existing_empty_json_archive_retires_stale_legacy_snapshot(self):
+        self.window.deleteLater()
+        path = Path(os.environ["CHESSLISTENER_LIBRARY"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"version":2,"games":[],"studies":[]}', encoding="utf-8"
+        )
+        settings = QSettings(overlay.ORGANIZATION, overlay.APPLICATION)
+        settings.setValue("review/latest", json.dumps({
+            "record": {"initial_fen": START, "moves": []},
+            "reviews": [],
+            "positions": [START],
+        }))
+        settings.sync()
+
+        self.window = overlay.Overlay()
+
+        self.assertIsNone(self.window.review_record)
+        self.assertFalse(settings.contains("review/latest"))
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         '{"version":2,"games":[],"studies":[]}')
+
+    def test_string_loss_cache_is_preserved_and_cannot_crash_startup_timeline(self):
+        self.window.deleteLater()
+        path = Path(os.environ["CHESSLISTENER_LIBRARY"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        score = {"rank": 1, "depth": 12, "cp": 15, "mate": None, "pv": []}
+        result = {
+            "ply": 1,
+            "uci": "e2e4",
+            "san": "e4",
+            "classification": "Best",
+            "loss": "0",
+            "eval": "+0.15",
+            "eval_score": score,
+            "best": "e2e4",
+            "depth": 12,
+            "lines": [score],
+            "fen_before": START,
+            "fen_after": AFTER_E4,
+        }
+        original = json.dumps({
+            "version": 2,
+            "games": [{
+                "id": "string-loss",
+                "initial_fen": START,
+                "moves": ["e2e4"],
+                "reviews": {"broken": {
+                    "settings": {},
+                    "results": [result],
+                    "positions": [START, AFTER_E4],
+                    "position_analyses": [],
+                    "created_at": 1,
+                }},
+            }],
+            "studies": [],
+        }, separators=(",", ":")).encode("utf-8")
+        path.write_bytes(original)
+
+        self.window = overlay.Overlay()
+
+        self.assertIn("Local library unavailable", self.window.status_text)
+        self.assertIn("cached-result loss", self.window.status_text)
+        self.assertIsNone(self.window.review_record)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_review_graph_hover_and_keyboard_describe_points(self):
+        graph = overlay.ReviewGraph()
+        graph.resize(320, 90)
+        graph.set_values(
+            [0, 31, -42],
+            current=1,
+            points=[
+                {},
+                {"san": "e4", "classification": "Best", "loss": 0},
+                {"san": "e5", "classification": "Inaccuracy", "loss": 73},
+            ],
+        )
+        graph.show()
+        self.app.processEvents()
+        try:
+            QTest.mouseMove(graph, QPoint(graph.width() - 5, graph.height() // 2))
+            self.app.processEvents()
+            self.assertEqual(graph.hovered, 2)
+            self.assertIn("Move 2: e5", graph.toolTip())
+            self.assertIn("Inaccuracy", graph.accessibleDescription())
+
+            selected = []
+            graph.selected.connect(selected.append)
+            graph.setFocus()
+            QTest.keyClick(graph, Qt.Key.Key_Home)
+            self.assertEqual(selected[-1], 0)
+            graph.set_current(2)
+            self.assertIn("Selected Move 2: e5", graph.accessibleDescription())
+        finally:
+            graph.close()
+            graph.deleteLater()
 
     def test_candidate_selection_preview_and_explore_here_tree(self):
         self.window.select_candidate(0)
@@ -284,7 +407,11 @@ class OverlayLabTests(unittest.TestCase):
         })
         self.assertEqual(self.window.review_moves.count(), 2)
         self.assertIn("1 turning point", self.window.review_summary.text())
-        self.assertTrue(QSettings(overlay.ORGANIZATION, overlay.APPLICATION).value("review/latest", ""))
+        self.assertFalse(
+            QSettings(overlay.ORGANIZATION, overlay.APPLICATION).value(
+                "review/latest", ""
+            )
+        )
         self.assertEqual(len(self.window.review_store.list_games()), 1)
         original_review_start = overlay.review_rules.start_review
         overlay.review_rules.start_review = lambda *_args, **_kwargs: self.fail(
@@ -345,6 +472,501 @@ class OverlayLabTests(unittest.TestCase):
             self.assertEqual(self.window.review_mode, "game")
         finally:
             overlay.review_rules.start_position_analysis = original
+
+    def test_late_review_result_is_ignored_after_game_switch(self):
+        class FakeJob:
+            def __init__(self):
+                self.alive = True
+                self.cancelled = False
+
+            def is_alive(self):
+                return self.alive
+
+            def cancel(self):
+                self.cancelled = True
+
+        output = queue.Queue()
+        job = FakeJob()
+        captured = {}
+        original = overlay.review_rules.start_review
+
+        def start(_fen, _moves, _settings, identity):
+            captured["identity"] = dict(identity)
+            return job, output
+
+        overlay.review_rules.start_review = start
+        try:
+            self.window.apply_game_record({
+                "initial_fen": START, "uci_moves": "e2e4", "result": "*"
+            })
+            self.window.start_game_review()
+            old_identity = captured["identity"]
+            self.window.apply_game_record({
+                "initial_fen": START, "uci_moves": "d2d4", "result": "*"
+            })
+            self.assertTrue(job.cancelled)
+            output.put({
+                "type": "complete",
+                "review_identity": old_identity,
+                "reviews": [{"ply": 1, "classification": "Blunder"}],
+                "positions": [START, AFTER_E4],
+                "position_analyses": [],
+            })
+            job.alive = False
+            self.window.poll_review()
+        finally:
+            overlay.review_rules.start_review = original
+
+        self.assertEqual(self.window.review_record["moves"], ["d2d4"])
+        self.assertEqual(self.window.review_results, [])
+        self.assertIsNone(self.window.review_job)
+        current_id = overlay.study_store.record_id(self.window.review_record)
+        self.assertIsNone(
+            self.window.review_store.cached_review(
+                current_id,
+                overlay.study_store.settings_key(self.window.current_review_settings()),
+            )
+        )
+
+    def test_legacy_review_migrates_once_and_deleted_game_stays_deleted(self):
+        legacy = {
+            "record": {
+                "initial_fen": START,
+                "moves": ["e2e4"],
+                "result": "*",
+                "label": "Legacy local review",
+                "metadata": {"Event": "Legacy fixture"},
+                "imported": True,
+            },
+            "reviews": [],
+            "positions": [START, AFTER_E4],
+            "position_analyses": [],
+        }
+        settings = QSettings(overlay.ORGANIZATION, overlay.APPLICATION)
+        settings.setValue("review/latest", __import__("json").dumps(legacy))
+        settings.sync()
+
+        self.window.restore_review_archive()
+        self.assertEqual(len(self.window.review_store.list_games()), 1)
+        self.assertEqual(self.window.review_record["label"], "Legacy local review")
+        self.assertFalse(settings.value("review/latest", ""))
+
+        # Simulate a stale duplicate left by an older release and prove that
+        # the explicit library deletion retires it as well.
+        settings.setValue("review/latest", __import__("json").dumps(legacy))
+        settings.sync()
+        original_question = overlay.QMessageBox.question
+        overlay.QMessageBox.question = lambda *_args, **_kwargs: (
+            overlay.QMessageBox.StandardButton.Yes
+        )
+        try:
+            self.window.delete_library_selection()
+        finally:
+            overlay.QMessageBox.question = original_question
+        self.assertEqual(self.window.review_store.list_games(), [])
+        self.assertFalse(settings.value("review/latest", ""))
+
+        replacement = overlay.Overlay()
+        replacement.send_control = lambda _command: None
+        try:
+            self.assertIsNone(replacement.review_record)
+            self.assertEqual(replacement.review_store.list_games(), [])
+        finally:
+            replacement.deleteLater()
+
+    def test_late_review_result_is_ignored_after_game_deletion(self):
+        class FakeJob:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def cancel(self):
+                pass
+
+        output = queue.Queue()
+        job = FakeJob()
+        captured = {}
+        original_start = overlay.review_rules.start_review
+        original_question = overlay.QMessageBox.question
+        overlay.review_rules.start_review = (
+            lambda _fen, _moves, _settings, identity: (
+                captured.setdefault("identity", dict(identity)) and job,
+                output,
+            )
+        )
+        overlay.QMessageBox.question = lambda *_args, **_kwargs: (
+            overlay.QMessageBox.StandardButton.Yes
+        )
+        try:
+            self.window.apply_game_record({
+                "initial_fen": START, "uci_moves": "e2e4", "result": "*"
+            })
+            identifier = self.window.review_store.save_record(self.window.review_record)
+            self.window.review_game_id = identifier
+            self.window.populate_review_library(identifier)
+            self.window.start_game_review()
+            self.window.delete_library_selection()
+            output.put({
+                "type": "complete",
+                "review_identity": captured["identity"],
+                "reviews": [{"ply": 1, "classification": "Best"}],
+                "positions": [START, AFTER_E4],
+            })
+            job.alive = False
+            self.window.poll_review()
+        finally:
+            overlay.review_rules.start_review = original_start
+            overlay.QMessageBox.question = original_question
+        self.assertIsNone(self.window.review_record)
+        self.assertEqual(self.window.review_results, [])
+        self.assertEqual(self.window.review_store.list_games(), [])
+
+    def test_completed_game_auto_save_is_deduplicated_and_review_is_independent(self):
+        self.window.auto_save_completed = True
+        self.window.review_auto = False
+        review_calls = []
+        original_open = self.window.open_review_for_completed_game
+        self.window.open_review_for_completed_game = (
+            lambda run=False: review_calls.append(run) or True
+        )
+        try:
+            self.window.apply_position({
+                "type": "position", "mode": "live", "target_revision": 2,
+                "live_revision": 2, "seq": 2, "fen": AFTER_E5,
+                "stm": "w", "flip": False, "source": "exact",
+                "last": "e7e5",
+            })
+            self.window.apply_game_record({
+                "initial_fen": START,
+                "uci_moves": "e2e4|e7e5",
+                "result": "1-0",
+                "history_complete": True,
+            })
+            self.window.apply_session({"event": "ended", "reason": "game_end"})
+            self.window.apply_session({"event": "ended", "reason": "game_end"})
+            games = self.window.review_store.list_games()
+            self.assertEqual(len(games), 1)
+            self.assertEqual(games[0]["result"], "1-0")
+            self.assertTrue(games[0]["completed"])
+            self.assertTrue(games[0]["history_complete"])
+            self.assertEqual(
+                self.window.completed_game_record["session_id"], "s"
+            )
+            self.assertEqual(review_calls, [])
+
+            self.window.apply_session({
+                "event": "started", "session_id": "second", "label": "Second"
+            })
+            self.window.apply_position({
+                "type": "position", "mode": "live", "target_revision": 3,
+                "live_revision": 3, "seq": 3, "fen": AFTER_D4,
+                "stm": "b", "flip": False, "source": "exact",
+                "last": "d2d4",
+            })
+            self.window.apply_game_record({
+                "initial_fen": START, "uci_moves": "d2d4", "result": "*"
+            })
+            self.window.auto_save_completed = False
+            self.window.review_auto = True
+            self.window.apply_session({"event": "ended", "reason": "completed"})
+            self.assertEqual(review_calls, [True])
+            self.assertEqual(len(self.window.review_store.list_games()), 1)
+        finally:
+            self.window.open_review_for_completed_game = original_open
+
+    def test_deleting_completed_review_reenables_postgame_save(self):
+        self.window.auto_save_completed = True
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 2,
+            "live_revision": 2, "seq": 2, "fen": AFTER_E5,
+            "stm": "w", "flip": False, "source": "exact",
+            "last": "e7e5",
+        })
+        self.window.apply_game_record({
+            "initial_fen": START,
+            "uci_moves": "e2e4|e7e5",
+            "result": "1-0",
+            "history_complete": True,
+        })
+        self.window.apply_session({"event": "ended", "reason": "game_end"})
+        identifier = self.window.completed_game_id
+        self.assertTrue(identifier)
+        self.assertTrue(self.window.completed_game_saved)
+        self.assertFalse(self.window.postgame_save_button.isEnabled())
+        self.assertTrue(self.window.open_review_for_completed_game(run=False))
+
+        original_question = overlay.QMessageBox.question
+        overlay.QMessageBox.question = lambda *_args, **_kwargs: (
+            overlay.QMessageBox.StandardButton.Yes
+        )
+        try:
+            self.window.delete_library_selection()
+        finally:
+            overlay.QMessageBox.question = original_question
+
+        self.assertIsNone(self.window.review_store.find(identifier))
+        self.assertIsNone(self.window.completed_game_id)
+        self.assertFalse(self.window.completed_game_saved)
+        self.assertTrue(self.window.postgame_save_button.isEnabled())
+        self.assertEqual(self.window.postgame_save_button.text(), "Save game")
+
+    def test_game_end_uses_current_position_when_move_history_is_unavailable(self):
+        self.window.auto_save_completed = True
+        self.window.review_auto = False
+        self.assertIsNone(self.window.live_game_record)
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 2,
+            "live_revision": 2, "seq": 2, "fen": AFTER_E4, "stm": "b",
+            "flip": False, "source": "exact", "last": "e2e4",
+        })
+
+        self.window.apply_session({
+            "event": "ended", "reason": "game_end", "result": "not-a-result"
+        })
+
+        record = self.window.completed_game_record
+        self.assertIsNotNone(record)
+        self.assertEqual(record["session_id"], "s")
+        self.assertEqual(record["initial_fen"], AFTER_E4)
+        self.assertEqual(record["moves"], [])
+        self.assertEqual(record["result"], "*")
+        self.assertEqual(record["label"], "Final position only")
+        self.assertTrue(record["position_only"])
+        self.assertFalse(record["history_complete"])
+        self.assertEqual(record["source"], "exact")
+        self.assertTrue(self.window.completed_game_saved)
+        saved = self.window.review_store.find(self.window.completed_game_id)
+        self.assertTrue(saved["position_only"])
+        self.assertFalse(saved["history_complete"])
+        self.assertEqual(saved["source"], "exact")
+        completed_identifier = self.window.completed_game_id
+        exported = overlay.review_rules.annotated_pgn(
+            record["initial_fen"], record["moves"], result=record["result"],
+            metadata=record["metadata"],
+        )
+        self.assertIn('[SetUp "1"]', exported)
+        self.assertIn(f'[FEN "{AFTER_E4}"]', exported)
+
+        # A one-position record is still a useful local review/explore root.
+        self.assertTrue(self.window.open_review_for_completed_game(run=False))
+        self.assertEqual(self.window.review_positions, [AFTER_E4])
+        self.assertTrue(self.window.completed_game_saved)
+        self.assertEqual(self.window.completed_game_id, completed_identifier)
+
+    def test_game_end_restores_authoritative_board_from_preview_and_lab(self):
+        # Preview can be one or more hypothetical plies ahead. The completed
+        # verified record and the board shown in Finished must both return to
+        # the real final position.
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 2,
+            "live_revision": 2, "seq": 2, "fen": AFTER_E4, "stm": "b",
+            "flip": False, "source": "exact", "last": "e2e4",
+        })
+        self.window.apply_game_record({
+            "initial_fen": START, "uci_moves": "e2e4", "result": "*",
+            "history_complete": True,
+        })
+        self.window.preview_root_fen = AFTER_E4
+        self.window.preview_root_grid, self.window.preview_root_side = (
+            overlay.fen_to_grid(AFTER_E4)
+        )
+        self.window.preview_moves = ["e7e5"]
+        self.window.preview_step = 1
+        self.window.apply_preview_step()
+        self.assertEqual(self.window.fen, AFTER_E5)
+        self.window.apply_session({
+            "event": "ended", "reason": "game_end", "result": "1-0"
+        })
+        self.window.flush_frame()
+        self.assertEqual(self.window.fen, AFTER_E4)
+        self.assertEqual(self.window.board.fen, AFTER_E4)
+        self.assertEqual(self.window.completed_game_record["moves"], ["e2e4"])
+        self.assertEqual(self.window.completed_game_record["result"], "1-0")
+
+        # Start a second session whose live truth is kept separately while a
+        # private Analysis Lab continuation owns the visible board.
+        self.window.apply_session({
+            "event": "started", "session_id": "lab-end", "label": "Lab end"
+        })
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 3,
+            "live_revision": 3, "seq": 3, "fen": AFTER_E4, "stm": "b",
+            "flip": True, "source": "exact", "last": "e2e4",
+        })
+        self.window.apply_game_record({
+            "initial_fen": START, "uci_moves": "e2e4", "result": "*",
+            "history_complete": True,
+        })
+        live_grid, live_side = overlay.fen_to_grid(AFTER_E4)
+        self.window.live_snapshot = {
+            "fen": AFTER_E4, "grid": live_grid, "side": live_side,
+            "flip": True, "last": "e2e4", "last_san": "e4",
+            "source": "exact", "synchronising": False, "revision": 3,
+        }
+        lab_grid, lab_side = overlay.fen_to_grid(AFTER_E5)
+        self.window.mode = "explore"
+        self.window.fen = AFTER_E5
+        self.window.grid = lab_grid
+        self.window.side_to_move = lab_side
+        self.window.board.set_position(lab_grid, lab_side, False, AFTER_E5)
+        self.window.apply_session({"event": "ended", "reason": "game_end"})
+        self.window.flush_frame()
+        self.assertEqual(self.window.fen, AFTER_E4)
+        self.assertEqual(self.window.board.fen, AFTER_E4)
+        self.assertTrue(self.window.flip)
+        self.assertTrue(self.window.board.flip)
+
+    def test_game_end_rejects_stale_same_session_history_prefix(self):
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 2,
+            "live_revision": 2, "seq": 2, "fen": AFTER_E5, "stm": "w",
+            "flip": False, "source": "exact", "last": "e7e5",
+        })
+        # Legal and session-bound, but one ply behind the authoritative board.
+        self.window.apply_game_record({
+            "initial_fen": START, "uci_moves": "e2e4", "result": "1-0",
+            "history_complete": True,
+        })
+        self.window.apply_session({"event": "ended", "reason": "game_end"})
+        self.window.flush_frame()
+        record = self.window.completed_game_record
+        self.assertTrue(record["position_only"])
+        self.assertFalse(record["history_complete"])
+        self.assertEqual(record["initial_fen"], AFTER_E5)
+        self.assertEqual(record["moves"], [])
+        self.assertEqual(self.window.fen, AFTER_E5)
+        self.assertEqual(self.window.board.fen, AFTER_E5)
+
+    def test_auto_save_failure_warning_survives_game_end(self):
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 2,
+            "live_revision": 2, "seq": 2, "fen": AFTER_E4, "stm": "b",
+            "flip": False, "source": "exact", "last": "e2e4",
+        })
+        self.window.apply_game_record({
+            "initial_fen": START, "uci_moves": "e2e4", "result": "*",
+            "history_complete": True,
+        })
+        self.window.auto_save_completed = True
+        original_save = self.window.review_store.save_completed_game
+
+        def fail_save(_record):
+            raise OSError("read-only test library")
+
+        self.window.review_store.save_completed_game = fail_save
+        try:
+            self.window.apply_session({"event": "ended", "reason": "game_end"})
+        finally:
+            self.window.review_store.save_completed_game = original_save
+        self.assertFalse(self.window.completed_game_saved)
+        self.assertIn("Could not save completed game", self.window.status_text)
+        self.assertEqual(self.window.status_label.objectName(), "statusWarn")
+
+    def test_postgame_actions_are_bound_only_to_the_ending_live_session(self):
+        self.window.apply_imported_record({
+            "initial_fen": START,
+            "moves": ["e2e4"],
+            "result": "*",
+            "label": "Previously imported",
+            "metadata": {"Event": "Old game"},
+        })
+        old_identifier = self.window.review_game_id
+        self.assertIsNotNone(old_identifier)
+        self.window.auto_save_completed = True
+        self.window.review_auto = True
+        review_calls = []
+        original_open = self.window.open_review_for_completed_game
+        self.window.open_review_for_completed_game = (
+            lambda run=False: review_calls.append(run) or True
+        )
+        try:
+            # The old imported record remains selected, but it must never be
+            # mistaken for the new browser session when no history arrives.
+            self.window.apply_session({
+                "event": "started", "session_id": "missing-history",
+                "label": "New game",
+            })
+            self.assertEqual(self.window.review_record["label"], "Previously imported")
+            self.window.fen = "not a valid FEN"
+            self.window.apply_session({"event": "ended", "reason": "game_end"})
+            self.assertIsNone(self.window.completed_game_record)
+            self.assertFalse(self.window.completed_game_saved)
+            self.assertFalse(self.window.save_completed_game())
+            self.assertEqual(review_calls, [])
+            self.assertEqual(
+                [game["id"] for game in self.window.review_store.list_games()],
+                [old_identifier],
+            )
+
+            # Once a verified record arrives for the active session, the end
+            # actions and idempotent autosave are scoped to that exact session.
+            self.window.apply_session({
+                "event": "started", "session_id": "current-session",
+                "label": "Current game",
+            })
+            self.window.apply_position({
+                "type": "position", "mode": "live", "target_revision": 2,
+                "live_revision": 2, "seq": 2, "fen": AFTER_D4,
+                "stm": "b", "flip": False, "source": "exact",
+                "last": "d2d4",
+            })
+            self.window.apply_game_record({
+                "initial_fen": START,
+                "uci_moves": "d2d4",
+                "result": "1/2-1/2",
+                "history_complete": True,
+            })
+            self.assertEqual(
+                self.window.live_game_record["session_id"], "current-session"
+            )
+            self.window.apply_session({"event": "ended", "reason": "completed"})
+            self.assertEqual(
+                self.window.completed_game_record["session_id"], "current-session"
+            )
+            self.assertEqual(self.window.completed_game_record["moves"], ["d2d4"])
+            self.assertTrue(self.window.completed_game_saved)
+            self.assertEqual(review_calls, [True])
+            saved = self.window.review_store.find(self.window.completed_game_id)
+            self.assertEqual(saved["session_id"], "current-session")
+            self.assertTrue(saved["completed"])
+            self.assertEqual(len(self.window.review_store.list_games()), 2)
+        finally:
+            self.window.open_review_for_completed_game = original_open
+
+    def test_completed_fallback_save_keeps_review_model_and_selection_paired(self):
+        self.window.apply_imported_record({
+            "initial_fen": START, "moves": ["e2e4"], "result": "*",
+            "label": "Older imported game", "metadata": {"Event": "Old"},
+        })
+        old_identifier = self.window.review_game_id
+        self.window.apply_session({
+            "event": "started", "session_id": "fresh", "label": "Fresh game"
+        })
+        self.window.apply_position({
+            "type": "position", "mode": "live", "target_revision": 2,
+            "live_revision": 2, "seq": 2, "fen": AFTER_E4, "stm": "b",
+            "flip": False, "source": "exact", "last": "e2e4",
+        })
+        self.window.auto_save_completed = True
+        self.window.apply_session({"event": "ended", "reason": "game_end"})
+        completed_identifier = self.window.completed_game_id
+        self.assertNotEqual(completed_identifier, old_identifier)
+        self.assertEqual(self.window.review_record["label"], "Older imported game")
+        self.assertEqual(self.window.review_game_id, old_identifier)
+        self.assertEqual(self.window.review_library_combo.currentData(), old_identifier)
+
+        self.window.open_review()
+        self.assertEqual(self.window.review_record["label"], "Older imported game")
+        self.assertEqual(self.window.review_library_combo.currentData(), old_identifier)
+
+        self.assertTrue(self.window.open_review_for_completed_game(run=False))
+        self.assertTrue(self.window.review_record["position_only"])
+        self.assertEqual(self.window.review_game_id, completed_identifier)
+        self.assertEqual(
+            self.window.review_library_combo.currentData(), completed_identifier
+        )
 
     def test_preferences_persist_and_all_eval_povs_invert_correctly(self):
         self.window.live_follow.setCurrentIndex(
@@ -570,6 +1192,237 @@ class OverlayLabTests(unittest.TestCase):
 
         self.window.close_study()
         self.assertIs(self.window.stack.currentWidget(), self.window.analysis_page)
+
+    def test_study_edits_flush_before_switch_and_survive_save_failure(self):
+        self.window.study_auto_analyse = False
+        first = overlay.study_rules.new_study("First", START)
+        first, child, _reused = overlay.study_rules.add_move(first, "0", "e2e4")
+        first_id = self.window.review_store.save_study(first)
+        second = overlay.study_rules.new_study("Second", START)
+        second_id = self.window.review_store.save_study(second)
+
+        self.assertTrue(self.window.load_study(self.window.review_store.find_study(first_id)))
+        self.assertTrue(self.window.select_study_node("0", analyse=False))
+        self.window.study_title_edit.setText("First edited")
+        self.window.study_name_edit.setText("Root plan")
+        self.window.study_comment_edit.setPlainText("Do not lose this note")
+        self.assertTrue(self.window.study_dirty)
+        self.assertTrue(self.window.load_study(self.window.review_store.find_study(second_id)))
+        saved_first = self.window.review_store.find_study(first_id)
+        self.assertEqual(saved_first["title"], "First edited")
+        self.assertEqual(saved_first["nodes"]["0"]["name"], "Root plan")
+        self.assertEqual(
+            saved_first["nodes"]["0"]["comment"], "Do not lose this note"
+        )
+
+        self.assertTrue(self.window.load_study(saved_first))
+        self.window.study_comment_edit.setPlainText("Retained after disk failure")
+        original_save = self.window.review_store.save_study
+        self.window.review_store.save_study = lambda _item: (_ for _ in ()).throw(
+            OSError("disk full")
+        )
+        try:
+            self.window.populate_study_library(first_id)
+            second_index = self.window.study_library_combo.findData(second_id)
+            self.window.study_library_combo.setCurrentIndex(second_index)
+            self.assertEqual(self.window.current_study_id, first_id)
+            self.assertEqual(self.window.study_library_combo.currentData(), first_id)
+
+            child_item = self.window.study_tree_items[child]
+            self.window.study_tree.setCurrentItem(child_item)
+            self.assertEqual(self.window.study_node_id, "0")
+            self.assertEqual(
+                self.window.study_tree.currentItem().data(
+                    0, overlay.Qt.ItemDataRole.UserRole
+                ),
+                "0",
+            )
+            self.assertFalse(self.window.select_study_node(child, analyse=False))
+            self.assertEqual(self.window.study_node_id, "0")
+            self.assertEqual(
+                self.window.study_comment_edit.toPlainText(),
+                "Retained after disk failure",
+            )
+            self.assertTrue(self.window.study_dirty)
+            self.assertTrue(self.window.study_save_failed)
+        finally:
+            self.window.review_store.save_study = original_save
+        self.assertTrue(self.window.flush_study_edits())
+        self.assertFalse(self.window.study_dirty)
+        self.assertEqual(
+            self.window.review_store.find_study(first_id)["nodes"]["0"]["comment"],
+            "Retained after disk failure",
+        )
+
+    def test_completed_study_analysis_never_repaints_a_different_node(self):
+        self.window.study_auto_analyse = False
+        item = overlay.study_rules.new_study("Node isolation", START)
+        item, e4, _reused = overlay.study_rules.add_move(item, "0", "e2e4")
+        item, e5, _reused = overlay.study_rules.add_move(item, e4, "e7e5")
+        identifier = self.window.review_store.save_study(item)
+        self.assertTrue(
+            self.window.load_study(self.window.review_store.find_study(identifier))
+        )
+        self.assertTrue(self.window.select_study_node(e5, analyse=False))
+
+        class FakeJob:
+            def cancel(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+        output = __import__("queue").Queue()
+        original = overlay.review_rules.start_position_analysis
+        overlay.review_rules.start_position_analysis = (
+            lambda _fen, _settings, _generation: (FakeJob(), output)
+        )
+        try:
+            self.window.analyse_study_node()
+            generation = self.window.study_position_generation
+            analysed_fen = self.window.current_study["nodes"][e5]["fen"]
+            self.assertTrue(self.window.select_study_node("0", analyse=False))
+            root_detail = self.window.study_detail.text()
+            output.put({
+                "type": "position_complete",
+                "generation": generation,
+                "fen": analysed_fen,
+                "lines": [{
+                    "rank": 1, "depth": 19, "cp": 777,
+                    "mate": None, "pv": ["g1f3"],
+                }],
+            })
+            self.window.poll_study_position()
+        finally:
+            overlay.review_rules.start_position_analysis = original
+
+        self.assertEqual(self.window.study_node_id, "0")
+        self.assertEqual(self.window.study_detail.text(), root_detail)
+        self.assertNotIn("+7.77", self.window.study_detail.text())
+        self.assertFalse(self.window.current_study["nodes"]["0"].get("analysis"))
+        saved = self.window.review_store.find_study(identifier)
+        self.assertEqual(saved["nodes"][e5]["analysis"]["lines"][0]["cp"], 777)
+
+    def test_creating_study_cancels_analysis_owned_by_previous_tree(self):
+        self.window.study_auto_analyse = False
+        first = overlay.study_rules.new_study("First", START)
+        first_id = self.window.review_store.save_study(first)
+        self.assertTrue(
+            self.window.load_study(self.window.review_store.find_study(first_id))
+        )
+
+        class FakeJob:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+            def is_alive(self):
+                return True
+
+        job = FakeJob()
+        output = __import__("queue").Queue()
+        original = overlay.review_rules.start_position_analysis
+        overlay.review_rules.start_position_analysis = (
+            lambda _fen, _settings, _generation: (job, output)
+        )
+        try:
+            self.window.analyse_study_node()
+            generation = self.window.study_position_generation
+            self.assertTrue(self.window.create_study("Replacement", START))
+            self.assertTrue(job.cancelled)
+            output.put({
+                "type": "position_complete",
+                "generation": generation,
+                "fen": START,
+                "lines": [{
+                    "rank": 1, "depth": 19, "cp": 888,
+                    "mate": None, "pv": ["e2e4"],
+                }],
+            })
+            self.window.poll_study_position()
+        finally:
+            overlay.review_rules.start_position_analysis = original
+
+        root = self.window.current_study["nodes"][self.window.current_study["root"]]
+        self.assertFalse(root.get("analysis"))
+        self.assertNotIn("+8.88", self.window.study_detail.text())
+
+    def test_window_close_flushes_pending_study_edits(self):
+        item = overlay.study_rules.new_study("Close safety", START)
+        identifier = self.window.review_store.save_study(item)
+        self.assertTrue(
+            self.window.load_study(self.window.review_store.find_study(identifier))
+        )
+        self.window.study_comment_edit.setPlainText("Written before close")
+        self.assertTrue(self.window.study_dirty)
+
+        event = QCloseEvent()
+        self.window.closeEvent(event)
+
+        self.assertTrue(event.isAccepted())
+        saved = self.window.review_store.find_study(identifier)
+        self.assertEqual(saved["nodes"]["0"]["comment"], "Written before close")
+        self.assertFalse(self.window.study_dirty)
+
+    def test_window_close_is_blocked_when_study_write_fails(self):
+        item = overlay.study_rules.new_study("Close failure", START)
+        identifier = self.window.review_store.save_study(item)
+        self.assertTrue(
+            self.window.load_study(self.window.review_store.find_study(identifier))
+        )
+        self.window.study_comment_edit.setPlainText("Keep this in the editor")
+        original_save = self.window.review_store.save_study
+        original_confirm = self.window.confirm_discard_failed_study_on_close
+        self.window.review_store.save_study = lambda _item: (
+            _ for _ in ()
+        ).throw(OSError("disk full"))
+        self.window.confirm_discard_failed_study_on_close = lambda: False
+        try:
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+        finally:
+            self.window.review_store.save_study = original_save
+            self.window.confirm_discard_failed_study_on_close = original_confirm
+
+        self.assertFalse(event.isAccepted())
+        self.assertTrue(self.window.study_dirty)
+        self.assertTrue(self.window.study_save_failed)
+        self.assertEqual(
+            self.window.study_comment_edit.toPlainText(),
+            "Keep this in the editor",
+        )
+        self.assertIn("window remains open", self.window.study_save_state_label.text())
+        self.assertFalse(any(command.startswith("QUIT") for command in self.commands))
+
+    def test_window_close_can_explicitly_discard_after_study_write_failure(self):
+        item = overlay.study_rules.new_study("Explicit discard", START)
+        identifier = self.window.review_store.save_study(item)
+        self.assertTrue(
+            self.window.load_study(self.window.review_store.find_study(identifier))
+        )
+        self.window.study_comment_edit.setPlainText("Unsaved by explicit choice")
+        original_save = self.window.review_store.save_study
+        original_confirm = self.window.confirm_discard_failed_study_on_close
+        self.window.review_store.save_study = lambda _item: (
+            _ for _ in ()
+        ).throw(OSError("read-only filesystem"))
+        self.window.confirm_discard_failed_study_on_close = lambda: True
+        try:
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+        finally:
+            self.window.review_store.save_study = original_save
+            self.window.confirm_discard_failed_study_on_close = original_confirm
+
+        self.assertTrue(event.isAccepted())
+        self.assertTrue(self.window.study_save_failed)
+        self.assertEqual(
+            self.window.review_store.find_study(identifier)["nodes"]["0"]["comment"],
+            "",
+        )
+        self.assertTrue(any(command.startswith("QUIT") for command in self.commands))
 
 
 if __name__ == "__main__":

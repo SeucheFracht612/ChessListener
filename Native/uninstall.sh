@@ -19,7 +19,8 @@ usage() {
 Usage: ./Native/uninstall.sh [--dry-run] [--prefix PATH]
 
 Removes the stable native-host installation and its Firefox manifest. It does
-not remove the source checkout, Firefox profile, or saved overlay preferences.
+not remove the source checkout, Firefox profile, saved overlay preferences, or
+the separate saved-game/study library.
 EOF
 }
 
@@ -86,11 +87,35 @@ elif [ ! -f "$INSTALL_PREFIX/.chess-listener-install" ] || \
        "ChessListener user installation" ]; then
     echo "error: refusing to remove an unmarked directory: $INSTALL_PREFIX" >&2
     exit 1
-elif [ "$DRY_RUN" -eq 1 ]; then
-    echo "Would remove installation: $INSTALL_PREFIX"
 else
-    rm -rf -- "$INSTALL_PREFIX"
-    echo "Removed installation: $INSTALL_PREFIX"
+    echo "Saved games and studies"
+    if command -v python3 >/dev/null 2>&1 && \
+       [ -r "$SCRIPT_DIR/study_store.py" ]; then
+        LIBRARY_ARGUMENTS=(
+            --migrate-legacy
+            --legacy "$INSTALL_PREFIX/reviews.json"
+        )
+        if [ "$DRY_RUN" -eq 1 ]; then
+            LIBRARY_ARGUMENTS+=(--dry-run)
+        fi
+        if ! python3 "$SCRIPT_DIR/study_store.py" "${LIBRARY_ARGUMENTS[@]}"; then
+            echo "error: uninstall stopped so no saved game/study data is lost" >&2
+            exit 1
+        fi
+    elif [ -e "$INSTALL_PREFIX/reviews.json" ]; then
+        echo "error: cannot preserve the legacy library without Python 3 and study_store.py" >&2
+        echo "Uninstall stopped before removing $INSTALL_PREFIX" >&2
+        exit 1
+    else
+        echo "User library remains at: $DEFAULT_DATA_HOME/chess-listener-library/reviews.json"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "Would remove installation: $INSTALL_PREFIX"
+    else
+        rm -rf -- "$INSTALL_PREFIX"
+        echo "Removed installation: $INSTALL_PREFIX"
+    fi
 fi
 
 if [ -e "$MANIFEST_PATH" ] && command -v python3 >/dev/null 2>&1; then
@@ -133,3 +158,4 @@ elif [ -e "$MANIFEST_PATH" ]; then
 fi
 
 echo "The source checkout and overlay preferences were left untouched."
+echo "Saved games/studies remain in the separate user library."

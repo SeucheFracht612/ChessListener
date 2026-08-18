@@ -44,5 +44,8 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: /usr/bin/python3 Native/Tests/test_overlay.py
 
+      - name: Run strict visual UI matrix
+        run: make visual-test PYTHON=/usr/bin/python3
+
       - name: Run sanitizer integration tests
         run: make asan

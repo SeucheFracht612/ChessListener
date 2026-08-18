@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.9.5 — The Analyst's Desk
+
+- Reworked every native screen around a quieter **Analyst's Desk** visual
+  system: matte charcoal surfaces, warm score-sheet rules, page-aware
+  navigation, consistent engine markers, complete control states, visible
+  keyboard focus, and responsive layouts from the compact live overlay to
+  wide Review and Studies workspaces.
+- Added a dedicated finished-game panel that keeps the final board visible and
+  offers idempotent local saving, Local Review, final-position exploration,
+  and PGN export. Completed games can be saved automatically without also
+  enabling automatic review; an exact visible result is retained when the
+  page exposes one, otherwise the record remains honestly unscored. If move
+  history is unavailable, the validated final FEN is saved as an explicitly
+  position-only record instead of borrowing another selected library game.
+- Added one global board-piece preference: **Outline set** or **Solid
+  silhouettes**. Both sides always use the same glyph family in their own
+  light/dark colours across Live, Analysis Lab, Review, and Saved Studies.
+- Refined Stockfish and Maia arrows with common inset geometry, target-aware
+  heads, a contrast halo, lateral separation for shared origins, and their
+  existing square/diamond source markers.
+- Reorganized Settings into everyday choices plus collapsible Lab, Review,
+  display, and advanced-engine sections. Added piece style, coordinates,
+  reduced motion, always-on-top, remembered Compact mode, automatic completed
+  game saving, and a reversible Reset defaults action.
+- Simplified Recovery around **Re-read visible board**, moved exact-state
+  repair under progressive disclosure, and retained explicit engine restart
+  and session-stop actions without blocking bot or test games.
+- Redesigned the Firefox popup with contextual Start, Refresh, Reopen, and
+  Switch actions, explicit busy states, accessible error explanations, and
+  quiet protocol details shown only when they are relevant. Firefox chrome now
+  uses the same warm-board **CL** mark as the desktop visual system.
+- Made review workers generation-, game-, and settings-scoped so late progress
+  or completion can never attach to a different selected record. Cancelling,
+  switching, importing, and deletion now have deterministic transition state.
+- Made study titles, branch names, and notes local-first with debounced atomic
+  autosave, visible Saving/Saved/Failed feedback, and a navigation/close guard
+  that retains edits after a storage failure.
+- Moved saved games, studies, and review caches out of the replaceable runtime
+  into `$XDG_DATA_HOME/chess-listener-library/reviews.json`. Legacy libraries
+  are preserved with an atomic create-without-overwrite migration; a different
+  existing destination wins and the old bytes become a separately reported
+  recovery copy. Install/update/uninstall dry runs are read-only, and uninstall
+  now proves legacy data is safe before deleting its marked runtime. Existing
+  malformed, unreadable, oversized, or concurrently changed archives fail
+  closed and remain untouched while live analysis stays available.
+- Made the optional Maia `Engine/lib` directory part of the validated managed
+  payload: a source replacement clears stale backend libraries before copying
+  its own, invalid/no-Maia cleanup removes them, and the validated-installed
+  preservation branch remains byte-for-byte unchanged.
+- Added a real offscreen-PyQt visual audit covering startup, Live, Compact,
+  Analysis Lab, finished games, Recovery, Settings, Review, Studies, both
+  piece styles, errors, busy states, narrow/normal/wide layouts, and enlarged
+  text. Structural clipping/overlap checks accompany the rendered contact
+  sheet for human visual review.
+- Kept protocol 4: the optional verified game-result field is additive.
+  Extension, host, and bundled UI are version 0.9.5.
+
 ## 0.9.0 — Saved Studies
 
 - Added persistent local study trees. Any Analysis Lab branch can be saved,

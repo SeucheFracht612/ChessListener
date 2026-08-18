@@ -194,6 +194,12 @@ function isValidBoard(board) {
     );
 }
 
+function canonicalGameResult(value) {
+    return ["*", "1-0", "0-1", "1/2-1/2"].includes(value)
+        ? value
+        : "*";
+}
+
 function isValidHistoryToken(token, notation) {
     if (notation === "uci") {
         return /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(token);
@@ -224,6 +230,9 @@ function isValidHistoryCandidate(message) {
         message.history_moves.length === 0 ||
         message.history_moves.length > MAX_HISTORY_BYTES ||
         typeof message?.history_complete !== "boolean" ||
+        ![undefined, "*", "1-0", "0-1", "1/2-1/2"].includes(
+            message?.game_result
+        ) ||
         !isValidInitialFen(message.initial_fen)
     ) {
         return false;
@@ -648,6 +657,7 @@ function makeNativeHistory(session, candidate, historySeq) {
         history_notation: candidate.history_notation,
         history_moves: candidate.history_moves,
         history_complete: candidate.history_complete,
+        game_result: candidate.game_result ?? "*",
         captured_at: candidate.captured_at
     };
     if (candidate.initial_fen !== undefined) {
@@ -928,7 +938,11 @@ async function endActiveSession(reason, options = {}) {
             postToConnection(connection, {
                 type: "session_end",
                 session_id: session.sessionId,
-                reason
+                reason,
+                game_result:
+                    reason === "game_end"
+                        ? canonicalGameResult(options.gameResult)
+                        : "*"
             });
         } catch (error) {
             console.warn("[ChessListener] could not send session_end:", error);
@@ -1034,7 +1048,10 @@ async function handlePageState(message, sender) {
         sameSessionIdentity(activeSession, entry) &&
         message.reason === "game_end"
     ) {
-        await endActiveSession("game_end", { claimNext: true });
+        await endActiveSession("game_end", {
+            claimNext: true,
+            gameResult: message.game_result
+        });
     } else if (activeSession === null) {
         await claimFirstEligible();
     }
@@ -1061,7 +1078,8 @@ function historyFingerprint(message) {
         message.history_notation,
         message.history_moves,
         message.history_complete === true ? "complete" : "partial",
-        message.initial_fen ?? ""
+        message.initial_fen ?? "",
+        message.game_result ?? "*"
     ].join("|");
 }
 
@@ -1260,6 +1278,7 @@ async function handleHistoryCandidate(message, sender) {
         history_notation: message.history_notation,
         history_moves: message.history_moves,
         history_complete: message.history_complete,
+        game_result: message.game_result ?? "*",
         captured_at: Number.isFinite(message.captured_at)
             ? message.captured_at
             : Date.now()

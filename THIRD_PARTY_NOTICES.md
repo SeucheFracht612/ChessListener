@@ -25,6 +25,7 @@ a submodule URL alone should not be assumed to fulfill every obligation.
 
 - Upstream: <https://github.com/CSSLab/maia-chess>
 - Repository location: `Native/Engine/maia-chess` (Git submodule)
+- Recorded source revision: `749204cf5979ce7f8b0412e804a4ee7c83c49ff8`
 - Runtime artifacts: Maia rating network files under `maia_weights/`
 - Upstream license: GNU General Public License, version 3
 

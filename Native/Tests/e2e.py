@@ -26,7 +26,7 @@ FAKE_UCI = os.path.abspath(
 )
 
 PROTOCOL_VERSION = 4
-HOST_VERSION = "0.9.0"
+HOST_VERSION = "0.9.5"
 DEFAULT_SESSION_ID = "e2e-session"
 MESSAGE_TIMEOUT = float(os.environ.get("CHESSLISTENER_TEST_MESSAGE_TIMEOUT", "3"))
 TEST_TIMEOUT = float(os.environ.get("CHESSLISTENER_TEST_TIMEOUT", "6"))
@@ -139,7 +139,7 @@ def handshake(proc):
     send(proc, {
         "type": "hello",
         "protocol_version": PROTOCOL_VERSION,
-        "extension_version": "0.9.0-test",
+        "extension_version": "0.9.5-test",
     })
     reply = recv(proc)
 
@@ -213,6 +213,7 @@ def send_history(
     session_id=DEFAULT_SESSION_ID,
     initial_fen=None,
     history_complete=True,
+    game_result=None,
 ):
     payload = {
         "type": "history_reconcile",
@@ -227,6 +228,8 @@ def send_history(
     }
     if initial_fen is not None:
         payload["initial_fen"] = initial_fen
+    if game_result is not None:
+        payload["game_result"] = game_result
     send(proc, payload)
     return recv_response(proc)
 
@@ -821,6 +824,144 @@ def assert_orientation_only_update(frame_log):
         stop_host(proc)
 
 
+def assert_game_result_transport(frame_log):
+    """Prove the bounded result survives the complete native/UI transport."""
+    board = apply_move(INITIAL, "e2e4")
+    proc = start_host(frame_log, session_id="result-exact")
+    try:
+        send_snapshot(proc, board, 1, session_id="result-exact")
+        exact = send_history(
+            proc, board, ["e2e4"], 1, 1,
+            session_id="result-exact", game_result="1-0",
+        )
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "game_record" and
+                item.get("result") == "1-0"
+                for item in items
+            ),
+        )
+        exact_records = [
+            item for item in frames if item.get("type") == "game_record"
+        ]
+        if exact.get("reason") != "history_reconciled" or \
+                not exact_records or exact_records[-1].get("result") != "1-0":
+            raise AssertionError(
+                f"exact game result did not reach the overlay: {exact}, {exact_records}"
+            )
+
+        start_session(proc, "result-omitted", "result-omitted-game")
+        send_snapshot(proc, board, 1, session_id="result-omitted")
+        omitted = send_history(
+            proc, board, ["e2e4"], 1, 1,
+            session_id="result-omitted",
+        )
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: len([
+                item for item in items if item.get("type") == "game_record"
+            ]) >= 2,
+        )
+        records = [
+            item for item in frames if item.get("type") == "game_record"
+        ]
+        if omitted.get("reason") != "history_reconciled" or \
+                records[-1].get("result") != "*":
+            raise AssertionError(
+                f"omitted game result was not conservatively unknown: {omitted}, {records[-1]}"
+            )
+
+        record_count = len(records)
+        invalid = send_history(
+            proc, board, ["e2e4"], 2, 1,
+            session_id="result-omitted", game_result="White won",
+        )
+        time.sleep(0.05)
+        after_invalid = [
+            item for item in load_frames(frame_log)
+            if item.get("type") == "game_record"
+        ]
+        if invalid.get("reason") != "invalid_game_result" or \
+                len(after_invalid) != record_count or \
+                after_invalid[-1].get("result") != "*":
+            raise AssertionError(
+                "invalid result emitted or mutated a game record: "
+                f"{invalid}, before={records}, after={after_invalid}"
+            )
+
+        # The final result is independent of DOM move-history availability.
+        # A position-only completion must still retain an exact visible result.
+        start_session(proc, "result-end-exact", "result-end-exact-game")
+        send_snapshot(proc, board, 1, session_id="result-end-exact")
+        send(proc, {
+            "type": "session_end",
+            "session_id": "result-end-exact",
+            "reason": "game_end",
+            "game_result": "1-0",
+        })
+        exact_end = recv_response(proc)
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "session" and
+                item.get("event") == "ended" and
+                item.get("result") == "1-0"
+                for item in items
+            ),
+        )
+        if exact_end.get("reason") != "session_ended":
+            raise AssertionError(
+                f"history-free result did not end its session: {exact_end}"
+            )
+
+        start_session(proc, "result-end-invalid", "result-end-invalid-game")
+        send_snapshot(proc, board, 1, session_id="result-end-invalid")
+        send(proc, {
+            "type": "session_end",
+            "session_id": "result-end-invalid",
+            "reason": "game_end",
+            "game_result": "White won",
+        })
+        invalid_end = recv_response(proc)
+        if invalid_end.get("reason") != "invalid_game_result":
+            raise AssertionError(
+                f"malformed session result was accepted: {invalid_end}"
+            )
+
+        send(proc, {
+            "type": "session_end",
+            "session_id": "result-end-invalid",
+            "reason": "navigation",
+            "game_result": "0-1",
+        })
+        ordinary_end = recv_response(proc)
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "session" and
+                item.get("event") == "ended" and
+                item.get("reason") == "navigation"
+                for item in items
+            ),
+        )
+        navigation_frames = [
+            item for item in frames
+            if item.get("type") == "session" and
+            item.get("event") == "ended" and
+            item.get("reason") == "navigation"
+        ]
+        if ordinary_end.get("reason") != "session_ended" or \
+                not navigation_frames or \
+                navigation_frames[-1].get("result") != "*":
+            raise AssertionError(
+                "non-game end retained a result: "
+                f"{ordinary_end}, {navigation_frames}"
+            )
+    finally:
+        stop_host(proc)
+
+
 def assert_overlay_event_bridge(frame_log):
     fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
     controls = (
@@ -1299,6 +1440,11 @@ def main():
             os.path.join(temp, "orientation-frames.jsonl")
         )
         print("orientation       -> updated without reanalysis")
+
+        assert_game_result_transport(
+            os.path.join(temp, "game-result-frames.jsonl")
+        )
+        print("game result       -> bounded through native/UI transport")
 
         assert_overlay_event_bridge(
             os.path.join(temp, "event-bridge-frames.jsonl")

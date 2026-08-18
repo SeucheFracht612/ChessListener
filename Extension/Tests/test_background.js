@@ -80,7 +80,7 @@ function loadBackground(options = {}) {
                     return makePort();
                 },
                 getManifest() {
-                    return { version: "0.9.0" };
+                    return { version: "0.9.5" };
                 },
                 sendMessage(message) {
                     runtimeMessages.push(message);
@@ -218,6 +218,7 @@ function historyCandidate(tab, options = {}) {
         history_notation: options.notation ?? "uci",
         history_moves: options.moves ?? "e2e4|e7e5",
         history_complete: options.complete ?? true,
+        game_result: options.gameResult ?? "*",
         captured_at: options.capturedAt ?? 2000 + base.route_generation,
         ...(options.initialFen === undefined
             ? {}
@@ -227,7 +228,7 @@ function historyCandidate(tab, options = {}) {
 
 function pageState(tab, options = {}) {
     const base = candidate(tab, options);
-    return {
+    const state = {
         type: "page_state",
         page_instance_id: base.page_instance_id,
         route_generation: base.route_generation,
@@ -237,6 +238,10 @@ function pageState(tab, options = {}) {
         eligible: options.eligible ?? true,
         reason: options.reason ?? "visibility"
     };
+    if (options.gameResult !== undefined) {
+        state.game_result = options.gameResult;
+    }
+    return state;
 }
 
 function hello(port, overrides = {}) {
@@ -244,7 +249,7 @@ function hello(port, overrides = {}) {
         type: "hello",
         ok: true,
         protocol_version: 4,
-        host_version: "0.9.0",
+        host_version: "0.9.5",
         capabilities: REQUIRED_CAPABILITIES,
         ...overrides
     });
@@ -269,7 +274,7 @@ async function startFirstSession(harness, tabId = 1, options = {}) {
     assert.equal(harness.ports.length, 1);
     assert.equal(harness.ports[0].posted[0].type, "hello");
     assert.equal(harness.ports[0].posted[0].protocol_version, 4);
-    assert.equal(harness.ports[0].posted[0].extension_version, "0.9.0");
+    assert.equal(harness.ports[0].posted[0].extension_version, "0.9.5");
     hello(harness.ports[0]);
     const reply = await pending;
     assert.equal(reply.accepted, true);
@@ -847,7 +852,8 @@ async function testHistoryAssociationRecoveryAndReconnectOrdering() {
             displayed_board: firstHistory.displayed_board,
             history_notation: firstHistory.history_notation,
             history_moves: firstHistory.history_moves,
-            history_complete: firstHistory.history_complete
+            history_complete: firstHistory.history_complete,
+            game_result: firstHistory.game_result
         },
         {
             type: "history_reconcile",
@@ -857,9 +863,33 @@ async function testHistoryAssociationRecoveryAndReconnectOrdering() {
             displayed_board: BOARD_A,
             history_notation: "uci",
             history_moves: "e2e4|e7e5",
-            history_complete: true
+            history_complete: true,
+            game_result: "*"
         }
     );
+
+    const resultUpdate = await harness.send(
+        historyCandidate(21, {
+            game: "history-game",
+            gameResult: "1-0"
+        }),
+        21
+    );
+    assert.equal(resultUpdate.accepted, true);
+    assert.equal(
+        nativeMessages(firstPort, "history_reconcile").at(-1).game_result,
+        "1-0"
+    );
+
+    const invalidResult = await harness.send(
+        historyCandidate(21, {
+            game: "history-game",
+            gameResult: "White won"
+        }),
+        21
+    );
+    assert.equal(invalidResult.accepted, false);
+    assert.equal(invalidResult.reason, "invalid_history");
 
     const beforeHistoryDuplicate = firstPort.posted.length;
     const duplicateHistory = await harness.send(
@@ -867,8 +897,8 @@ async function testHistoryAssociationRecoveryAndReconnectOrdering() {
         21
     );
     assert.equal(duplicateHistory.duplicate, undefined);
-    /* The initial_fen difference is a meaningful full-fingerprint rewrite. */
-    assert.equal(duplicateHistory.history_seq, 2);
+    /* Initial FEN/result differences are meaningful fingerprint rewrites. */
+    assert.equal(duplicateHistory.history_seq, 3);
     const exactDuplicate = await harness.send(
         historyCandidate(21, { game: "history-game" }),
         21
@@ -885,7 +915,7 @@ async function testHistoryAssociationRecoveryAndReconnectOrdering() {
         }),
         21
     );
-    assert.equal(rewrite.history_seq, 3);
+    assert.equal(rewrite.history_seq, 4);
     assert.equal(
         nativeMessages(firstPort, "history_reconcile").at(-1).history_moves,
         "e4|c5"
@@ -1007,6 +1037,52 @@ async function testCrashAfterRecoveryReplaysOrdinaryBaseline() {
     assert.equal(retryPort.posted.at(-1).recovery, false);
 }
 
+async function testBoundedGameEndResultTransport() {
+    const exactHarness = loadBackground();
+    await startFirstSession(exactHarness, 24, { game: "result-exact" });
+    const exactPort = exactHarness.ports[0];
+    await exactHarness.send(
+        pageState(24, {
+            game: "result-exact",
+            eligible: false,
+            reason: "game_end",
+            gameResult: "1-0"
+        }),
+        24
+    );
+    const exactEnd = nativeMessages(exactPort, "session_end").at(-1);
+    assert.equal(exactEnd.reason, "game_end");
+    assert.equal(exactEnd.game_result, "1-0");
+
+    const malformedHarness = loadBackground();
+    await startFirstSession(malformedHarness, 25, { game: "result-malformed" });
+    const malformedPort = malformedHarness.ports[0];
+    await malformedHarness.send(
+        pageState(25, {
+            game: "result-malformed",
+            eligible: false,
+            reason: "game_end",
+            gameResult: "White won"
+        }),
+        25
+    );
+    assert.equal(
+        nativeMessages(malformedPort, "session_end").at(-1).game_result,
+        "*"
+    );
+
+    const ordinaryHarness = loadBackground();
+    await startFirstSession(ordinaryHarness, 26, { game: "result-ordinary" });
+    const ordinaryPort = ordinaryHarness.ports[0];
+    await ordinaryHarness.send({
+        type: "popup_action",
+        action: "stop_session"
+    });
+    const ordinaryEnd = nativeMessages(ordinaryPort, "session_end").at(-1);
+    assert.equal(ordinaryEnd.reason, "manual_stop");
+    assert.equal(ordinaryEnd.game_result, "*");
+}
+
 async function main() {
     await testOwnershipSwitchNavigationAndClose();
     await testDismissalAndOverlayCommandIsolation();
@@ -1021,6 +1097,7 @@ async function main() {
     await testAnalyzeRejectsUnsupportedTab();
     await testHistoryAssociationRecoveryAndReconnectOrdering();
     await testCrashAfterRecoveryReplaysOrdinaryBaseline();
+    await testBoundedGameEndResultTransport();
     console.log(
         "PASS ownership, recovery ordering, history association, persistence, and reconnect"
     );

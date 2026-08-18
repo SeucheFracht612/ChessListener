@@ -22,8 +22,19 @@ diagnostics, update delegation/path persistence, uninstall dry-run, refusal to
 touch unmarked or symlinked directories, and removal of only the recognized
 runtime and manifest. It also performs ZIP-style reinstalls with a fake Maia
 runtime, proving that validated lc0, all nine nets, and local libraries are
-preserved byte-for-byte while incomplete payloads are removed. It uses fake
-local dependencies and never changes the real user installation.
+preserved byte-for-byte while incomplete payloads are removed. It also proves
+that a validated source replacement clears stale `Engine/lib` files before
+copying its own managed libraries. It uses fake local dependencies and never
+changes the real user installation.
+
+The same lifecycle fixture starts with a pre-0.9.5 `reviews.json`, verifies
+that `--check` and uninstall `--dry-run` are read-only, and proves actual
+uninstall moves the exact bytes outside the runtime before removing it. A
+library-only directory at the former default prefix is also migrated instead
+of blocking first installation. `test_library_migration.py` separately covers
+atomic default migration, identical-file deduplication, conflict recovery
+without overwrite, explicit path opt-out, dry-run behavior, and symlink
+refusal under isolated XDG roots.
 
 `e2e.py` drives `chess-listener-host` from both ends at once: it speaks the
 browser's length-prefixed native-messaging protocol 4 (including version and
@@ -73,6 +84,47 @@ What it asserts:
 * a live `SET` sent mid-session is acknowledged
 * explorer analysis never crosses a newer branch/node/live target
 * live snapshots continue at normal latency while a branch is selected
+
+## Visual UI matrix
+
+Run the deterministic screenshot and structural audit separately from the
+normal suite:
+
+    make visual-test
+
+With PyQt6 installed, this writes the PNG matrix, JSON manifest, and a
+filterable contact sheet to `Native/.build/visual-ui/`; open
+`Native/.build/visual-ui/index.html` to inspect it. The matrix covers every
+native screen and important transient state at 320×620, 360×720, and 420×820, adds a
+large-text case, and renders Review and Studies in a 920×720 workspace. It
+also includes both piece families, shared-origin engine arrows, completed-game
+actions, cancellation, scrolled narrow-workspace details, study save feedback,
+and the independent Review/Study board-orientation preference.
+
+Firefox popup idle/owner/connecting/switch/dismissed/error/busy states are
+rendered by an optional deterministic Playwright companion at normal and
+large-text scale; its PNGs and findings are folded into the same contact sheet
+and manifest.
+The capture stubs WebExtension APIs locally and never opens the network. If a
+Playwright Chromium runtime is unavailable it skips cleanly, while
+`Extension/Tests/test_popup.js` still enforces the popup's DOM, accessibility,
+copy, busy-state, and contrast contracts.
+
+The target is strict by default: it fails on missing/off-window/overlapping
+required controls, horizontal overflow, mixed piece families, undersized
+primary/title actions, missing accessible labels, keyboard-inaccessible
+buttons, malformed board/arrow geometry, live-board jumps between waiting and
+engine results, stale live source badges in local workspaces, and configured
+screenshot-baseline regressions. Set
+`VISUAL_STRICT=0` only while collecting a diagnostic contact sheet of known
+defects:
+
+    make visual-test VISUAL_STRICT=0
+
+Override `VISUAL_OUTPUT=/absolute/path` to keep a separate run. If the PyQt6
+QtWidgets runtime cannot actually load (including a missing native Qt
+library), the target reports a clean skip and does not pretend a contact sheet
+was produced.
 
 Knobs:
 

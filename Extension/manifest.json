@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
   "name": "ChessListener",
-  "version": "0.9.0",
+  "version": "0.9.5",
   "description": "Provides a local live-analysis overlay for Chess.com games, including bot games.",
+  "icons": {
+    "16": "icons/chesslistener.svg",
+    "32": "icons/chesslistener.svg",
+    "48": "icons/chesslistener.svg",
+    "96": "icons/chesslistener.svg"
+  },
   "permissions": [
     "nativeMessaging",
     "storage"
@@ -17,7 +23,13 @@
   },
   "action": {
     "default_title": "ChessListener session",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/chesslistener.svg",
+      "32": "icons/chesslistener.svg",
+      "48": "icons/chesslistener.svg",
+      "96": "icons/chesslistener.svg"
+    }
   },
   "content_scripts": [
     {

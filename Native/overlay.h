@@ -59,7 +59,8 @@ int overlay_publish_settings(Overlay *o, const OverlaySettings *settings);
  * positions. All strings are JSON-escaped by this module. */
 int overlay_publish_session_start(Overlay *o, const char *session_id,
                                   const char *label);
-int overlay_publish_session_end(Overlay *o, const char *reason);
+int overlay_publish_session_end(Overlay *o, const char *reason,
+                                const char *result);
 int overlay_publish_game_record(Overlay *o, const char *initial_fen,
                                 const char *uci_moves, size_t move_count,
                                 const char *result);

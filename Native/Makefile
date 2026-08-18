@@ -5,6 +5,8 @@ PYTHON    ?= python3
 NODE      ?= node
 TARGET    ?= chess-listener-host
 BUILD_DIR ?= .build/release
+VISUAL_OUTPUT ?= $(abspath .build/visual-ui)
+VISUAL_STRICT ?= 1
 
 CPPFLAGS ?=
 CFLAGS   ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -pthread
@@ -17,7 +19,7 @@ DEPS    := $(OBJECTS:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean check check-python check-js check-shell test test-js debug asan tsan
+.PHONY: all clean check check-python check-js check-shell test test-js visual-test debug asan tsan
 
 all: $(TARGET)
 
@@ -40,7 +42,7 @@ check-js:
 	@if [ -f ../Extension/popup.js ]; then \
 		$(NODE) --check ../Extension/popup.js; \
 	fi
-	@for file in ../Extension/Tests/*.js; do \
+	@for file in ../Extension/Tests/*.js ../Extension/Tests/*.cjs; do \
 		[ -e "$$file" ] || continue; \
 		$(NODE) --check "$$file"; \
 	done
@@ -60,6 +62,26 @@ test-js:
 	done; \
 	if [ "$$found" -eq 0 ]; then echo "No extension tests found"; fi
 
+# Optional on purpose: the normal suite remains usable on minimal systems
+# without PyQt6, while design/release work gets the complete strict matrix.
+visual-test:
+	@set -e; if $(PYTHON) -c 'from PyQt6.QtWidgets import QApplication' >/dev/null 2>&1; then \
+		mkdir -p "$(VISUAL_OUTPUT)"; \
+		CHESSLISTENER_VISUAL_OUTPUT="$(VISUAL_OUTPUT)" \
+			$(NODE) ../Extension/Tests/capture_popup_visual.cjs; \
+		QT_QPA_PLATFORM=offscreen \
+		CHESSLISTENER_VISUAL_OUTPUT="$(VISUAL_OUTPUT)" \
+		CHESSLISTENER_VISUAL_STRICT="$(VISUAL_STRICT)" \
+			$(PYTHON) Tests/test_visual_ui.py; \
+		if [ -f "$(VISUAL_OUTPUT)/index.html" ]; then \
+			echo "Visual contact sheet: $(VISUAL_OUTPUT)/index.html"; \
+		else \
+			echo "Visual matrix skipped (Qt runtime unavailable; no contact sheet produced)."; \
+		fi; \
+	else \
+		echo "Visual matrix skipped (PyQt6 QtWidgets runtime is not available)."; \
+	fi
+
 # -B is deliberate: tests must exercise objects compiled from the current
 # checkout, never old or accidentally committed build products.
 test:
@@ -71,6 +93,7 @@ test:
 	$(PYTHON) Tests/test_explanations.py
 	$(PYTHON) Tests/test_review.py
 	$(PYTHON) Tests/test_study_store.py
+	$(PYTHON) Tests/test_library_migration.py
 	$(PYTHON) Tests/test_study.py
 	$(PYTHON) Tests/test_pgn_import.py
 	$(PYTHON) Tests/test_overlay.py

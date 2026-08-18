@@ -164,6 +164,35 @@ function detectGameOver() {
     });
 }
 
+function canonicalGameResult(value) {
+    if (typeof value !== "string") {
+        return null;
+    }
+    const normalized = value.replace(/\u00bd/g, "1/2").trim();
+    const match = /(?:^|\s)(1-0|0-1|1\/2-1\/2)(?:\s|$)/.exec(normalized);
+    return match === null ? null : match[1];
+}
+
+function readVisibleGameResult() {
+    for (const selector of GAME_OVER_SELECTORS) {
+        const element = document.querySelector(selector);
+        if (element === null || !elementIsRendered(element)) {
+            continue;
+        }
+        for (const attribute of ["data-result", "data-game-result"]) {
+            const result = canonicalGameResult(element.getAttribute?.(attribute));
+            if (result !== null) {
+                return result;
+            }
+        }
+        const result = canonicalGameResult(element.textContent ?? "");
+        if (result !== null) {
+            return result;
+        }
+    }
+    return "*";
+}
+
 function findActiveBoard() {
     if (!isGamePage()) {
         return null;
@@ -670,6 +699,7 @@ function collectNumberedContainerTextHistory(container) {
     let fullMove = 1;
     let side = "white";
     let ended = false;
+    let result = null;
 
     for (const chunk of chunks) {
         const moveNumber = /^(\d+)\.(\.\.)?$/.exec(chunk);
@@ -684,6 +714,7 @@ function collectNumberedContainerTextHistory(container) {
 
         if (["1-0", "0-1", "1/2-1/2", "*"].includes(chunk)) {
             ended = true;
+            result = chunk;
             continue;
         }
         if (ended || /^\$\d+$/.test(chunk)) {
@@ -708,7 +739,7 @@ function collectNumberedContainerTextHistory(container) {
 
     return tokens.length === 0
         ? null
-        : { notation: "san", tokens, complete: true };
+        : { notation: "san", tokens, complete: true, result };
 }
 
 function readInitialFen(container) {
@@ -763,12 +794,13 @@ function readMoveHistory(container) {
         notation: history.notation,
         moves,
         complete: history.complete,
-        initialFen: readInitialFen(container)
+        initialFen: readInitialFen(container),
+        result: history.result ?? readVisibleGameResult()
     };
 }
 
-function currentPageState(reason) {
-    return {
+function currentPageState(reason, gameResult = undefined) {
+    const state = {
         type: "page_state",
         page_instance_id: PAGE_INSTANCE_ID,
         route_generation: routeGeneration,
@@ -779,6 +811,10 @@ function currentPageState(reason) {
             isGamePage() && activeBoard !== null && !gameIsOver,
         reason
     };
+    if (reason === "game_end") {
+        state.game_result = canonicalGameResult(gameResult) ?? "*";
+    }
+    return state;
 }
 
 function sendWithoutWaiting(message) {
@@ -947,7 +983,8 @@ async function captureHistory(token, forced) {
         history.notation,
         history.moves,
         history.complete ? "complete" : "partial",
-        history.initialFen ?? ""
+        history.initialFen ?? "",
+        history.result
     ].join("|");
     if (!forced && fingerprint === lastSubmittedHistoryFingerprint) {
         return;
@@ -964,6 +1001,7 @@ async function captureHistory(token, forced) {
         history_notation: history.notation,
         history_moves: history.moves,
         history_complete: history.complete,
+        game_result: history.result,
         captured_at: Date.now()
     };
     if (history.initialFen !== null) {
@@ -994,6 +1032,9 @@ async function captureHistory(token, forced) {
 }
 
 async function submitFinalGameState() {
+    /* Capture this before awaiting either native-message round trip. The game
+     * over surface can be replaced while the final board/history is in flight. */
+    const finalGameResult = readVisibleGameResult();
     const board = activeBoard;
     const container = activeHistoryContainer;
     if (board !== null && board.isConnected && !pointerIsDown) {
@@ -1030,6 +1071,7 @@ async function submitFinalGameState() {
                             history_notation: history.notation,
                             history_moves: history.moves,
                             history_complete: true,
+                            game_result: history.result,
                             captured_at: Date.now()
                         };
                         if (history.initialFen !== null) {
@@ -1043,7 +1085,7 @@ async function submitFinalGameState() {
             }
         }
     }
-    sendWithoutWaiting(currentPageState("game_end"));
+    sendWithoutWaiting(currentPageState("game_end", finalGameResult));
 }
 
 async function captureStablePosition(token, forced) {

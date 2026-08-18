@@ -295,13 +295,15 @@ def assert_history_replay(failures):
         board = apply_move(board, move)
 
     for notation, moves in (("san", san), ("uci", uci)):
+        expected_result = "1-0" if notation == "uci" else "*"
         with tempfile.TemporaryDirectory(prefix="chess-listener-history-") as temp:
             frame_log = os.path.join(temp, "frames.jsonl")
             proc = start_host(frame_log)
             try:
                 waiting = snapshot(proc, board, 1)
                 reply = send_history(
-                    proc, board, moves, 1, 1, notation=notation
+                    proc, board, moves, 1, 1, notation=notation,
+                    game_result=expected_result,
                 )
             finally:
                 stop_host(proc)
@@ -318,11 +320,24 @@ def assert_history_replay(failures):
         if reply.get("uci") != "e1g1":
             failures.append(f"{notation} history lost final castling move: {reply}")
         if not records or records[-1].get("uci_moves") != "|".join(uci) or \
-                records[-1].get("move_count") != len(uci):
+                records[-1].get("move_count") != len(uci) or \
+                records[-1].get("result") != expected_result:
             failures.append(
                 f"{notation} history did not publish canonical review record: "
                 f"{records[-1] if records else None}"
             )
+
+    with tempfile.TemporaryDirectory(prefix="chess-listener-history-") as temp:
+        proc = start_host(os.path.join(temp, "frames.jsonl"))
+        try:
+            snapshot(proc, board, 1)
+            invalid_result = send_history(
+                proc, board, uci, 1, 1, game_result="White won"
+            )
+        finally:
+            stop_host(proc)
+    if invalid_result.get("reason") != "invalid_game_result":
+        failures.append(f"unbounded game result was accepted: {invalid_result}")
 
     ep_fen = "rnbqkbnr/1pp1pppp/p2P4/8/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 3"
     ep_board = board_from_fen(ep_fen)

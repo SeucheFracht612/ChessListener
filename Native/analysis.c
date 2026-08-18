@@ -1433,7 +1433,7 @@ void AnalysisSessionStart(const char *session_id, const char *label)
     }
 }
 
-void AnalysisSessionEnd(const char *reason)
+void AnalysisSessionEnd(const char *reason, const char *result)
 {
     int publishStatus;
 
@@ -1465,7 +1465,9 @@ void AnalysisSessionEnd(const char *reason)
     pthread_mutex_unlock(&g_lock);
 
     publishStatus = overlay_publish_session_end(
-        g_overlay, reason != NULL ? reason : "ended");
+        g_overlay,
+        reason != NULL ? reason : "ended",
+        result != NULL ? result : "*");
     pthread_mutex_unlock(&g_publish_lock);
 
     if (publishStatus != 0) {

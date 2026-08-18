@@ -9,6 +9,7 @@ UCI game record, so deeper retrospective work cannot delay board capture.
 import os
 import queue
 import select
+import shutil
 import subprocess
 import threading
 import time
@@ -17,6 +18,44 @@ import san
 
 
 MATE_SCORE = 100000
+DEFAULT_STOCKFISH = "/usr/games/stockfish"
+
+
+def resolve_stockfish_executable(settings=None, *, environ=None,
+                                 is_executable=None, which=None):
+    """Resolve the local UCI engine using the same order as installation.
+
+    A job-local ``engine`` remains useful for tests and advanced callers.  The
+    documented environment override comes next.  Otherwise prefer the common
+    distro location before consulting PATH, matching ``install.sh`` and the
+    live native host.
+
+    The lookup collaborators are injectable so discovery tests never depend
+    on which packages happen to be installed on the machine running them.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    environment = os.environ if environ is None else environ
+    configured = settings.get("engine") or environment.get(
+        "CHESSLISTENER_STOCKFISH"
+    )
+    if configured:
+        return configured
+
+    executable_check = is_executable or (
+        lambda path: os.access(path, os.X_OK)
+    )
+    if executable_check(DEFAULT_STOCKFISH):
+        return DEFAULT_STOCKFISH
+
+    path_lookup = which or shutil.which
+    discovered = path_lookup("stockfish")
+    if discovered:
+        return discovered
+
+    raise FileNotFoundError(
+        "Stockfish was not found at /usr/games/stockfish or on PATH; "
+        "install Stockfish or set CHESSLISTENER_STOCKFISH"
+    )
 
 
 def score_value(cp=None, mate=None, **_ignored):
@@ -211,12 +250,16 @@ class UciEngine:
 
 
 class ReviewJob(threading.Thread):
-    def __init__(self, initial_fen, moves, settings, output):
+    def __init__(self, initial_fen, moves, settings, output, identity=None):
         super().__init__(daemon=True)
         self.initial_fen = initial_fen
         self.moves = list(moves)
         self.settings = dict(settings)
         self.output = output
+        # Copy the caller-created immutable game/settings/generation token.
+        # Every queue item carries it, so a late worker can never be mistaken
+        # for whichever game happens to be visible when it finishes.
+        self.identity = dict(identity or {})
         self.cancel_event = threading.Event()
         self.engine = None
 
@@ -229,14 +272,12 @@ class ReviewJob(threading.Thread):
                 pass
 
     def emit(self, kind, **payload):
-        self.output.put({"type": kind, **payload})
+        self.output.put({"type": kind, "review_identity": dict(self.identity), **payload})
 
     def run(self):
         engine = None
         try:
-            path = self.settings.get("engine") or os.environ.get(
-                "CHESSLISTENER_STOCKFISH", "/usr/games/stockfish"
-            )
+            path = resolve_stockfish_executable(self.settings)
             engine = UciEngine(path, self.settings.get("threads", 2), self.settings.get("lines", 2))
             self.engine = engine
             board = san.Board(self.initial_fen)
@@ -309,9 +350,9 @@ class ReviewJob(threading.Thread):
             self.engine = None
 
 
-def start_review(initial_fen, moves, settings=None):
+def start_review(initial_fen, moves, settings=None, identity=None):
     output = queue.Queue()
-    job = ReviewJob(initial_fen, moves, settings or {}, output)
+    job = ReviewJob(initial_fen, moves, settings or {}, output, identity)
     job.start()
     return job, output
 
@@ -348,9 +389,7 @@ class PositionJob(threading.Thread):
                 lines = [{"rank": 1, "depth": 0, "cp": cp,
                           "mate": mate, "pv": []}]
             else:
-                path = self.settings.get("engine") or os.environ.get(
-                    "CHESSLISTENER_STOCKFISH", "/usr/games/stockfish"
-                )
+                path = resolve_stockfish_executable(self.settings)
                 engine = UciEngine(
                     path, self.settings.get("threads", 2),
                     self.settings.get("lines", 2),

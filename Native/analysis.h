@@ -50,7 +50,7 @@ void AnalysisStop(void);
  * every result from the previous generation. Ending one cancels outstanding
  * work; the overlay decides whether to retain the final board from reason. */
 void AnalysisSessionStart(const char *session_id, const char *label);
-void AnalysisSessionEnd(const char *reason);
+void AnalysisSessionEnd(const char *reason, const char *result);
 
 /* Publish the latest legally verified full game record for local review. */
 void AnalysisUpdateGameRecord(const char *initial_fen, const char *uci_moves,

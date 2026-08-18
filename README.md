@@ -23,9 +23,13 @@ record is legally replayed before it is accepted, then uses the same review,
 graph, engine, export, and exploration tools. A standalone local mode works
 without opening Firefox or Chess.com.
 
-Version 0.9 adds **Saved Studies**. Analysis Lab trees can be named, annotated,
-stored locally, searched, reopened offline, extended with new legal branches,
-and exported as a full variation PGN with evaluation snapshots.
+Version 0.9.5 gives the whole application a cohesive **Analyst's Desk** UI.
+Live analysis remains a compact companion, while Review and Saved Studies
+expand into responsive local workspaces. A completed game now keeps its final
+board visible beside direct actions to save, review, explore, or export it.
+Analysis Lab trees can still be named, annotated, stored locally, searched,
+reopened offline, extended with legal branches, and exported as a full
+variation PGN with evaluation snapshots.
 
 ChessListener deliberately does not try to decide whether a page is a
 spectator, bot, test, or participant game. That keeps local testing possible
@@ -67,6 +71,14 @@ On Ubuntu, install the non-browser dependencies first:
 ```bash
 sudo apt update
 sudo apt install build-essential python3 python3-pyqt6 stockfish
+```
+
+Node.js is a **test-only** dependency on both Debian and Ubuntu. It is not used
+by the installed extension or native host, but it is required for `make check`,
+`make test`, and the popup portion of `make visual-test`:
+
+```bash
+sudo apt install nodejs
 ```
 
 Ubuntu's ordinary `firefox` package commonly installs the Snap build, whose
@@ -135,6 +147,11 @@ runtime into the stable per-user directory:
 ${XDG_DATA_HOME:-$HOME/.local/share}/chess-listener
 ```
 
+That directory contains replaceable program/runtime files only. Saved games,
+studies, and review caches live separately under
+`${XDG_DATA_HOME:-$HOME/.local/share}/chess-listener-library`, so reinstalling
+or uninstalling the native host does not remove them.
+
 It then generates Firefox's manifest at:
 
 ```text
@@ -166,8 +183,11 @@ By default Maia is optional. A fully validated Maia runtime in the source
 checkout replaces the installed copy. When reinstalling from a source archive
 that contains no Maia payload, an already-installed runtime is preserved only
 if all nine nets still pass the complete validation. If neither copy validates,
-the incomplete managed payload is removed and ChessListener continues with
-Stockfish. To make Maia mandatory for a particular installation:
+the incomplete managed payload (including its private `Engine/lib` directory)
+is removed and ChessListener continues with Stockfish. A validated source
+replacement also replaces `Engine/lib` as a unit, so libraries from an older
+lc0 backend cannot remain on the installed search path. To make Maia mandatory
+for a particular installation:
 
 ```bash
 ./Native/install.sh --require-maia
@@ -327,16 +347,21 @@ piece inventory at the displayed horizon. It does not claim that Stockfish has
 explained its internal reasoning or manufacture strategic statements such as
 "improves king safety" when the line does not prove them.
 
-The Settings page groups live engine, Analysis Lab, and display preferences.
+The Settings page puts everyday analysis choices first and keeps Analysis Lab,
+Review, board/display, and advanced engine controls in collapsible sections.
 The configurable choices include analysis strength, threads, candidate count,
-Maia rating or Off, Explore strength, displayed PV length, explanation detail,
-evaluation perspective, live-follow behaviour, candidate expansion, arrow
-visibility, and opacity. More MultiPV candidates divide the same Stockfish
+Maia rating or Off, Explore strength, continuation length, explanation detail,
+evaluation perspective, live-follow behaviour, candidate expansion, board
+markings, coordinates, opacity, always-on-top, reduced motion, and whether
+Compact mode is remembered. The board piece style is global: **Outline set**
+uses the outline family for both colours, while **Solid silhouettes** uses the
+filled family for both. More MultiPV candidates divide the same Stockfish
 search effort, so a larger count may reach less depth in the same time.
 
 ## Saved Studies
 
-The diamond button opens the local study library. While Analysis Lab is open,
+Open **Saved Studies** from the title bar or its labeled overflow menu. While
+Analysis Lab is open,
 press **Save** in its toolbar (or **Save Lab** on the study page) to capture the
 entire variation tree currently known to the UI, not only the selected line.
 You can also press **New** to start a one-position study from the current live,
@@ -348,7 +373,10 @@ move selects that child instead of duplicating it. Root, parent, and forward
 controls navigate the tree, while the tree itself exposes every alternative
 and remembers which subtrees were collapsed. Each position can have a
 variation name and a longer comment. Search matches titles, metadata, move
-coordinates, variation names, and comments.
+coordinates, variation names, and comments. Those text fields are copied into
+the local model immediately and saved atomically after a short debounce;
+Saving, Saved, and Failed states remain visible, and a failed write blocks a
+navigation that would otherwise discard the visible edit.
 
 Selecting a node can automatically run a finite local Stockfish pass using the
 configured Explore strength, threads, and candidate count. The result is a
@@ -366,12 +394,23 @@ unreachable nodes, and stored FENs that disagree with their path fail closed.
 
 ## Local Review, PGN/FEN Import, and Library
 
-The star button always opens Review & Import. ChessListener can use a complete
+Open **Local Review** from the title bar, finished-game panel, or labeled
+overflow menu. ChessListener can use a complete
 move history verified from the live page, **Import PGN…**, or **Import FEN…**.
 PGN import keeps one main line, ignores comments and nested side variations,
 and legally matches every SAN token before converting it to canonical UCI.
 Custom positions require all six FEN fields. Invalid, ambiguous, oversized, or
 multi-game files leave the current record untouched.
+
+When a tracked game finishes, the live page keeps the final board and presents
+**Save game**, **Run local review**, **Explore final position**, and **Export
+PGN**. Saving is idempotent for the completed browser session, and
+**Automatically save completed games** is independent of automatic review.
+If Chess.com exposes an exact result token it is retained; otherwise the local
+record uses `*` rather than guessing. If complete move history is unavailable,
+ChessListener can still save the validated final position as a clearly marked
+position-only SetUp/FEN record; it never substitutes whichever library game
+happened to be open. The same actions remain available from Review later.
 
 Press **Run local review** at any time, or enable automatic review in Settings.
 A separate Stockfish process analyses every position, so the stronger
@@ -393,14 +432,38 @@ arrow, and fresh MultiPV continuations after the browser session has ended.
 Left/Right, Home, and End navigate the historical timeline.
 
 Up to 50 games/positions, 100 studies, and setting-specific cached reviews are stored in
-`$XDG_DATA_HOME/chess-listener/reviews.json` (normally
-`~/.local/share/chess-listener/reviews.json`) with atomic replacement and a
-16 MB combined cap. A study is additionally capped at 512 positions. Imported
-player/event/result metadata is retained. Imports are saved before analysis,
-and identical settings reuse the cached review. The saved selector can reopen
-or delete records. **Export PGN** writes the legal game with local review
+`$XDG_DATA_HOME/chess-listener-library/reviews.json` (normally
+`~/.local/share/chess-listener-library/reviews.json`) with atomic replacement
+and a 16 MB combined cap. A study is additionally capped at 512 positions. Imported
+player/event/result metadata is retained. Imports and explicitly or
+automatically saved completed games are written before analysis, and identical
+settings reuse the cached review. Different review settings remain separately
+cached for the same game. The saved selector can reopen or delete records.
+**Export PGN** writes the legal game with local review
 comments and custom SetUp/FEN headers where required. A schema-1 library from
 0.8 is migrated in memory and rewritten atomically on the next change.
+
+An existing library is never treated as empty merely because it is malformed,
+unreadable, oversized, or not a regular file. ChessListener preserves the
+original bytes, disables library mutations, and shows an actionable warning;
+live analysis remains available while the archive is repaired or restored.
+Writes also fail closed if another process changes the library between reading
+and saving it.
+
+On the first 0.9.5 local launch, an older default
+`$XDG_DATA_HOME/chess-listener/reviews.json` is moved atomically to the separate
+library directory. Install, update, and uninstall also protect a legacy
+`reviews.json` physically inside their exact managed runtime—including custom
+prefixes and installations whose `XDG_DATA_HOME` later changed. An existing
+new library is never
+overwritten: if the two files differ, the old file is preserved beside it as a
+content-addressed `reviews.legacy-….json` recovery copy and the lifecycle script
+reports both paths. `--check` and uninstall `--dry-run` report the same plan
+without changing any file. Advanced users may set `CHESSLISTENER_LIBRARY` to an
+exact absolute JSON path **outside every managed `.../chess-listener` runtime**.
+The running overlay uses that override as-is; install/uninstall scripts do not
+manage or migrate arbitrary override paths. They only protect the old
+`reviews.json` at the root of a managed runtime before removing it.
 
 The classification thresholds are intentionally conservative and the numeric
 loss is an engine-evaluation change, not literal material. ChessListener does
@@ -418,8 +481,11 @@ Preview the exact targets, then remove them:
 
 The uninstaller removes only a marked `.../chess-listener` runtime directory
 and a manifest that points to that exact host. It refuses symlinked, unmarked,
-or broadly scoped paths. It leaves the Git checkout, Firefox profile, and saved
-overlay preferences untouched.
+or broadly scoped paths. It leaves the Git checkout, Firefox profile, saved
+overlay preferences, and the separate saved-game/study library untouched. If
+it finds a pre-0.9.5 library inside the runtime, it first preserves that file
+in the separate library directory (or reports the action in `--dry-run` mode)
+and refuses to continue if preservation cannot be completed safely.
 
 For a custom installation, use its installed script; it reads the persisted
 manifest directory before removing the runtime:
@@ -449,7 +515,7 @@ CUSTOM_PREFIX=/absolute/custom/path/chess-listener
 | `Native/pgn_import.py` | Parses one local PGN main line, validates six-field FENs, and legally converts SAN to canonical UCI. |
 
 The browser-to-host channel uses Firefox's length-prefixed native-messaging
-format. Release 0.9.0 uses **protocol version 4**. The extension sends a `hello`
+format. Release 0.9.5 uses **protocol version 4**. The extension sends a `hello`
 containing its protocol and release version; the host replies with its version
 and capabilities before accepting session-scoped snapshots or recovery
 commands. The host and Python overlay also negotiate protocol 4 before engines
@@ -475,6 +541,7 @@ Useful targets from the repository root:
 make             # optimized native host
 make check       # Python, JavaScript, and shell syntax/source checks
 make test        # clean/current build plus deterministic test suite
+make visual-test # strict real-PyQt screen matrix and HTML contact sheet
 make debug       # debug build
 make asan        # sanitizer build/tests where supported
 make tsan        # focused Stockfish/Maia race check where supported
@@ -487,6 +554,12 @@ change. Start with `make clean`; CI does the same.
 The extension tests can also be run directly as documented by the test output.
 Native integration tests speak the actual length-prefixed browser protocol and
 use a headless overlay plus deterministic UCI doubles.
+
+With PyQt6 available, `make visual-test` renders the strict 0.9.5 matrix to
+`Native/.build/visual-ui/` and writes `index.html` for human inspection. It
+covers narrow, normal, wide-workspace, and enlarged-text layouts plus both
+piece families and important loading, error, cancellation, save, and
+finished-game states.
 
 The engine-lane regression test deliberately delays Maia and verifies that a
 Stockfish result still arrives first, that rapid supersession favors the new
@@ -597,7 +670,7 @@ those are required for capture and the local host connection.
 Debug logs are local but may preserve game positions until deleted. Chess.com
 itself still receives the normal traffic generated by its website.
 
-Release 0.9.0 intentionally does not classify a page as participant,
+Release 0.9.5 intentionally does not classify a page as participant,
 spectator, bot, or test play. The same capture path remains available for bot
 games and local feature testing. Decide whether analysis is allowed in your
 context and follow the applicable site, event, and tournament rules.

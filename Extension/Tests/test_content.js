@@ -125,8 +125,12 @@ function moveList(nodes, attributes = {}, options = {}) {
 function modal(options = {}) {
     return {
         hidden: options.hidden ?? false,
+        textContent: options.textContent ?? "",
         getAttribute(name) {
-            return name === "aria-hidden" ? options.ariaHidden ?? null : null;
+            if (name === "aria-hidden") {
+                return options.ariaHidden ?? null;
+            }
+            return options.attributes?.[name] ?? null;
         },
         computedStyle: {
             display: options.display ?? "block",
@@ -339,8 +343,16 @@ async function testLifecycleAndFastStableCapture() {
     assert.equal(vm.runInContext("detectGameOver()", context), false);
     harness.setModal(modal({ width: 0, height: 0 }));
     assert.equal(vm.runInContext("detectGameOver()", context), false);
-    harness.setModal(modal());
+    harness.setHistory(
+        "wc-simple-move-list",
+        moveList([
+            moveNode({ "data-ply": "1", "data-san": "e4" }, "e4"),
+            moveNode({ "data-ply": "2", "data-san": "e5" }, "e5")
+        ])
+    );
+    harness.setModal(modal({ textContent: "Game over 1-0" }));
     assert.equal(vm.runInContext("detectGameOver()", context), true);
+    assert.equal(vm.runInContext("readVisibleGameResult()", context), "1-0");
 
     harness.runtimeMessages.length = 0;
     harness.timers.clear();
@@ -348,6 +360,13 @@ async function testLifecycleAndFastStableCapture() {
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(vm.runInContext("gameIsOver", context), true);
     assert.equal(harness.runtimeMessages.at(-1).reason, "game_end");
+    assert.equal(harness.runtimeMessages.at(-1).game_result, "1-0");
+    assert.equal(
+        harness.runtimeMessages.find(
+            (message) => message.type === "history_candidate"
+        )?.game_result,
+        "1-0"
+    );
 
     harness.setModal(null);
     vm.runInContext("refreshContext()", context);
@@ -470,6 +489,41 @@ async function testLifecycleAndFastStableCapture() {
     assert.equal(unsupported.reason, "no_supported_board");
 }
 
+async function testGameEndResultWithoutHistory() {
+    const harness = loadContent();
+    const { context } = harness;
+
+    harness.setHistory(null, null);
+    harness.setModal(modal({ textContent: "Black wins 0-1" }));
+    harness.runtimeMessages.length = 0;
+    harness.timers.clear();
+    vm.runInContext("refreshContext()", context);
+    await flushTasks();
+
+    assert.equal(
+        harness.runtimeMessages.some(
+            (message) => message.type === "history_candidate"
+        ),
+        false
+    );
+    const endState = harness.runtimeMessages.find(
+        (message) => message.type === "page_state" && message.reason === "game_end"
+    );
+    assert.notEqual(endState, undefined);
+    assert.equal(endState.game_result, "0-1");
+
+    const malformed = vm.runInContext(
+        'currentPageState("game_end", "White won")',
+        context
+    );
+    assert.equal(malformed.game_result, "*");
+    const ordinary = vm.runInContext(
+        'currentPageState("visibility", "1-0")',
+        context
+    );
+    assert.equal(Object.hasOwn(ordinary, "game_result"), false);
+}
+
 function testHistoryAdaptersAndNormalization() {
     const harness = loadContent();
     const { context } = harness;
@@ -524,7 +578,8 @@ function testHistoryAdaptersAndNormalization() {
         notation: "uci",
         moves: "e2e4|e7e5",
         complete: true,
-        initialFen: null
+        initialFen: null,
+        result: "*"
     });
 
     result = historyResult(
@@ -584,6 +639,7 @@ function testHistoryAdaptersAndNormalization() {
     );
     assert.equal(result.notation, "san");
     assert.equal(result.moves, "e4|e5|Nf3|Nc6|Bb5|a6");
+    assert.equal(result.result, "1-0");
     assert.equal(
         result.complete,
         true,
@@ -737,6 +793,7 @@ async function testIndependentHistoryRewriteAndDelayedRecovery() {
 
 async function main() {
     await testLifecycleAndFastStableCapture();
+    await testGameEndResultWithoutHistory();
     testHistoryAdaptersAndNormalization();
     await testIndependentHistoryRewriteAndDelayedRecovery();
     console.log(

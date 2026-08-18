@@ -8,35 +8,54 @@
   <script src="popup.js" defer></script>
 </head>
 <body>
-  <main>
+  <main id="popup-root" aria-busy="false">
     <header>
-      <div>
-        <p class="eyebrow">ChessListener</p>
-        <h1>Analysis session</h1>
+      <span class="mark" aria-hidden="true">
+        <span>C</span><span></span><span></span><span>L</span>
+      </span>
+      <div class="brand-copy">
+        <p class="eyebrow">Local chess analysis</p>
+        <h1>ChessListener</h1>
       </div>
-      <span id="status-badge" class="badge" data-status="idle">Idle</span>
+      <span
+        id="status-badge"
+        class="badge"
+        data-status="idle"
+        aria-live="polite"
+        aria-atomic="true"
+      >Idle</span>
     </header>
 
-    <section class="session-card" aria-live="polite">
+    <section class="session-block" aria-live="polite" aria-atomic="true">
+      <p class="section-label">Current board</p>
       <p id="session-label" class="session-label">No active board</p>
       <p id="session-detail" class="session-detail">
-        Open a Chess.com game or press Analyze this tab.
+        Open a Chess.com board to begin.
       </p>
     </section>
 
-    <p id="error" class="error" role="alert" hidden></p>
+    <section id="error-panel" class="error-panel" role="alert" hidden>
+      <strong id="error-title">Analysis could not continue</strong>
+      <p id="error" class="error"></p>
+      <details id="error-details" hidden>
+        <summary>Technical details</summary>
+        <code id="error-technical"></code>
+      </details>
+    </section>
 
     <div class="actions">
       <button id="analyze" class="primary" type="button">
-        Analyze this tab
+        Start analysis
       </button>
-      <button id="rescan" type="button" disabled>Re-read board</button>
       <button id="stop" class="danger" type="button" disabled>
         Stop session
       </button>
     </div>
 
-    <footer id="version">Protocol 4</footer>
+    <footer>
+      <span id="version">v0.9.5</span>
+      <span>Local &amp; offline</span>
+    </footer>
   </main>
 </body>
 </html>
