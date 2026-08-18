@@ -62,8 +62,8 @@ function render(state) {
     }
 
     versionLabel.textContent =
-        `v${state?.extension_version ?? "0.3.0"} · Protocol ` +
-        `${state?.native_protocol_version ?? 2}`;
+        `v${state?.extension_version ?? "0.9.0"} · Protocol ` +
+        `${state?.native_protocol_version ?? 4}`;
     analyzeButton.disabled = busy;
     rescanButton.disabled =
         busy || !["active", "connecting"].includes(status);

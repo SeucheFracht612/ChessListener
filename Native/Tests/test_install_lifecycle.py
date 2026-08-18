@@ -52,7 +52,10 @@ def create_install_source(source):
     source.mkdir(parents=True, exist_ok=True)
     for name in ("install.sh", "update.sh", "uninstall.sh"):
         shutil.copy2(NATIVE / name, source / name)
-    for name in ("overlay.py", "san.py", "local.chess_listener.json"):
+    for name in (
+        "overlay.py", "san.py", "explanations.py", "review.py", "study_store.py", "study.py",
+        "pgn_import.py", "local.chess_listener.json"
+    ):
         shutil.copy2(NATIVE / name, source / name)
     (source / "Makefile").write_text(
         """.PHONY: all clean
@@ -111,6 +114,13 @@ def main():
         shutil.copy2("/bin/true", runtime / "chess-listener-host")
         (runtime / "overlay.py").write_text("# lifecycle fixture\n", encoding="utf-8")
         (runtime / "san.py").write_text("# lifecycle fixture\n", encoding="utf-8")
+        (runtime / "explanations.py").write_text(
+            "# lifecycle fixture\n", encoding="utf-8"
+        )
+        (runtime / "review.py").write_text("# lifecycle fixture\n", encoding="utf-8")
+        (runtime / "study_store.py").write_text("# lifecycle fixture\n", encoding="utf-8")
+        (runtime / "study.py").write_text("# lifecycle fixture\n", encoding="utf-8")
+        (runtime / "pgn_import.py").write_text("# lifecycle fixture\n", encoding="utf-8")
 
         manifest_path = manifest_dir / "local.chess_listener.json"
         manifest_path.write_text(

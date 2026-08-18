@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChessListener",
-  "version": "0.3.0",
+  "version": "0.9.0",
   "description": "Provides a local live-analysis overlay for Chess.com games, including bot games.",
   "permissions": [
     "nativeMessaging",

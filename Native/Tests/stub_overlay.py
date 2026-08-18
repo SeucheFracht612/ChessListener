@@ -13,7 +13,12 @@ import sys
 
 LOG = os.environ.get("CHESSLISTENER_STUB_LOG", "/tmp/chess-listener-frames.jsonl")
 SET_AFTER = int(os.environ.get("CHESSLISTENER_STUB_SET_AFTER_POSITIONS", "0"))
-PROTOCOL = os.environ.get("CHESSLISTENER_STUB_PROTOCOL", "2")
+PROTOCOL = os.environ.get("CHESSLISTENER_STUB_PROTOCOL", "4")
+START_SETTINGS = os.environ.get("CHESSLISTENER_STUB_START_SETTINGS")
+SET_PAYLOAD = os.environ.get(
+    "CHESSLISTENER_STUB_SET_PAYLOAD",
+    "budget=90 explore_budget=-1 maia=1900 threads=1 multipv=2",
+)
 CONTROLS = [
     command
     for command in os.environ.get("CHESSLISTENER_STUB_CONTROLS", "").split("|")
@@ -30,9 +35,11 @@ def send(command):
 
 def main():
     budget = os.environ.get("BUDGET", "100")
+    settings = START_SETTINGS or (
+        f"budget={budget} explore_budget=-1 maia=1900 threads=1 multipv=3"
+    )
     send(
-        f"START protocol={PROTOCOL} ui_version=0.3.0-test budget={budget} "
-        "maia=1900 threads=1 multipv=3"
+        f"START protocol={PROTOCOL} ui_version=0.9.0-test {settings}"
     )
 
     positions = 0
@@ -64,7 +71,7 @@ def main():
 
             if SET_AFTER > 0 and positions >= SET_AFTER and not settings_sent:
                 # Exercise option changes while board snapshots are arriving.
-                send("SET budget=90 maia=1900 threads=1 multipv=2")
+                send(f"SET {SET_PAYLOAD}")
                 settings_sent = True
 
             if (

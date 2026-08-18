@@ -15,11 +15,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CONTROL_LINE_MAX 256U
+#define CONTROL_LINE_MAX 1024U
 #define OVERLAY_WRITE_TIMEOUT_MS 500L
 
 #define MIN_BUDGET_MS   100L
 #define MAX_BUDGET_MS   10000L
+#define SAME_LIVE_BUDGET -1L
 #define MIN_MAIA_RATING 1100
 #define MAX_MAIA_RATING 1900
 #define MIN_THREADS     1
@@ -343,11 +344,22 @@ int overlay_parse_settings(const char *payload, OverlaySettings *settings)
                 milliseconds == 0L
                     ? 0L
                     : clamp_long(milliseconds, MIN_BUDGET_MS, MAX_BUDGET_MS);
+        } else if (strcmp(token, "explore_budget") == 0) {
+            long milliseconds = strtol(value, NULL, 10);
+
+            settings->explore_budget_ms =
+                milliseconds == SAME_LIVE_BUDGET || milliseconds == 0L
+                    ? milliseconds
+                    : clamp_long(milliseconds, MIN_BUDGET_MS, MAX_BUDGET_MS);
         } else if (strcmp(token, "maia") == 0) {
             int rating = (int)strtol(value, NULL, 10);
 
-            rating = clamp_int(rating, MIN_MAIA_RATING, MAX_MAIA_RATING);
-            settings->maia_rating = (rating / 100) * 100;
+            if (rating == 0) {
+                settings->maia_rating = 0;
+            } else {
+                rating = clamp_int(rating, MIN_MAIA_RATING, MAX_MAIA_RATING);
+                settings->maia_rating = (rating / 100) * 100;
+            }
         } else if (strcmp(token, "threads") == 0) {
             settings->threads =
                 clamp_int((int)strtol(value, NULL, 10), MIN_THREADS, MAX_THREADS);
@@ -415,6 +427,7 @@ int overlay_wait_for_start(Overlay *overlay, OverlaySettings *settings)
 
     /* Sensible defaults, so a payload missing a field is still usable. */
     settings->budget_ms = 400L;
+    settings->explore_budget_ms = -1L;
     settings->maia_rating = 1900;
     settings->threads = 2;
     settings->multipv = 3;
@@ -572,6 +585,16 @@ static int append_score_white(char *buffer, size_t capacity, size_t *length,
                               const UciLine *line, int flipSign)
 {
     int written;
+    UciScoreBound bound = line->bound;
+    const char *boundName;
+
+    if (flipSign) {
+        if (bound == UCI_SCORE_LOWERBOUND) {
+            bound = UCI_SCORE_UPPERBOUND;
+        } else if (bound == UCI_SCORE_UPPERBOUND) {
+            bound = UCI_SCORE_LOWERBOUND;
+        }
+    }
 
     if (line->has_mate) {
         written = snprintf(buffer + *length, capacity - *length,
@@ -587,6 +610,17 @@ static int append_score_white(char *buffer, size_t capacity, size_t *length,
         return -1;
     }
 
+    *length += (size_t)written;
+
+    boundName = bound == UCI_SCORE_LOWERBOUND
+        ? "lowerbound"
+        : bound == UCI_SCORE_UPPERBOUND ? "upperbound" : "exact";
+    written = snprintf(
+        buffer + *length, capacity - *length,
+        ",\"bound\":\"%s\"", boundName);
+    if (written < 0 || (size_t)written >= capacity - *length) {
+        return -1;
+    }
     *length += (size_t)written;
     return 0;
 }
@@ -626,10 +660,11 @@ int overlay_publish_ready(Overlay *overlay, int stockfish_ready, int maia_ready,
     written = snprintf(
         buffer, sizeof(buffer),
         "{\"type\":\"ready\",\"stockfish\":%s,\"maia\":%s,"
-        "\"budget_ms\":%ld,\"maia_rating\":%d,\"threads\":%d,\"multipv\":%d}\n",
+        "\"budget_ms\":%ld,\"explore_budget_ms\":%ld,"
+        "\"maia_rating\":%d,\"threads\":%d,\"multipv\":%d}\n",
         stockfish_ready ? "true" : "false",
         maia_ready ? "true" : "false",
-        settings->budget_ms, settings->maia_rating,
+        settings->budget_ms, settings->explore_budget_ms, settings->maia_rating,
         settings->threads, settings->multipv);
 
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
@@ -650,9 +685,10 @@ int overlay_publish_settings(Overlay *overlay, const OverlaySettings *settings)
 
     written = snprintf(
         buffer, sizeof(buffer),
-        "{\"type\":\"settings\",\"budget_ms\":%ld,\"maia_rating\":%d,"
+        "{\"type\":\"settings\",\"budget_ms\":%ld,"
+        "\"explore_budget_ms\":%ld,\"maia_rating\":%d,"
         "\"threads\":%d,\"multipv\":%d}\n",
-        settings->budget_ms, settings->maia_rating,
+        settings->budget_ms, settings->explore_budget_ms, settings->maia_rating,
         settings->threads, settings->multipv);
 
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
@@ -692,6 +728,33 @@ int overlay_publish_session_end(Overlay *overlay, const char *reason)
 
     APPEND("{\"type\":\"session\",\"event\":\"ended\",\"reason\":");
     if (append_json_string(buffer, sizeof(buffer), &length, reason) < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_game_record(Overlay *overlay, const char *initial_fen,
+                                const char *uci_moves, size_t move_count,
+                                const char *result)
+{
+    char buffer[65536];
+    size_t length = 0U;
+
+    if (initial_fen == NULL || uci_moves == NULL) {
+        return -1;
+    }
+    APPEND("{\"type\":\"game_record\",\"initial_fen\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, initial_fen) < 0) {
+        return -1;
+    }
+    APPEND(",\"uci_moves\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, uci_moves) < 0) {
+        return -1;
+    }
+    APPEND(",\"move_count\":%zu,\"result\":", move_count);
+    if (append_json_string(buffer, sizeof(buffer), &length,
+                           result != NULL ? result : "*") < 0) {
         return -1;
     }
     APPEND("}\n");
@@ -760,6 +823,124 @@ int overlay_publish_orientation(Overlay *overlay, int flip)
     return publish_buffer(overlay, buffer, (size_t)written);
 }
 
+int overlay_publish_explore(Overlay *overlay, const char *event,
+                            const char *action, const char *reason,
+                            const char *text,
+                            unsigned long long branch_id,
+                            unsigned int node_id,
+                            const char *fen, const char *last_move)
+{
+    char buffer[1536];
+    size_t length = 0U;
+
+    if (event == NULL || *event == '\0') {
+        return -1;
+    }
+
+    APPEND("{\"type\":\"explore\",\"event\":");
+    if (append_json_string(buffer, sizeof(buffer), &length, event) < 0) {
+        return -1;
+    }
+    if (action != NULL && *action != '\0') {
+        APPEND(",\"action\":");
+        if (append_json_string(buffer, sizeof(buffer), &length, action) < 0) {
+            return -1;
+        }
+    }
+    if (reason != NULL && *reason != '\0') {
+        APPEND(",\"reason\":");
+        if (append_json_string(buffer, sizeof(buffer), &length, reason) < 0) {
+            return -1;
+        }
+    }
+    if (text != NULL && *text != '\0') {
+        APPEND(",\"text\":");
+        if (append_json_string(buffer, sizeof(buffer), &length, text) < 0) {
+            return -1;
+        }
+    }
+    if (branch_id != 0ULL) {
+        APPEND(",\"branch_id\":%llu,\"node_id\":%u", branch_id, node_id);
+    }
+    if (fen != NULL && *fen != '\0') {
+        APPEND(",\"fen\":");
+        if (append_json_string(buffer, sizeof(buffer), &length, fen) < 0) {
+            return -1;
+        }
+    }
+    if (last_move != NULL && *last_move != '\0') {
+        APPEND(",\"last\":");
+        if (append_json_string(buffer, sizeof(buffer), &length, last_move) < 0) {
+            return -1;
+        }
+    } else if (fen != NULL) {
+        APPEND(",\"last\":null");
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_live_update(Overlay *overlay, unsigned long live_revision,
+                                const char *fen, int flip,
+                                const char *last_move, const char *source,
+                                int synchronising, const char *text)
+{
+    char buffer[1024];
+    size_t length = 0U;
+
+    if (fen == NULL || source == NULL || *source == '\0') {
+        return -1;
+    }
+
+    APPEND("{\"type\":\"live_update\",\"live_revision\":%lu,"
+           "\"fen\":\"%s\",\"flip\":%s,\"stm\":\"%c\",\"source\":",
+           live_revision, fen, flip ? "true" : "false",
+           black_to_move(fen) ? 'b' : 'w');
+    if (append_json_string(buffer, sizeof(buffer), &length, source) < 0) {
+        return -1;
+    }
+    if (append_last_move(buffer, sizeof(buffer), &length, last_move) < 0) {
+        return -1;
+    }
+    APPEND(",\"synchronising\":%s,\"text\":",
+           synchronising ? "true" : "false");
+    if (append_json_string(
+            buffer, sizeof(buffer), &length, text != NULL ? text : "") < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
+int overlay_publish_state(Overlay *overlay, unsigned long seq,
+                          unsigned long live_revision,
+                          const char *source, int synchronising,
+                          const char *text)
+{
+    char buffer[768];
+    size_t length = 0U;
+
+    if (source == NULL || *source == '\0') {
+        return -1;
+    }
+
+    APPEND("{\"type\":\"state\",\"seq\":%lu,"
+           "\"target_revision\":%lu,\"state_revision\":%lu,"
+           "\"live_revision\":%lu,\"mode\":\"live\",\"source\":",
+           seq, seq, seq, live_revision);
+    if (append_json_string(buffer, sizeof(buffer), &length, source) < 0) {
+        return -1;
+    }
+    APPEND(",\"synchronising\":%s,\"text\":",
+           synchronising ? "true" : "false");
+    if (append_json_string(
+            buffer, sizeof(buffer), &length, text != NULL ? text : "") < 0) {
+        return -1;
+    }
+    APPEND("}\n");
+    return publish_buffer(overlay, buffer, length);
+}
+
 int overlay_publish_status(Overlay *overlay, const char *kind, const char *text)
 {
     char buffer[512];
@@ -781,21 +962,33 @@ int overlay_publish_status(Overlay *overlay, const char *kind, const char *text)
 }
 
 int overlay_publish_position(Overlay *overlay, unsigned long seq,
-                             const char *fen, int flip, const char *last_move)
+                             const char *fen, int flip, const char *last_move,
+                             const char *source, const char *mode,
+                             unsigned long live_revision,
+                             unsigned long long branch_id,
+                             unsigned int node_id)
 {
-    char buffer[320];
+    char buffer[384];
     size_t length = 0U;
 
-    if (fen == NULL) {
+    if (fen == NULL || source == NULL || *source == '\0' || mode == NULL) {
         return -1;
     }
 
-    APPEND("{\"type\":\"position\",\"seq\":%lu,\"fen\":\"%s\",\"flip\":%s,"
-           "\"stm\":\"%c\"",
-           seq, fen, flip ? "true" : "false",
+    APPEND("{\"type\":\"position\",\"seq\":%lu,"
+           "\"target_revision\":%lu,\"state_revision\":%lu,"
+           "\"live_revision\":%lu,\"mode\":\"%s\","
+           "\"fen\":\"%s\",\"flip\":%s,\"stm\":\"%c\",\"source\":",
+           seq, seq, seq, live_revision, mode, fen, flip ? "true" : "false",
            black_to_move(fen) ? 'b' : 'w');
+    if (append_json_string(buffer, sizeof(buffer), &length, source) < 0) {
+        return -1;
+    }
     if (append_last_move(buffer, sizeof(buffer), &length, last_move) < 0) {
         return -1;
+    }
+    if (strcmp(mode, "explore") == 0) {
+        APPEND(",\"branch_id\":%llu,\"node_id\":%u", branch_id, node_id);
     }
 
     APPEND("}\n");
@@ -806,25 +999,38 @@ int overlay_publish_analysis(Overlay *overlay, unsigned long seq,
                              const char *fen, int flip, const char *last_move,
                              int depth, int final, const UciLine *best,
                              const char *human_move, const UciLine *lines,
-                             int count)
+                             int count, const char *source, const char *mode,
+                             unsigned long live_revision,
+                             unsigned long long branch_id,
+                             unsigned int node_id)
 {
     char buffer[4096];
     size_t length = 0U;
     int emitted = 0;
     int flipSign;
 
-    if (overlay == NULL || fen == NULL) {
+    if (overlay == NULL || fen == NULL || source == NULL || *source == '\0' ||
+        mode == NULL) {
         return -1;
     }
 
     flipSign = black_to_move(fen);
 
-    APPEND("{\"type\":\"analysis\",\"seq\":%lu,\"fen\":\"%s\",\"flip\":%s,"
-           "\"stm\":\"%c\",\"depth\":%d,\"final\":%s",
-           seq, fen, flip ? "true" : "false",
+    APPEND("{\"type\":\"analysis\",\"seq\":%lu,"
+           "\"target_revision\":%lu,\"state_revision\":%lu,"
+           "\"live_revision\":%lu,\"mode\":\"%s\","
+           "\"fen\":\"%s\",\"flip\":%s,\"stm\":\"%c\","
+           "\"depth\":%d,\"final\":%s,\"source\":",
+           seq, seq, seq, live_revision, mode, fen, flip ? "true" : "false",
            flipSign ? 'b' : 'w', depth, final ? "true" : "false");
+    if (append_json_string(buffer, sizeof(buffer), &length, source) < 0) {
+        return -1;
+    }
     if (append_last_move(buffer, sizeof(buffer), &length, last_move) < 0) {
         return -1;
+    }
+    if (strcmp(mode, "explore") == 0) {
+        APPEND(",\"branch_id\":%llu,\"node_id\":%u", branch_id, node_id);
     }
 
     if (best != NULL && best->move[0] != '\0') {

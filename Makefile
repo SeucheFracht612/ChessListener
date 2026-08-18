@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := all
 
-.PHONY: all clean check test debug asan
+.PHONY: all clean check test debug asan tsan
 
 all:
 	$(MAKE) -C Native all
@@ -19,3 +19,6 @@ debug:
 
 asan:
 	$(MAKE) -C Native asan
+
+tsan:
+	$(MAKE) -C Native tsan

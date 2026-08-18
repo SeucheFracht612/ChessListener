@@ -20,8 +20,18 @@
 #define FEN_MAX      128
 #define MOVE_MAX     8
 #define SESSION_ID_MAX 128
-#define POLL_SLICE_MS 40    /* how fast we notice a new position           */
-#define PUSH_EVERY_MS 120   /* how often a deepening search redraws the bar */
+#define STOCKFISH_POLL_MS 20 /* how fast the fast lane notices a new board */
+#define MAIA_POLL_MS      20 /* bounds supersession latency in Maia's lane */
+#define PUSH_EVERY_MS     80 /* first info is immediate; later redraws cap */
+#define MAIA_DEADLINE_MS 1500
+#define MAIA_ABORT_MS     250
+#define SOURCE_MAX         16
+#define SYNC_TEXT_MAX     192
+
+typedef enum {
+    ANALYSIS_MODE_LIVE = 0,
+    ANALYSIS_MODE_EXPLORE = 1
+} AnalysisMode;
 
 static UciEngine *g_stockfish;
 static UciEngine *g_maia;
@@ -35,16 +45,60 @@ static pthread_cond_t  g_wake = PTHREAD_COND_INITIALIZER;
 
 static char          g_fen[FEN_MAX];
 static char          g_last_move[MOVE_MAX];
+static char          g_source[SOURCE_MAX];
 static int           g_flip;
 static unsigned long g_seq;        /* newest position handed in           */
-static unsigned long g_taken;      /* newest position the worker has taken */
+static AnalysisMode  g_mode;
+static unsigned long long g_branch_id;
+static unsigned int  g_node_id;
+
+/* Browser-owned live state advances even while the engines are intentionally
+ * focused on an Analysis Lab node.  It is never reconstructed from a branch. */
+static char          g_live_fen[FEN_MAX];
+static char          g_live_last_move[MOVE_MAX];
+static char          g_live_source[SOURCE_MAX];
+static int           g_live_flip;
+static unsigned long g_live_revision;
+static int           g_live_synchronising;
+static char          g_live_sync_text[SYNC_TEXT_MAX];
+static unsigned long g_stockfish_taken;
+static unsigned long g_maia_taken;
 static OverlaySettings g_settings;
-static int           g_options_dirty;  /* threads / multipv / budget changed */
-static int           g_maia_reload;    /* rating changed, lc0 must restart   */
-static int           g_restart_engines;
+static int           g_stockfish_options_dirty;
+static int           g_maia_reload;
+static int           g_restart_stockfish;
+static int           g_restart_maia;
+static int           g_stockfish_ready;
+static int           g_maia_ready;
 static int           g_session_active;
 static char          g_session_id[SESSION_ID_MAX + 1];
+static int           g_synchronising;
+static char          g_sync_text[SYNC_TEXT_MAX];
 static int           g_quit;
+
+/* Both engine lanes merge into this revision-keyed cache. A late Maia result
+ * therefore republishes the already-computed Stockfish lines instead of
+ * clearing them in the overlay; conversely, every later Stockfish frame keeps
+ * an early Maia result. The cache is reset atomically when g_seq advances. */
+typedef struct {
+    unsigned long seq;
+    char fen[FEN_MAX];
+    char last_move[MOVE_MAX];
+    char source[SOURCE_MAX];
+    int flip;
+    AnalysisMode mode;
+    unsigned long live_revision;
+    unsigned long long branch_id;
+    unsigned int node_id;
+    UciLine lines[UCI_LINES_MAX];
+    int line_count;
+    int depth;
+    int stockfish_done;
+    int maia_done;
+    char human[MOVE_MAX];
+} RevisionResult;
+
+static RevisionResult g_result;
 
 /* Registered before the controller thread starts and immutable afterwards. */
 static AnalysisEventSink g_event_sink;
@@ -55,9 +109,11 @@ static void             *g_event_context;
  * frame, even if a future caller publishes from more than one thread. */
 static pthread_mutex_t g_publish_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static pthread_t g_worker;
+static pthread_t g_stockfish_worker;
+static pthread_t g_maia_worker;
 static pthread_t g_controller;
-static int       g_worker_live;
+static int       g_stockfish_worker_live;
+static int       g_maia_worker_live;
 
 /* Shutdown runs exactly once, and a second caller waits for the first to
  * finish rather than racing it. Both the message loop (browser pipe closed)
@@ -66,17 +122,18 @@ static int       g_worker_live;
 static pthread_mutex_t g_stop_lock = PTHREAD_MUTEX_INITIALIZER;
 static int             g_stopped;
 
-/* g_stockfish and g_maia belong to the worker thread once it exists: it is the
- * only thread that starts, restarts, or stops them. AnalysisStop joins the
- * worker and lets it do the teardown, which is what removed the last of the
- * shutdown races. */
-static void StopEngines(void)
+/* Once their worker exists, each UCI process has exactly one owner. No engine
+ * object or its pipe state is ever touched by the other lane. */
+static void StopStockfish(void)
 {
     if (g_stockfish != NULL) {
         uci_stop(g_stockfish);
         g_stockfish = NULL;
     }
+}
 
+static void StopMaia(void)
+{
     if (g_maia != NULL) {
         uci_stop(g_maia);
         g_maia = NULL;
@@ -182,6 +239,35 @@ static int ParseScopedFen(const char *line,
     return 1;
 }
 
+static int ParseScopedPayload(const char *line, const char *command,
+                              char sessionId[SESSION_ID_MAX + 1],
+                              const char **payload)
+{
+    size_t commandLength;
+    const char *token;
+    const char *space;
+
+    if (line == NULL || command == NULL || payload == NULL) {
+        return 0;
+    }
+
+    commandLength = strlen(command);
+    if (strncmp(line, command, commandLength) != 0 ||
+        line[commandLength] != ' ') {
+        return 0;
+    }
+
+    token = line + commandLength + 1U;
+    space = strchr(token, ' ');
+    if (space == NULL || space == token || space[1] == '\0' ||
+        !MatchCurrentSession(token, (size_t)(space - token), sessionId)) {
+        return 0;
+    }
+
+    *payload = space + 1;
+    return 1;
+}
+
 static void EmitEvent(const char *kind, const char *name, const char *payload,
                       const char *sessionId)
 {
@@ -201,6 +287,38 @@ static long NowMs(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static const char *StateSource(const char *source)
+{
+    if (source != NULL &&
+        (strcmp(source, "exact") == 0 ||
+         strcmp(source, "manual") == 0 ||
+         strcmp(source, "inferred") == 0)) {
+        return source;
+    }
+
+    return "inferred";
+}
+
+static long MaiaDeadlineMs(void)
+{
+    const char *value = getenv("CHESSLISTENER_MAIA_DEADLINE_MS");
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || *value == '\0') {
+        return MAIA_DEADLINE_MS;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return MAIA_DEADLINE_MS;
+    }
+
+    if (parsed < 100L) parsed = 100L;
+    if (parsed > 10000L) parsed = 10000L;
+    return parsed;
 }
 
 /* ------------------------------------------------------------ discovery -- */
@@ -292,6 +410,11 @@ static void StartMaia(int rating)
     const char *lc0;
     const char *net;
 
+    if (rating == 0) {
+        Log("analysis: Maia disabled by user");
+        return;
+    }
+
     snprintf(lc0Default, sizeof(lc0Default), "%s/Engine/lc0", g_base);
     snprintf(netDefault, sizeof(netDefault),
              "%s/Engine/maia-chess/maia_weights/maia-%d.pb.gz", g_base, rating);
@@ -365,10 +488,11 @@ static void DisableStockfish(const char *operation, int status)
         operation,
         status);
 
-    if (g_stockfish != NULL) {
-        uci_stop(g_stockfish);
-        g_stockfish = NULL;
-    }
+    StopStockfish();
+
+    pthread_mutex_lock(&g_lock);
+    g_stockfish_ready = 0;
+    pthread_mutex_unlock(&g_lock);
 
     (void)overlay_publish_status(
         g_overlay, "warn", "Stockfish stopped after an engine error.");
@@ -381,31 +505,60 @@ static void DisableMaia(const char *operation, int status)
         operation,
         status);
 
-    if (g_maia != NULL) {
-        uci_stop(g_maia);
-        g_maia = NULL;
-    }
+    StopMaia();
+
+    pthread_mutex_lock(&g_lock);
+    g_maia_ready = 0;
+    pthread_mutex_unlock(&g_lock);
 
     (void)overlay_publish_status(
         g_overlay, "warn", "Maia stopped after an engine error.");
 }
 
-/* ---------------------------------------------------------- worker loop -- */
+/* ---------------------------------------------------------- worker lanes -- */
 
-/* True when the worker should drop what it is doing: a newer position, a
- * settings change, or shutdown. */
-static int Superseded(unsigned long mine)
+static void OverlayGone(void);
+
+static void PublishReadyState(void)
+{
+    OverlaySettings settings;
+    int stockfishReady;
+    int maiaReady;
+    int publish;
+
+    pthread_mutex_lock(&g_lock);
+    settings = g_settings;
+    stockfishReady = g_stockfish_ready;
+    maiaReady = g_maia_ready;
+    publish = !g_quit;
+    pthread_mutex_unlock(&g_lock);
+
+    if (publish && overlay_publish_ready(
+            g_overlay, stockfishReady, maiaReady, &settings) != 0) {
+        OverlayGone();
+    }
+}
+
+static int StockfishSuperseded(unsigned long mine)
 {
     int superseded;
 
     pthread_mutex_lock(&g_lock);
     superseded =
-        g_quit ||
-        !g_session_active ||
-        g_seq != mine ||
-        g_options_dirty ||
-        g_maia_reload ||
-        g_restart_engines;
+        g_quit || !g_session_active || g_seq != mine ||
+        g_stockfish_options_dirty || g_restart_stockfish;
+    pthread_mutex_unlock(&g_lock);
+    return superseded;
+}
+
+static int MaiaSuperseded(unsigned long mine)
+{
+    int superseded;
+
+    pthread_mutex_lock(&g_lock);
+    superseded =
+        g_quit || !g_session_active || g_seq != mine ||
+        g_maia_reload || g_restart_maia;
     pthread_mutex_unlock(&g_lock);
     return superseded;
 }
@@ -421,33 +574,33 @@ static void OverlayGone(void)
     pthread_mutex_unlock(&g_lock);
 }
 
-static void PublishAnalysis(unsigned long seq, const char *fen, int flip,
-                            const char *lastMove, int depth, int final,
-                            const char *human)
+static void PublishAnalysis(unsigned long seq)
 {
-    const UciLine *lines = NULL;
-    int count = 0;
+    RevisionResult snapshot;
     int current;
-
-    if (g_stockfish != NULL) {
-        lines = uci_lines(g_stockfish, &count);
-    }
 
     /* Lifecycle frames and position commits use the same lock. Re-check after
      * taking it so an evaluation that raced a session end can never appear
      * after the frame that cleared it. */
     pthread_mutex_lock(&g_publish_lock);
     pthread_mutex_lock(&g_lock);
-    current = g_session_active && g_seq == seq && !g_quit;
+    current =
+        g_session_active && g_seq == seq && g_result.seq == seq && !g_quit;
+    if (current) {
+        snapshot = g_result;
+    }
     pthread_mutex_unlock(&g_lock);
 
     if (current &&
         overlay_publish_analysis(
-            g_overlay, seq, fen, flip, lastMove, depth, final,
-            count > 0 ? &lines[0] : NULL,
-            (human != NULL && *human != '\0') ? human : NULL,
-            count > 0 ? lines : NULL,
-            count) != 0) {
+            g_overlay, seq, snapshot.fen, snapshot.flip, snapshot.last_move,
+            snapshot.depth, snapshot.stockfish_done,
+            snapshot.line_count > 0 ? &snapshot.lines[0] : NULL,
+            snapshot.human[0] != '\0' ? snapshot.human : NULL,
+            snapshot.line_count > 0 ? snapshot.lines : NULL,
+            snapshot.line_count, snapshot.source,
+            snapshot.mode == ANALYSIS_MODE_EXPLORE ? "explore" : "live",
+            snapshot.live_revision, snapshot.branch_id, snapshot.node_id) != 0) {
         pthread_mutex_unlock(&g_publish_lock);
         OverlayGone();
         return;
@@ -456,39 +609,84 @@ static void PublishAnalysis(unsigned long seq, const char *fen, int flip,
     pthread_mutex_unlock(&g_publish_lock);
 }
 
-static void AnalysePosition(unsigned long seq, const char *fen, int flip,
-                            const char *lastMove, long budgetMs)
+static int CopyStockfishLines(UciLine output[UCI_LINES_MAX], int *depth)
 {
-    char human[8];
+    const UciLine *lines;
+    int count = 0;
+
+    if (depth != NULL) {
+        *depth = g_stockfish != NULL ? uci_depth(g_stockfish) : 0;
+    }
+
+    lines = g_stockfish != NULL ? uci_lines(g_stockfish, &count) : NULL;
+    if (count < 0) count = 0;
+    if (count > UCI_LINES_MAX) count = UCI_LINES_MAX;
+    if (count > 0 && lines != NULL) {
+        memcpy(output, lines, (size_t)count * sizeof(*output));
+    }
+    return count;
+}
+
+static void CommitStockfish(unsigned long seq,
+                            const UciLine *lines, int count,
+                            int depth, int done)
+{
+    int current;
+
+    if (count < 0) count = 0;
+    if (count > UCI_LINES_MAX) count = UCI_LINES_MAX;
+
+    pthread_mutex_lock(&g_lock);
+    current =
+        !g_quit && g_session_active && g_seq == seq && g_result.seq == seq;
+    if (current) {
+        memset(g_result.lines, 0, sizeof(g_result.lines));
+        if (count > 0 && lines != NULL) {
+            memcpy(g_result.lines, lines,
+                   (size_t)count * sizeof(g_result.lines[0]));
+        }
+        g_result.line_count = count;
+        g_result.depth = depth;
+        g_result.stockfish_done = done != 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (current) {
+        PublishAnalysis(seq);
+    }
+}
+
+static void CommitMaia(unsigned long seq, const char *human)
+{
+    int current;
+
+    pthread_mutex_lock(&g_lock);
+    current =
+        !g_quit && g_session_active && g_seq == seq && g_result.seq == seq;
+    if (current) {
+        snprintf(g_result.human, sizeof(g_result.human), "%s",
+                 human != NULL ? human : "");
+        g_result.maia_done = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (current) {
+        PublishAnalysis(seq);
+    }
+}
+
+static void AnalyseStockfish(unsigned long seq, const char *fen, long budgetMs)
+{
     long started;
     long lastPush;
     int status;
 
-    human[0] = '\0';
-
-    if (Superseded(seq)) {
+    if (StockfishSuperseded(seq)) {
         return;
     }
 
-    /* Maia first: one network evaluation, tens of milliseconds, and the
-     * "what would a human play" line is the part that reads as instant. */
-    if (g_maia != NULL) {
-        status = uci_bestmove(g_maia, fen, human, sizeof(human));
-
-        if (status != 0) {
-            human[0] = '\0';
-
-            /* -4 is a clean terminal position. Every other negative result
-             * leaves the one-shot UCI exchange potentially desynchronised, so
-             * never hand that process another position. */
-            if (status != -4) {
-                DisableMaia("query", status);
-            }
-        }
-    }
-
     if (g_stockfish == NULL) {
-        PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
+        CommitStockfish(seq, NULL, 0, 0, 1);
         return;
     }
 
@@ -496,7 +694,7 @@ static void AnalysePosition(unsigned long seq, const char *fen, int flip,
 
     if (status != 0) {
         DisableStockfish("search start", status);
-        PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
+        CommitStockfish(seq, NULL, 0, 0, 1);
         return;
     }
 
@@ -508,25 +706,30 @@ static void AnalysePosition(unsigned long seq, const char *fen, int flip,
         int finished = 0;
         long now;
 
-        status = uci_search_poll(g_stockfish, POLL_SLICE_MS, &updated, &finished);
+        status = uci_search_poll(
+            g_stockfish, STOCKFISH_POLL_MS, &updated, &finished);
 
         if (status == -4) {                       /* mate or stalemate */
-            PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
+            CommitStockfish(seq, NULL, 0, 0, 1);
             return;
         }
 
         if (status != 0) {
+            UciLine lines[UCI_LINES_MAX];
+            int depth;
+            int count = CopyStockfishLines(lines, &depth);
+
             /* A protocol/read error (-1) used to fall through and immediately
              * poll again forever. Any non-terminal error makes the stream
              * unsafe to reuse; stop it and publish a final engine-less frame. */
             DisableStockfish("search poll", status);
-            PublishAnalysis(seq, fen, flip, lastMove, 0, 1, human);
+            CommitStockfish(seq, lines, count, depth, 1);
             return;
         }
 
         now = NowMs();
 
-        if (Superseded(seq)) {
+        if (StockfishSuperseded(seq)) {
             int abortStatus;
 
             /* The board has moved on. Kill the search now; the outer loop
@@ -541,32 +744,125 @@ static void AnalysePosition(unsigned long seq, const char *fen, int flip,
         }
 
         if (finished) {
-            PublishAnalysis(
-                seq, fen, flip, lastMove,
-                uci_depth(g_stockfish), 1, human);
+            UciLine lines[UCI_LINES_MAX];
+            int depth;
+            int count = CopyStockfishLines(lines, &depth);
+
+            CommitStockfish(seq, lines, count, depth, 1);
             return;
         }
 
         if (budgetMs > 0L && now - started >= budgetMs) {
-            int depth = uci_depth(g_stockfish);
+            UciLine lines[UCI_LINES_MAX];
+            int depth;
+            int count;
             int abortStatus = uci_search_abort(g_stockfish);
+
+            count = CopyStockfishLines(lines, &depth);
 
             if (abortStatus != 0) {
                 DisableStockfish("search deadline abort", abortStatus);
                 depth = 0;
             }
 
-            PublishAnalysis(
-                seq, fen, flip, lastMove,
-                depth, 1, human);
+            CommitStockfish(seq, lines, count, depth, 1);
             return;
         }
 
         if (updated && now - lastPush >= PUSH_EVERY_MS) {
+            UciLine lines[UCI_LINES_MAX];
+            int depth;
+            int count;
+
             lastPush = now;
-            PublishAnalysis(
-                seq, fen, flip, lastMove,
-                uci_depth(g_stockfish), 0, human);
+            count = CopyStockfishLines(lines, &depth);
+            CommitStockfish(seq, lines, count, depth, 0);
+        }
+    }
+}
+
+static void AnalyseMaia(unsigned long seq, const char *fen)
+{
+    char human[MOVE_MAX] = "";
+    long started;
+    long deadlineMs = MaiaDeadlineMs();
+    int status;
+
+    if (MaiaSuperseded(seq)) {
+        return;
+    }
+
+    if (g_maia == NULL) {
+        return;
+    }
+
+    status = uci_analyse_begin(g_maia, fen);
+    if (status != 0) {
+        DisableMaia("search start", status);
+        CommitMaia(seq, NULL);
+        return;
+    }
+
+    started = NowMs();
+
+    for (;;) {
+        int updated = 0;
+        int finished = 0;
+        long now;
+
+        status = uci_search_poll(
+            g_maia, MAIA_POLL_MS, &updated, &finished);
+        (void)updated;
+
+        if (status != 0 && status != -4) {
+            DisableMaia("query", status);
+            CommitMaia(seq, NULL);
+            return;
+        }
+
+        if (MaiaSuperseded(seq)) {
+            int abortStatus = uci_search_abort_timeout(g_maia, MAIA_ABORT_MS);
+
+            if (abortStatus != 0) {
+                DisableMaia("supersession abort", abortStatus);
+                pthread_mutex_lock(&g_lock);
+                if (!g_quit) {
+                    g_restart_maia = 1;
+                    pthread_cond_broadcast(&g_wake);
+                }
+                pthread_mutex_unlock(&g_lock);
+            }
+            return;
+        }
+
+        if (status == -4) {
+            CommitMaia(seq, NULL);
+            return;
+        }
+
+        if (finished) {
+            const UciLine *lines;
+            int count = 0;
+
+            lines = uci_lines(g_maia, &count);
+            if (count > 0 && lines != NULL) {
+                snprintf(human, sizeof(human), "%s", lines[0].move);
+            }
+            CommitMaia(seq, human);
+            return;
+        }
+
+        now = NowMs();
+        if (now - started >= deadlineMs) {
+            int abortStatus =
+                uci_search_abort_timeout(g_maia, MAIA_ABORT_MS);
+
+            Log("analysis: Maia query exceeded %ld ms", deadlineMs);
+            if (abortStatus != 0) {
+                DisableMaia("deadline abort", abortStatus);
+            }
+            CommitMaia(seq, NULL);
+            return;
         }
     }
 }
@@ -607,15 +903,26 @@ static void ReloadMaia(int rating)
 {
     char note[64];
 
+    StopMaia();
+
+    if (rating == 0) {
+        pthread_mutex_lock(&g_lock);
+        g_maia_ready = 0;
+        pthread_mutex_unlock(&g_lock);
+        PublishReadyState();
+        (void)overlay_publish_status(g_overlay, "info", "Maia disabled.");
+        return;
+    }
+
     snprintf(note, sizeof(note), "Loading Maia %d\u2026", rating);
     (void)overlay_publish_status(g_overlay, "info", note);
 
-    if (g_maia != NULL) {
-        uci_stop(g_maia);
-        g_maia = NULL;
-    }
-
     StartMaia(rating);
+
+    pthread_mutex_lock(&g_lock);
+    g_maia_ready = g_maia != NULL;
+    pthread_mutex_unlock(&g_lock);
+    PublishReadyState();
 
     if (g_maia == NULL) {
         snprintf(note, sizeof(note), "Maia %d unavailable.", rating);
@@ -625,17 +932,99 @@ static void ReloadMaia(int rating)
     }
 }
 
-static void *WorkerThread(void *unused)
+static void *StockfishWorkerThread(void *unused)
 {
     (void)unused;
 
     for (;;) {
         char fen[FEN_MAX];
-        char lastMove[MOVE_MAX];
         unsigned long seq;
-        int flip;
-        int reload;
         int dirty;
+        int restart;
+        int active;
+        AnalysisMode mode;
+        OverlaySettings settings;
+
+        pthread_mutex_lock(&g_lock);
+
+        while (
+            !g_quit &&
+            g_seq == g_stockfish_taken &&
+            !g_stockfish_options_dirty &&
+            !g_restart_stockfish
+        ) {
+            pthread_cond_wait(&g_wake, &g_lock);
+        }
+
+        if (g_quit) {
+            pthread_mutex_unlock(&g_lock);
+            break;
+        }
+
+        dirty = g_stockfish_options_dirty;
+        restart = g_restart_stockfish;
+        g_stockfish_options_dirty = 0;
+        g_restart_stockfish = 0;
+        settings = g_settings;
+        seq = g_seq;
+        active = g_session_active;
+        mode = g_mode;
+        memcpy(fen, g_fen, sizeof(fen));
+        g_stockfish_taken = seq;
+
+        pthread_mutex_unlock(&g_lock);
+
+        if (restart) {
+            StopStockfish();
+            StartStockfish(&settings);
+
+            pthread_mutex_lock(&g_lock);
+            g_stockfish_ready = g_stockfish != NULL;
+            pthread_mutex_unlock(&g_lock);
+            PublishReadyState();
+        }
+
+        if (dirty && !restart) {
+            ApplyStockfishOptions(&settings);
+        }
+
+        if (dirty) {
+            (void)overlay_publish_settings(g_overlay, &settings);
+        }
+
+        if (active && fen[0] != '\0') {
+            long budget = settings.budget_ms;
+
+            if (mode == ANALYSIS_MODE_EXPLORE &&
+                settings.explore_budget_ms >= 0L) {
+                budget = settings.explore_budget_ms;
+            }
+            AnalyseStockfish(seq, fen, budget);
+        }
+    }
+
+    StopStockfish();
+    return NULL;
+}
+
+static void *MaiaWorkerThread(void *unused)
+{
+    OverlaySettings initialSettings;
+
+    (void)unused;
+
+    pthread_mutex_lock(&g_lock);
+    initialSettings = g_settings;
+    pthread_mutex_unlock(&g_lock);
+
+    /* lc0 and its network can take noticeably longer to initialise than
+     * Stockfish. It now starts entirely off the fast lane. */
+    ReloadMaia(initialSettings.maia_rating);
+
+    for (;;) {
+        char fen[FEN_MAX];
+        unsigned long seq;
+        int reload;
         int restart;
         int active;
         OverlaySettings settings;
@@ -644,10 +1033,9 @@ static void *WorkerThread(void *unused)
 
         while (
             !g_quit &&
-            g_seq == g_taken &&
-            !g_options_dirty &&
+            g_seq == g_maia_taken &&
             !g_maia_reload &&
-            !g_restart_engines
+            !g_restart_maia
         ) {
             pthread_cond_wait(&g_wake, &g_lock);
         }
@@ -658,56 +1046,27 @@ static void *WorkerThread(void *unused)
         }
 
         reload = g_maia_reload;
-        dirty = g_options_dirty;
-        restart = g_restart_engines;
+        restart = g_restart_maia;
         g_maia_reload = 0;
-        g_options_dirty = 0;
-        g_restart_engines = 0;
+        g_restart_maia = 0;
         settings = g_settings;
         seq = g_seq;
-        flip = g_flip;
         active = g_session_active;
         memcpy(fen, g_fen, sizeof(fen));
-        memcpy(lastMove, g_last_move, sizeof(lastMove));
-        g_taken = seq;
+        g_maia_taken = seq;
 
         pthread_mutex_unlock(&g_lock);
 
-        if (restart) {
-            int restartCurrent;
-
-            StopEngines();
-            StartStockfish(&settings);
-            StartMaia(settings.maia_rating);
-
-            pthread_mutex_lock(&g_lock);
-            restartCurrent =
-                !g_quit && g_session_active && g_seq == seq;
-            pthread_mutex_unlock(&g_lock);
-
-            if (restartCurrent && overlay_publish_ready(
-                    g_overlay,
-                    g_stockfish != NULL,
-                    g_maia != NULL,
-                    &settings) != 0) {
-                OverlayGone();
-                continue;
-            }
-        } else if (reload) {
+        if (reload || restart) {
             ReloadMaia(settings.maia_rating);
         }
 
-        if (dirty && !restart) {
-            ApplyStockfishOptions(&settings);
-            (void)overlay_publish_settings(g_overlay, &settings);
-        }
-
         if (active && fen[0] != '\0') {
-            AnalysePosition(seq, fen, flip, lastMove, settings.budget_ms);
+            AnalyseMaia(seq, fen);
         }
     }
 
-    StopEngines();
+    StopMaia();
     return NULL;
 }
 
@@ -716,7 +1075,7 @@ static void *WorkerThread(void *unused)
 static void *ControlThread(void *unused)
 {
     /* FEN plus a maximum-length session id must fit in one atomic line. */
-    char line[512];
+    char line[1024];
 
     (void)unused;
 
@@ -724,6 +1083,7 @@ static void *ControlThread(void *unused)
         int status = overlay_read_control(g_overlay, line, sizeof(line));
         char sessionId[SESSION_ID_MAX + 1];
         const char *fenPayload = NULL;
+        const char *explorePayload = NULL;
 
         if (status <= 0) {
             break;              /* overlay exited or the pipe broke */
@@ -794,6 +1154,61 @@ static void *ControlThread(void *unused)
             continue;
         }
 
+        if (strncmp(line, "EXPLORE_START", 13) == 0 &&
+            (line[13] == '\0' || line[13] == ' ')) {
+            if (!ParseScopedPayload(
+                    line, "EXPLORE_START", sessionId, &explorePayload)) {
+                Log("analysis: ignored unscoped, stale, or empty EXPLORE_START");
+                continue;
+            }
+            EmitEvent("command", "explore_start", explorePayload, sessionId);
+            continue;
+        }
+
+        if (strncmp(line, "EXPLORE_MOVE", 12) == 0 &&
+            (line[12] == '\0' || line[12] == ' ')) {
+            if (!ParseScopedPayload(
+                    line, "EXPLORE_MOVE", sessionId, &explorePayload)) {
+                Log("analysis: ignored unscoped, stale, or empty EXPLORE_MOVE");
+                continue;
+            }
+            EmitEvent("command", "explore_move", explorePayload, sessionId);
+            continue;
+        }
+
+        if (strncmp(line, "EXPLORE_GOTO", 12) == 0 &&
+            (line[12] == '\0' || line[12] == ' ')) {
+            if (!ParseScopedPayload(
+                    line, "EXPLORE_GOTO", sessionId, &explorePayload)) {
+                Log("analysis: ignored unscoped, stale, or empty EXPLORE_GOTO");
+                continue;
+            }
+            EmitEvent("command", "explore_goto", explorePayload, sessionId);
+            continue;
+        }
+
+        if (strncmp(line, "EXPLORE_LIVE", 12) == 0 &&
+            (line[12] == '\0' || line[12] == ' ')) {
+            if (!ParseScopedPayload(
+                    line, "EXPLORE_LIVE", sessionId, &explorePayload)) {
+                Log("analysis: ignored unscoped, stale, or empty EXPLORE_LIVE");
+                continue;
+            }
+            EmitEvent("command", "explore_live", explorePayload, sessionId);
+            continue;
+        }
+
+        if (strncmp(line, "EXPLORE_RESUME", 14) == 0 &&
+            (line[14] == '\0' || line[14] == ' ')) {
+            if (!ParseScopedPayload(
+                    line, "EXPLORE_RESUME", sessionId, &explorePayload)) {
+                Log("analysis: ignored unscoped, stale, or empty EXPLORE_RESUME");
+                continue;
+            }
+            EmitEvent("command", "explore_resume", explorePayload, sessionId);
+            continue;
+        }
+
         if (strncmp(line, "SET", 3) == 0 && (line[3] == '\0' || line[3] == ' ')) {
             OverlaySettings wanted;
             int ratingChanged;
@@ -809,7 +1224,7 @@ static void *ControlThread(void *unused)
             pthread_mutex_lock(&g_lock);
             ratingChanged = wanted.maia_rating != g_settings.maia_rating;
             g_settings = wanted;
-            g_options_dirty = 1;
+            g_stockfish_options_dirty = 1;
 
             if (ratingChanged) {
                 g_maia_reload = 1;
@@ -818,10 +1233,10 @@ static void *ControlThread(void *unused)
             pthread_cond_broadcast(&g_wake);
             pthread_mutex_unlock(&g_lock);
 
-            Log("analysis: settings -> budget %ld ms, maia %d, threads %d, "
-                "multipv %d",
-                wanted.budget_ms, wanted.maia_rating, wanted.threads,
-                wanted.multipv);
+            Log("analysis: settings -> budget %ld ms, explore budget %ld ms, "
+                "maia %d, threads %d, multipv %d",
+                wanted.budget_ms, wanted.explore_budget_ms,
+                wanted.maia_rating, wanted.threads, wanted.multipv);
         }
     }
 
@@ -875,29 +1290,46 @@ int AnalysisStart(FILE *logFile, AnalysisEventSink sink, void *ctx)
         return result;
     }
 
-    StartStockfish(&settings);
-    StartMaia(settings.maia_rating);
-
     pthread_mutex_lock(&g_lock);
     g_settings = settings;
+    g_stockfish_ready = 0;
+    g_maia_ready = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    /* Stockfish is the latency-sensitive dependency, so establish it first.
+     * Maia startup moves to its own worker below and cannot delay returning to
+     * the browser message loop. */
+    StartStockfish(&settings);
+
+    pthread_mutex_lock(&g_lock);
+    g_stockfish_ready = g_stockfish != NULL;
     pthread_mutex_unlock(&g_lock);
 
     if (
         overlay_publish_ready(
-            g_overlay, g_stockfish != NULL, g_maia != NULL, &settings) != 0
+            g_overlay, g_stockfish != NULL, 0, &settings) != 0
     ) {
         Log("analysis: overlay closed during engine startup");
         AnalysisStop();
         return 0;
     }
 
-    if (pthread_create(&g_worker, NULL, WorkerThread, NULL) != 0) {
-        Log("analysis: could not start engine thread");
+    if (pthread_create(
+            &g_stockfish_worker, NULL, StockfishWorkerThread, NULL) != 0) {
+        Log("analysis: could not start Stockfish thread");
         AnalysisStop();
         return 0;
     }
 
-    g_worker_live = 1;
+    g_stockfish_worker_live = 1;
+
+    if (pthread_create(&g_maia_worker, NULL, MaiaWorkerThread, NULL) != 0) {
+        Log("analysis: could not start Maia thread; Stockfish remains usable");
+        (void)overlay_publish_status(
+            g_overlay, "warn", "Maia worker unavailable.");
+    } else {
+        g_maia_worker_live = 1;
+    }
 
     if (pthread_create(&g_controller, NULL, ControlThread, NULL) != 0) {
         Log("analysis: could not start control thread");
@@ -910,8 +1342,10 @@ int AnalysisStart(FILE *logFile, AnalysisEventSink sink, void *ctx)
 
 void AnalysisStop(void)
 {
-    pthread_t worker;
-    int joinWorker;
+    pthread_t stockfishWorker;
+    pthread_t maiaWorker;
+    int joinStockfish;
+    int joinMaia;
 
     pthread_mutex_lock(&g_stop_lock);
 
@@ -924,19 +1358,26 @@ void AnalysisStop(void)
 
     pthread_mutex_lock(&g_lock);
     g_quit = 1;
-    joinWorker = g_worker_live;
-    worker = g_worker;
-    g_worker_live = 0;
+    joinStockfish = g_stockfish_worker_live;
+    joinMaia = g_maia_worker_live;
+    stockfishWorker = g_stockfish_worker;
+    maiaWorker = g_maia_worker;
+    g_stockfish_worker_live = 0;
+    g_maia_worker_live = 0;
     pthread_cond_broadcast(&g_wake);
     pthread_mutex_unlock(&g_lock);
 
-    if (joinWorker && !pthread_equal(pthread_self(), worker)) {
-        /* Returning from the join means the worker has already stopped both
-         * engines, so nothing here touches them. */
-        pthread_join(worker, NULL);
-    } else if (!joinWorker) {
-        /* Failed startup: there is no worker, so the engines are still ours. */
-        StopEngines();
+    if (joinStockfish &&
+        !pthread_equal(pthread_self(), stockfishWorker)) {
+        pthread_join(stockfishWorker, NULL);
+    } else if (!joinStockfish) {
+        StopStockfish();
+    }
+
+    if (joinMaia && !pthread_equal(pthread_self(), maiaWorker)) {
+        pthread_join(maiaWorker, NULL);
+    } else if (!joinMaia) {
+        StopMaia();
     }
 
     /* Kept allocated on purpose -- see the comment on overlay_stop. */
@@ -960,9 +1401,26 @@ void AnalysisSessionStart(const char *session_id, const char *label)
     g_session_active = 1;
     snprintf(g_session_id, sizeof(g_session_id), "%s", session_id);
     g_seq += 1UL;
+    g_mode = ANALYSIS_MODE_LIVE;
+    g_branch_id = 0ULL;
+    g_node_id = 0U;
     g_fen[0] = '\0';
     g_last_move[0] = '\0';
+    snprintf(g_source, sizeof(g_source), "inferred");
     g_flip = 0;
+    g_synchronising = 0;
+    g_sync_text[0] = '\0';
+    g_live_revision = 0UL;
+    g_live_fen[0] = '\0';
+    g_live_last_move[0] = '\0';
+    snprintf(g_live_source, sizeof(g_live_source), "inferred");
+    g_live_flip = 0;
+    g_live_synchronising = 0;
+    g_live_sync_text[0] = '\0';
+    memset(&g_result, 0, sizeof(g_result));
+    g_result.seq = g_seq;
+    g_result.mode = ANALYSIS_MODE_LIVE;
+    snprintf(g_result.source, sizeof(g_result.source), "%s", g_source);
     pthread_cond_broadcast(&g_wake);
     pthread_mutex_unlock(&g_lock);
 
@@ -989,8 +1447,20 @@ void AnalysisSessionEnd(const char *reason)
     g_session_active = 0;
     g_session_id[0] = '\0';
     g_seq += 1UL;
+    g_mode = ANALYSIS_MODE_LIVE;
+    g_branch_id = 0ULL;
+    g_node_id = 0U;
     g_fen[0] = '\0';
     g_last_move[0] = '\0';
+    g_synchronising = 0;
+    g_sync_text[0] = '\0';
+    g_live_revision = 0UL;
+    g_live_fen[0] = '\0';
+    g_live_last_move[0] = '\0';
+    g_live_synchronising = 0;
+    g_live_sync_text[0] = '\0';
+    memset(&g_result, 0, sizeof(g_result));
+    g_result.seq = g_seq;
     pthread_cond_broadcast(&g_wake);
     pthread_mutex_unlock(&g_lock);
 
@@ -1001,6 +1471,18 @@ void AnalysisSessionEnd(const char *reason)
     if (publishStatus != 0) {
         OverlayGone();
     }
+}
+
+void AnalysisUpdateGameRecord(const char *initial_fen, const char *uci_moves,
+                              size_t move_count, const char *result)
+{
+    if (g_overlay == NULL || initial_fen == NULL || uci_moves == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_publish_lock);
+    (void)overlay_publish_game_record(
+        g_overlay, initial_fen, uci_moves, move_count, result);
+    pthread_mutex_unlock(&g_publish_lock);
 }
 
 void AnalysisRestartEngines(void)
@@ -1018,7 +1500,8 @@ void AnalysisRestartEngines(void)
     pthread_mutex_lock(&g_lock);
 
     if (!g_quit && publishStatus == 0) {
-        g_restart_engines = 1;
+        g_restart_stockfish = 1;
+        g_restart_maia = 1;
         pthread_cond_broadcast(&g_wake);
     }
 
@@ -1068,7 +1551,11 @@ void AnalysisUpdateOrientation(int visuallyFlipped)
     pthread_mutex_lock(&g_publish_lock);
     pthread_mutex_lock(&g_lock);
     active = g_session_active;
+    g_live_flip = visuallyFlipped != 0;
     g_flip = visuallyFlipped != 0;
+    if (g_result.seq == g_seq) {
+        g_result.flip = visuallyFlipped != 0;
+    }
     pthread_mutex_unlock(&g_lock);
 
     if (active && g_overlay != NULL) {
@@ -1084,10 +1571,14 @@ void AnalysisUpdateOrientation(int visuallyFlipped)
 }
 
 void AnalysisPublish(const char *fen, int visuallyFlipped,
-                     const char *lastMove)
+                     const char *lastMove, const char *source)
 {
     unsigned long seq;
+    unsigned long liveRevision;
+    const char *validSource = StateSource(source);
     int active;
+    AnalysisMode mode;
+    int publishStatus;
 
     /* g_overlay is written once during startup and never cleared, so reading
      * it from the message loop needs no lock. */
@@ -1099,7 +1590,9 @@ void AnalysisPublish(const char *fen, int visuallyFlipped,
 
     pthread_mutex_lock(&g_lock);
     active = g_session_active;
+    mode = g_mode;
     seq = g_seq + 1UL;
+    liveRevision = g_live_revision + 1UL;
     pthread_mutex_unlock(&g_lock);
 
     if (!active) {
@@ -1107,27 +1600,380 @@ void AnalysisPublish(const char *fen, int visuallyFlipped,
         return;
     }
 
-    /* Publish before making this seq visible to the worker. The overlay write
-     * lock serialises old analysis frames with this board frame, while the
-     * worker cannot start the new analysis until the commit below. */
-    if (
-        overlay_publish_position(
-            g_overlay, seq, fen, visuallyFlipped, lastMove) != 0
-    ) {
-        pthread_mutex_unlock(&g_publish_lock);
+    if (mode == ANALYSIS_MODE_LIVE) {
+        /* Publish before making this target revision visible to the worker.
+         * No analysis frame can overtake its matching board frame. */
+        publishStatus = overlay_publish_position(
+            g_overlay, seq, fen, visuallyFlipped, lastMove, validSource,
+            "live", liveRevision, 0ULL, 0U);
+    } else {
+        /* A real move is background metadata while the user is exploring. */
+        publishStatus = overlay_publish_live_update(
+            g_overlay, liveRevision, fen, visuallyFlipped, lastMove,
+            validSource, 0, "");
+    }
+
+    if (publishStatus == 0) {
+        pthread_mutex_lock(&g_lock);
+        g_live_revision = liveRevision;
+        g_live_flip = visuallyFlipped != 0;
+        g_live_synchronising = 0;
+        g_live_sync_text[0] = '\0';
+        snprintf(g_live_fen, sizeof(g_live_fen), "%s", fen);
+        snprintf(g_live_last_move, sizeof(g_live_last_move), "%s",
+                 lastMove != NULL ? lastMove : "");
+        snprintf(g_live_source, sizeof(g_live_source), "%s", validSource);
+
+        if (mode == ANALYSIS_MODE_LIVE) {
+            g_seq = seq;
+            g_flip = visuallyFlipped != 0;
+            g_synchronising = 0;
+            g_sync_text[0] = '\0';
+            snprintf(g_fen, sizeof(g_fen), "%s", fen);
+            snprintf(g_last_move, sizeof(g_last_move), "%s",
+                     lastMove != NULL ? lastMove : "");
+            snprintf(g_source, sizeof(g_source), "%s", validSource);
+            memset(&g_result, 0, sizeof(g_result));
+            g_result.seq = seq;
+            g_result.flip = visuallyFlipped != 0;
+            g_result.mode = ANALYSIS_MODE_LIVE;
+            g_result.live_revision = liveRevision;
+            snprintf(g_result.fen, sizeof(g_result.fen), "%s", fen);
+            snprintf(g_result.last_move, sizeof(g_result.last_move), "%s",
+                     lastMove != NULL ? lastMove : "");
+            snprintf(g_result.source, sizeof(g_result.source), "%s", validSource);
+            pthread_cond_broadcast(&g_wake);
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+
+    pthread_mutex_unlock(&g_publish_lock);
+
+    if (publishStatus != 0) {
         OverlayGone();
+    }
+}
+
+void AnalysisUpdateStateSource(const char *source)
+{
+    const char *validSource = StateSource(source);
+    unsigned long seq;
+    unsigned long liveRevision;
+    char liveFen[FEN_MAX];
+    char liveLast[MOVE_MAX];
+    int liveFlip;
+    AnalysisMode mode;
+    char currentSource[SOURCE_MAX];
+    int active;
+    int synchronising;
+    int publishStatus = 0;
+    char text[SYNC_TEXT_MAX];
+
+    pthread_mutex_lock(&g_publish_lock);
+    pthread_mutex_lock(&g_lock);
+    active = g_session_active && g_live_fen[0] != '\0';
+    seq = g_seq;
+    liveRevision = g_live_revision;
+    liveFlip = g_live_flip;
+    mode = g_mode;
+    synchronising = g_live_synchronising;
+    snprintf(g_live_source, sizeof(g_live_source), "%s", validSource);
+    snprintf(liveFen, sizeof(liveFen), "%s", g_live_fen);
+    snprintf(liveLast, sizeof(liveLast), "%s", g_live_last_move);
+    if (mode == ANALYSIS_MODE_LIVE) {
+        snprintf(g_source, sizeof(g_source), "%s", validSource);
+        if (g_result.seq == seq) {
+            snprintf(g_result.source, sizeof(g_result.source), "%s", validSource);
+        }
+    }
+    snprintf(currentSource, sizeof(currentSource), "%s", validSource);
+    snprintf(text, sizeof(text), "%s", g_live_sync_text);
+    pthread_mutex_unlock(&g_lock);
+
+    if (active && g_overlay != NULL) {
+        publishStatus = mode == ANALYSIS_MODE_LIVE
+            ? overlay_publish_state(
+                  g_overlay, seq, liveRevision, currentSource,
+                  synchronising, text)
+            : overlay_publish_live_update(
+                  g_overlay, liveRevision, liveFen, liveFlip, liveLast,
+                  currentSource, synchronising, text);
+    }
+    pthread_mutex_unlock(&g_publish_lock);
+
+    if (publishStatus != 0) {
+        OverlayGone();
+    }
+}
+
+void AnalysisSetSynchronising(int active, const char *textValue)
+{
+    unsigned long seq;
+    unsigned long liveRevision;
+    char source[SOURCE_MAX];
+    char text[SYNC_TEXT_MAX];
+    char liveFen[FEN_MAX];
+    char liveLast[MOVE_MAX];
+    int liveFlip;
+    AnalysisMode mode;
+    int sessionActive;
+    int synchronising = active != 0;
+    int publishStatus = 0;
+
+    pthread_mutex_lock(&g_publish_lock);
+    pthread_mutex_lock(&g_lock);
+    sessionActive = g_session_active && g_live_fen[0] != '\0';
+    seq = g_seq;
+    liveRevision = g_live_revision;
+    liveFlip = g_live_flip;
+    mode = g_mode;
+    g_live_synchronising = synchronising;
+    snprintf(g_live_sync_text, sizeof(g_live_sync_text), "%s",
+             textValue != NULL ? textValue : "");
+    snprintf(source, sizeof(source), "%s", g_live_source);
+    snprintf(text, sizeof(text), "%s", g_live_sync_text);
+    snprintf(liveFen, sizeof(liveFen), "%s", g_live_fen);
+    snprintf(liveLast, sizeof(liveLast), "%s", g_live_last_move);
+    if (mode == ANALYSIS_MODE_LIVE) {
+        g_synchronising = synchronising;
+        snprintf(g_sync_text, sizeof(g_sync_text), "%s", g_live_sync_text);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (sessionActive && g_overlay != NULL) {
+        publishStatus = mode == ANALYSIS_MODE_LIVE
+            ? overlay_publish_state(
+                  g_overlay, seq, liveRevision, source, synchronising, text)
+            : overlay_publish_live_update(
+                  g_overlay, liveRevision, liveFen, liveFlip, liveLast,
+                  source, synchronising, text);
+    }
+    pthread_mutex_unlock(&g_publish_lock);
+
+    if (publishStatus != 0) {
+        OverlayGone();
+    }
+}
+
+static int SelectExploreTarget(unsigned long long branchId,
+                               unsigned int nodeId, const char *fen,
+                               int visuallyFlipped, const char *lastMove,
+                               const char *source, const char *event,
+                               const char *action)
+{
+    const char *validSource = StateSource(source);
+    unsigned long seq;
+    unsigned long liveRevision;
+    int active;
+    int publishStatus = 0;
+
+    if (branchId == 0ULL || fen == NULL || *fen == '\0' || g_overlay == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_publish_lock);
+    pthread_mutex_lock(&g_lock);
+    active = g_session_active && g_live_fen[0] != '\0';
+    seq = g_seq + 1UL;
+    liveRevision = g_live_revision;
+    pthread_mutex_unlock(&g_lock);
+
+    if (active) {
+        publishStatus = overlay_publish_explore(
+            g_overlay, event, action, NULL, NULL, branchId, nodeId,
+            fen, lastMove);
+    }
+    if (active && publishStatus == 0) {
+        publishStatus = overlay_publish_position(
+            g_overlay, seq, fen, visuallyFlipped, lastMove, validSource,
+            "explore", liveRevision, branchId, nodeId);
+    }
+
+    if (active && publishStatus == 0) {
+        pthread_mutex_lock(&g_lock);
+        g_seq = seq;
+        g_mode = ANALYSIS_MODE_EXPLORE;
+        g_branch_id = branchId;
+        g_node_id = nodeId;
+        g_flip = visuallyFlipped != 0;
+        g_synchronising = 0;
+        g_sync_text[0] = '\0';
+        snprintf(g_fen, sizeof(g_fen), "%s", fen);
+        snprintf(g_last_move, sizeof(g_last_move), "%s",
+                 lastMove != NULL ? lastMove : "");
+        snprintf(g_source, sizeof(g_source), "%s", validSource);
+        memset(&g_result, 0, sizeof(g_result));
+        g_result.seq = seq;
+        g_result.flip = visuallyFlipped != 0;
+        g_result.mode = ANALYSIS_MODE_EXPLORE;
+        g_result.live_revision = liveRevision;
+        g_result.branch_id = branchId;
+        g_result.node_id = nodeId;
+        snprintf(g_result.fen, sizeof(g_result.fen), "%s", fen);
+        snprintf(g_result.last_move, sizeof(g_result.last_move), "%s",
+                 lastMove != NULL ? lastMove : "");
+        snprintf(g_result.source, sizeof(g_result.source), "%s", validSource);
+        pthread_cond_broadcast(&g_wake);
+        pthread_mutex_unlock(&g_lock);
+    }
+
+    pthread_mutex_unlock(&g_publish_lock);
+
+    if (publishStatus != 0) {
+        OverlayGone();
+    }
+    return active && publishStatus == 0;
+}
+
+void AnalysisExploreStart(unsigned long long branchId, unsigned int nodeId,
+                          const char *fen, int visuallyFlipped,
+                          const char *lastMove, const char *source)
+{
+    (void)SelectExploreTarget(
+        branchId, nodeId, fen, visuallyFlipped, lastMove, source,
+        "started", "start");
+}
+
+void AnalysisExploreSelect(unsigned long long branchId, unsigned int nodeId,
+                           const char *fen, int visuallyFlipped,
+                           const char *lastMove, const char *source,
+                           const char *action)
+{
+    (void)SelectExploreTarget(
+        branchId, nodeId, fen, visuallyFlipped, lastMove, source,
+        "selected", action != NULL ? action : "goto");
+}
+
+void AnalysisExploreLive(unsigned long long branchId)
+{
+    unsigned long seq;
+    unsigned long liveRevision;
+    char fen[FEN_MAX];
+    char last[MOVE_MAX];
+    char source[SOURCE_MAX];
+    int flip;
+    int synchronising;
+    char text[SYNC_TEXT_MAX];
+    int active;
+    int publishStatus = 0;
+
+    pthread_mutex_lock(&g_publish_lock);
+    pthread_mutex_lock(&g_lock);
+    active = g_session_active && g_live_fen[0] != '\0';
+    seq = g_seq + 1UL;
+    liveRevision = g_live_revision;
+    flip = g_live_flip;
+    synchronising = g_live_synchronising;
+    snprintf(fen, sizeof(fen), "%s", g_live_fen);
+    snprintf(last, sizeof(last), "%s", g_live_last_move);
+    snprintf(source, sizeof(source), "%s", g_live_source);
+    snprintf(text, sizeof(text), "%s", g_live_sync_text);
+    pthread_mutex_unlock(&g_lock);
+
+    if (active) {
+        publishStatus = overlay_publish_explore(
+            g_overlay, "live", "live", NULL, NULL,
+            branchId, 0U, NULL, NULL);
+    }
+    if (active && publishStatus == 0) {
+        publishStatus = overlay_publish_position(
+            g_overlay, seq, fen, flip, last, source, "live",
+            liveRevision, 0ULL, 0U);
+    }
+    if (active && publishStatus == 0 && synchronising) {
+        publishStatus = overlay_publish_state(
+            g_overlay, seq, liveRevision, source, synchronising, text);
+    }
+
+    if (active && publishStatus == 0) {
+        pthread_mutex_lock(&g_lock);
+        g_seq = seq;
+        g_mode = ANALYSIS_MODE_LIVE;
+        g_branch_id = 0ULL;
+        g_node_id = 0U;
+        g_flip = flip;
+        g_synchronising = synchronising;
+        snprintf(g_sync_text, sizeof(g_sync_text), "%s", text);
+        snprintf(g_fen, sizeof(g_fen), "%s", fen);
+        snprintf(g_last_move, sizeof(g_last_move), "%s", last);
+        snprintf(g_source, sizeof(g_source), "%s", source);
+        memset(&g_result, 0, sizeof(g_result));
+        g_result.seq = seq;
+        g_result.flip = flip;
+        g_result.mode = ANALYSIS_MODE_LIVE;
+        g_result.live_revision = liveRevision;
+        snprintf(g_result.fen, sizeof(g_result.fen), "%s", fen);
+        snprintf(g_result.last_move, sizeof(g_result.last_move), "%s", last);
+        snprintf(g_result.source, sizeof(g_result.source), "%s", source);
+        pthread_cond_broadcast(&g_wake);
+        pthread_mutex_unlock(&g_lock);
+    }
+
+    pthread_mutex_unlock(&g_publish_lock);
+    if (publishStatus != 0) {
+        OverlayGone();
+    }
+}
+
+void AnalysisExploreDestroy(unsigned long long branchId, const char *reason)
+{
+    int active;
+    int publishStatus = 0;
+
+    if (branchId == 0ULL || g_overlay == NULL) {
         return;
     }
 
+    pthread_mutex_lock(&g_publish_lock);
     pthread_mutex_lock(&g_lock);
-    g_seq = seq;
-    g_flip = visuallyFlipped;
-    snprintf(g_fen, sizeof(g_fen), "%s", fen);
-    snprintf(
-        g_last_move, sizeof(g_last_move), "%s",
-        lastMove != NULL ? lastMove : "");
-    pthread_cond_broadcast(&g_wake);
+    active = g_session_active;
+    if (active && g_mode == ANALYSIS_MODE_EXPLORE &&
+        g_branch_id == branchId) {
+        g_seq += 1UL;
+        g_mode = ANALYSIS_MODE_LIVE;
+        g_branch_id = 0ULL;
+        g_node_id = 0U;
+        g_fen[0] = '\0';
+        memset(&g_result, 0, sizeof(g_result));
+        g_result.seq = g_seq;
+        g_result.mode = ANALYSIS_MODE_LIVE;
+        pthread_cond_broadcast(&g_wake);
+    }
     pthread_mutex_unlock(&g_lock);
-
+    if (active) {
+        publishStatus = overlay_publish_explore(
+            g_overlay, "destroyed", NULL, reason, NULL,
+            branchId, 0U, NULL, NULL);
+    }
     pthread_mutex_unlock(&g_publish_lock);
+    if (publishStatus != 0) {
+        OverlayGone();
+    }
+}
+
+void AnalysisReportExploreRejected(const char *action, const char *reason,
+                                   const char *message,
+                                   unsigned long long branchId,
+                                   unsigned int nodeId)
+{
+    int active;
+    int publishStatus = 0;
+
+    if (g_overlay == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_publish_lock);
+    pthread_mutex_lock(&g_lock);
+    active = g_session_active;
+    pthread_mutex_unlock(&g_lock);
+    if (active) {
+        publishStatus = overlay_publish_explore(
+            g_overlay, "rejected", action, reason, message,
+            branchId, nodeId, NULL, NULL);
+    }
+    pthread_mutex_unlock(&g_publish_lock);
+    if (publishStatus != 0) {
+        OverlayGone();
+    }
 }

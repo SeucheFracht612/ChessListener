@@ -3,6 +3,7 @@
 /Native/chess-listener-host
 /Native/chess-listener-host-debug
 /Native/chess-listener-host-asan
+/Native/chess-listener-host-tsan
 /Native/*.o
 /Native/*.d
 
@@ -19,3 +20,4 @@ __pycache__/
 *.log
 .DS_Store
 *~
+Native/Engine/lc0-src/

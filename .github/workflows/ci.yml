@@ -34,5 +34,15 @@ jobs:
       - name: Test current source
         run: make test
 
+      - name: Install Qt UI test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyqt6 qt6-qpa-plugins
+
+      - name: Run real offscreen UI tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: /usr/bin/python3 Native/Tests/test_overlay.py
+
       - name: Run sanitizer integration tests
         run: make asan

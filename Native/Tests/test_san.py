@@ -77,6 +77,49 @@ if pv != ["Nd4", "Nxd4", "Bxd4", "c3"]:
     bad += 1
     print("BAD pv")
 
+# Analysis Lab helpers retain all six FEN fields and reject UI moves before
+# they ever reach the native host.
+after_e4 = san.Board(START).apply_uci("e2e4")
+if after_e4.fen() != "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1":
+    bad += 1
+    print("BAD full FEN after e4:", after_e4.fen())
+
+after_e5 = after_e4.apply_uci("e7e5")
+if not after_e5.fen().endswith(" w KQkq e6 0 2"):
+    bad += 1
+    print("BAD counters after ...e5:", after_e5.fen())
+
+after_nf3 = after_e5.apply_uci("g1f3")
+if not after_nf3.fen().endswith(" b KQkq - 1 2"):
+    bad += 1
+    print("BAD halfmove clock after Nf3:", after_nf3.fen())
+
+if "e2e4" not in san.Board(START).legal_uci_moves(san.square_from_name("e2")):
+    bad += 1
+    print("BAD legal UCI filtering")
+
+try:
+    san.Board(START).apply_uci("e2e5")
+except ValueError:
+    pass
+else:
+    bad += 1
+    print("BAD illegal UCI accepted")
+
+numbered = san.numbered_line_to_san(
+    START, "e2e4 e7e5 g1f3 b8c6".split(), 4
+)
+if numbered != "1. e4 e5 2. Nf3 Nc6":
+    bad += 1
+    print("BAD numbered PV:", numbered)
+
+black_numbered = san.numbered_line_to_san(
+    "8/8/8/8/8/8/4k3/6K1 b - - 7 18", ["e2f3"], 1
+)
+if black_numbered != "18... Kf3":
+    bad += 1
+    print("BAD black-root numbered PV:", black_numbered)
+
 
 
 def perft(board, depth):

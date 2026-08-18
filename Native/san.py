@@ -59,6 +59,15 @@ class Board:
         target = fields[3] if len(fields) > 3 else "-"
         self.en_passant = None if target == "-" else square_from_name(target)
 
+        try:
+            self.halfmove_clock = int(fields[4]) if len(fields) > 4 else 0
+            self.fullmove_number = int(fields[5]) if len(fields) > 5 else 1
+        except ValueError as error:
+            raise ValueError("bad FEN move counters") from error
+
+        if self.halfmove_clock < 0 or self.fullmove_number < 1:
+            raise ValueError("bad FEN move counters")
+
     # -- helpers ----------------------------------------------------------
 
     def copy(self):
@@ -67,7 +76,50 @@ class Board:
         clone.white_to_move = self.white_to_move
         clone.castling = set(self.castling)
         clone.en_passant = self.en_passant
+        clone.halfmove_clock = self.halfmove_clock
+        clone.fullmove_number = self.fullmove_number
         return clone
+
+    def fen(self):
+        """Return a complete six-field FEN for this position.
+
+        Analysis Lab positions are deliberately transported as ordinary FENs,
+        so retaining the counters here avoids turning an exploratory move into
+        a lossy board-only reconstruction.
+        """
+        rows = []
+
+        for start in range(0, 64, 8):
+            row = []
+            empty = 0
+
+            for piece in self.squares[start : start + 8]:
+                if piece == ".":
+                    empty += 1
+                    continue
+
+                if empty:
+                    row.append(str(empty))
+                    empty = 0
+                row.append(piece)
+
+            if empty:
+                row.append(str(empty))
+
+            rows.append("".join(row))
+
+        board = "/".join(rows)
+        side = "w" if self.white_to_move else "b"
+        castling = "".join(
+            right for right in "KQkq" if right in self.castling
+        ) or "-"
+        en_passant = (
+            "-" if self.en_passant is None else square_name(self.en_passant)
+        )
+        return (
+            f"{board} {side} {castling} {en_passant} "
+            f"{self.halfmove_clock} {self.fullmove_number}"
+        )
 
     @staticmethod
     def is_white(piece):
@@ -277,6 +329,7 @@ class Board:
         piece = after.squares[origin]
         kind = piece.lower()
         white = piece.isupper()
+        capture = after.squares[target] != "."
 
         after.squares[origin] = "."
         after.squares[target] = piece
@@ -284,6 +337,7 @@ class Board:
         if kind == "p" and target == self.en_passant:
             captured_row = target // 8 + (1 if white else -1)
             after.squares[captured_row * 8 + target % 8] = "."
+            capture = True
 
         if promotion:
             after.squares[target] = promotion.upper() if white else promotion
@@ -309,8 +363,54 @@ class Board:
         if kind == "p" and abs(target - origin) == 16:
             after.en_passant = (origin + target) // 2
 
+        after.halfmove_clock = (
+            0 if kind == "p" or capture else self.halfmove_clock + 1
+        )
+        after.fullmove_number = self.fullmove_number + (
+            0 if self.white_to_move else 1
+        )
         after.white_to_move = not self.white_to_move
         return after
+
+    def legal_uci_moves(self, origin=None):
+        """Return legal moves in UCI notation, optionally from one square."""
+        output = []
+
+        for move_origin, target, promotion in self.legal_moves():
+            if origin is not None and move_origin != origin:
+                continue
+
+            output.append(
+                square_name(move_origin) + square_name(target) + promotion
+            )
+
+        return output
+
+    def apply_uci(self, uci, require_legal=True):
+        """Apply one UCI move and return the resulting board.
+
+        ``require_legal`` exists for callers that already obtained a move from
+        ``legal_moves``. Interactive UI paths should retain the default and
+        fail closed before asking the native host to validate the same move.
+        """
+        if not isinstance(uci, str) or len(uci) not in {4, 5}:
+            raise ValueError("bad UCI move")
+
+        try:
+            origin = square_from_name(uci[0:2])
+            target = square_from_name(uci[2:4])
+        except (ValueError, IndexError):
+            raise ValueError("bad UCI move") from None
+
+        promotion = uci[4].lower() if len(uci) == 5 else ""
+
+        if promotion and promotion not in "qrbn":
+            raise ValueError("bad UCI promotion")
+
+        if require_legal and (origin, target, promotion) not in self.legal_moves():
+            raise ValueError("illegal move")
+
+        return self.apply(origin, target, promotion)
 
     def legal_moves(self):
         legal = []
@@ -325,9 +425,14 @@ class Board:
 
     # -- naming -----------------------------------------------------------
 
-    def san(self, uci):
+    def san(self, uci, legal=None):
         """Name a UCI move in this position, or return it unchanged if it is
-        not legal here (a desynchronised FEN should not raise into the UI)."""
+        not legal here (a desynchronised FEN should not raise into the UI).
+
+        Importers may pass one precomputed ``legal_moves()`` list while
+        matching a SAN token against every candidate. Ordinary UI callers can
+        omit it and retain the original one-shot behaviour.
+        """
         if not uci or len(uci) < 4:
             return uci
 
@@ -338,7 +443,7 @@ class Board:
             return uci
 
         promotion = uci[4].lower() if len(uci) > 4 else ""
-        legal = self.legal_moves()
+        legal = self.legal_moves() if legal is None else legal
 
         if (origin, target, promotion) not in legal:
             return uci
@@ -417,11 +522,48 @@ def line_to_san(fen, moves, limit=6):
         output.append(text)
 
         try:
-            origin = square_from_name(uci[0:2])
-            target = square_from_name(uci[2:4])
-        except (ValueError, IndexError):
+            board = board.apply_uci(uci)
+        except ValueError:
             break
 
-        board = board.apply(origin, target, uci[4].lower() if len(uci) > 4 else "")
-
     return output
+
+
+def numbered_line_to_san(fen, moves, limit=6):
+    """Render a UCI line with move numbers, suitable for a compact PV row.
+
+    A black-to-move root starts with the conventional ``18...`` marker. The
+    function shares ``line_to_san``'s fail-closed behaviour: a malformed or
+    stale continuation is shown only up to its first invalid move.
+    """
+    try:
+        board = Board(fen)
+    except ValueError:
+        return ""
+
+    if limit is None:
+        selected = moves
+    else:
+        selected = moves[: max(0, int(limit))]
+
+    output = []
+
+    for index, uci in enumerate(selected):
+        text = board.san(uci)
+
+        if text == uci and len(uci) >= 4:
+            break
+
+        if board.white_to_move:
+            output.append(f"{board.fullmove_number}. {text}")
+        elif index == 0:
+            output.append(f"{board.fullmove_number}... {text}")
+        else:
+            output.append(text)
+
+        try:
+            board = board.apply_uci(uci)
+        except ValueError:
+            break
+
+    return " ".join(output)

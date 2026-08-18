@@ -348,10 +348,16 @@ check_installed_files() {
         required_missing "$expected_host"
     fi
 
-    if [ -r "$INSTALL_PREFIX/overlay.py" ] && [ -r "$INSTALL_PREFIX/san.py" ]; then
+    if [ -r "$INSTALL_PREFIX/overlay.py" ] && \
+       [ -r "$INSTALL_PREFIX/san.py" ] && \
+       [ -r "$INSTALL_PREFIX/explanations.py" ] && \
+       [ -r "$INSTALL_PREFIX/review.py" ] && \
+       [ -r "$INSTALL_PREFIX/study_store.py" ] && \
+       [ -r "$INSTALL_PREFIX/study.py" ] && \
+       [ -r "$INSTALL_PREFIX/pgn_import.py" ]; then
         ok "overlay Python modules"
     else
-        required_missing "overlay.py and san.py in $INSTALL_PREFIX"
+        required_missing "overlay.py, san.py, explanations.py, review.py, study_store.py, study.py, and pgn_import.py in $INSTALL_PREFIX"
     fi
 
     if [ ! -r "$MANIFEST_PATH" ]; then
@@ -452,6 +458,11 @@ printf '%s\n' "$MANIFEST_DIR" > "$INSTALL_PREFIX/.manifest-dir"
 install -m 0755 "$SCRIPT_DIR/chess-listener-host" "$INSTALL_PREFIX/chess-listener-host"
 install -m 0755 "$SCRIPT_DIR/overlay.py" "$INSTALL_PREFIX/overlay.py"
 install -m 0644 "$SCRIPT_DIR/san.py" "$INSTALL_PREFIX/san.py"
+install -m 0644 "$SCRIPT_DIR/explanations.py" "$INSTALL_PREFIX/explanations.py"
+install -m 0644 "$SCRIPT_DIR/review.py" "$INSTALL_PREFIX/review.py"
+install -m 0644 "$SCRIPT_DIR/study_store.py" "$INSTALL_PREFIX/study_store.py"
+install -m 0644 "$SCRIPT_DIR/study.py" "$INSTALL_PREFIX/study.py"
+install -m 0644 "$SCRIPT_DIR/pgn_import.py" "$INSTALL_PREFIX/pgn_import.py"
 install -m 0755 "$SCRIPT_DIR/install.sh" "$INSTALL_PREFIX/install.sh"
 install -m 0755 "$SCRIPT_DIR/update.sh" "$INSTALL_PREFIX/update.sh"
 install -m 0755 "$SCRIPT_DIR/uninstall.sh" "$INSTALL_PREFIX/uninstall.sh"

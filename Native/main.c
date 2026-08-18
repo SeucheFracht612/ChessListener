@@ -1,11 +1,15 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <ctype.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "analysis.h"
 #include "version.h"
@@ -15,10 +19,14 @@
 #define BOARD_SQUARE_COUNT 64U
 #define MAX_LEGAL_MOVES 256U
 #define MAX_FEN_LENGTH 128U
-#define MAX_RESPONSE_LENGTH 512U
+#define MAX_RESPONSE_LENGTH 1024U
 #define MAX_SESSION_ID_LENGTH 128U
 #define MAX_SESSION_LABEL_LENGTH 256U
-#define MAX_EVENT_LENGTH 512U
+#define MAX_EVENT_LENGTH 1024U
+#define MAX_HISTORY_TEXT_LENGTH (32U * 1024U)
+#define MAX_HISTORY_MOVES 1024U
+#define MAX_HISTORY_TOKEN_LENGTH 64U
+#define MAX_STATE_SOURCE_LENGTH 8U
 
 #define CASTLE_WHITE_KINGSIDE  (1U << 0)
 #define CASTLE_WHITE_QUEENSIDE (1U << 1)
@@ -57,6 +65,25 @@ typedef struct {
     size_t count;
 } MoveList;
 
+#define MAX_EXPLORER_NODES 256U
+#define MAX_EXPLORER_START_PLIES 32U
+
+typedef struct {
+    Position position;
+    unsigned int parent;
+    char uci[6];
+} ExplorerNode;
+
+typedef struct {
+    int active;
+    int targeting;
+    uint64_t id;
+    unsigned int selectedNode;
+    unsigned int nodeCount;
+    char baseSource[MAX_STATE_SOURCE_LENGTH + 1U];
+    ExplorerNode nodes[MAX_EXPLORER_NODES];
+} ExplorerBranch;
+
 typedef struct {
     int active;
     char id[MAX_SESSION_ID_LENGTH + 1U];
@@ -65,10 +92,17 @@ typedef struct {
     char lastMove[6];
     char pendingBoard[BOARD_SQUARE_COUNT];
     int hasPendingBoard;
+    int pendingIsMismatch;
+    int pendingRecoveryFailed;
+    uint64_t pendingSnapshotSequence;
     uint64_t lastSnapshotSequence;
     int hasSnapshotSequence;
+    uint64_t lastHistorySequence;
+    int hasHistorySequence;
+    char stateSource[MAX_STATE_SOURCE_LENGTH + 1U];
     int visuallyFlipped;
     int hasOrientation;
+    ExplorerBranch explorer;
 } SessionState;
 
 /* Firefox native-messaging frames may originate on the browser thread or on
@@ -85,6 +119,10 @@ static const char INITIAL_BOARD[BOARD_SQUARE_COUNT + 1U] =
 "........"
 "PPPPPPPP"
 "RNBQKBNR";
+
+/* Kept below JavaScript's exact-integer ceiling for JSON consumers.  A native
+ * host owns one browser connection, so process-local monotonic IDs are ample. */
+static uint64_t nextExplorerBranchId = 1U;
 
 static int ReadExact(void *destination, size_t byteCount)
 {
@@ -245,7 +283,12 @@ static void ForwardAnalysisEvent(
         if (strcmp(name, "rescan") != 0 &&
             strcmp(name, "set_fen") != 0 &&
             strcmp(name, "restart_engines") != 0 &&
-            strcmp(name, "stop_session") != 0) {
+            strcmp(name, "stop_session") != 0 &&
+            strcmp(name, "explore_start") != 0 &&
+            strcmp(name, "explore_move") != 0 &&
+            strcmp(name, "explore_goto") != 0 &&
+            strcmp(name, "explore_live") != 0 &&
+            strcmp(name, "explore_resume") != 0) {
             return;
         }
         if (sessionId == NULL || *sessionId == '\0') {
@@ -1587,16 +1630,41 @@ static int BoardsEqual(const char left[64], const char right[64])
  * fails, and because the tracker then keeps its stale position, every later
  * frame fails too: one skipped snapshot used to kill the rest of the game.
  *
- * So search for a *sequence* instead, shallowest first, and take the first
- * sequence that lands on the observed board. Transpositions can produce more
- * than one path to the same board; they agree on the board and on castling
- * rights, and can differ only in which move was last, which affects nothing
- * beyond the label showing what was just played.
+ * This is deliberately a delayed recovery path, never part of ordinary move
+ * capture. Search shallowest first and label its result inferred: two legal
+ * paths can land on the same visible pieces while disagreeing about hidden
+ * state such as en-passant or the halfmove clock.
  */
 #define MAX_CATCHUP_PLIES 6
-#define CATCHUP_NODE_BUDGET 2000000
+#define CATCHUP_NODE_BUDGET 100000UL
+#define CATCHUP_DEADLINE_NS (50ULL * 1000ULL * 1000ULL)
 
 #define MAX_SQUARES_PER_PLY 4
+
+static uint64_t MonotonicNanoseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0U;
+    }
+
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static int CatchupLimitReached(
+    const unsigned long *nodeBudget,
+    uint64_t deadlineNanoseconds)
+{
+    uint64_t now;
+
+    if (nodeBudget == NULL || *nodeBudget == 0UL) {
+        return 1;
+    }
+
+    now = MonotonicNanoseconds();
+    return now == 0U || now >= deadlineNanoseconds;
+}
 
 static int OutOfReach(
     const char current[64],
@@ -1624,6 +1692,7 @@ static int SearchMoveSequence(
     const char observedBoard[64],
     int pliesRemaining,
     unsigned long *nodeBudget,
+    uint64_t deadlineNanoseconds,
     Move *lastMoveOut,
     Position *resultOut)
 {
@@ -1638,7 +1707,7 @@ static int SearchMoveSequence(
     for (size_t index = 0U; index < legalMoves.count; index += 1U) {
         Position candidate;
 
-        if (*nodeBudget == 0UL) {
+        if (CatchupLimitReached(nodeBudget, deadlineNanoseconds)) {
             return 0;
         }
 
@@ -1679,6 +1748,7 @@ static int SearchMoveSequence(
                 observedBoard,
                 pliesRemaining - 1,
                 nodeBudget,
+                deadlineNanoseconds,
                 lastMoveOut,
                 resultOut)
         ) {
@@ -1700,16 +1770,33 @@ static int FindMoveSequence(
     Position *resultOut,
     int *pliesOut)
 {
-    for (int plies = 2; plies <= MAX_CATCHUP_PLIES; plies += 1) {
-        unsigned long budget = CATCHUP_NODE_BUDGET;
+    unsigned long budget = CATCHUP_NODE_BUDGET;
+    uint64_t started = MonotonicNanoseconds();
+    uint64_t deadline;
 
+    if (started == 0U || UINT64_MAX - started < CATCHUP_DEADLINE_NS) {
+        return 0;
+    }
+    deadline = started + CATCHUP_DEADLINE_NS;
+
+    for (int plies = 2; plies <= MAX_CATCHUP_PLIES; plies += 1) {
         if (OutOfReach(position->board, observedBoard, plies)) {
             continue;
         }
 
+        if (CatchupLimitReached(&budget, deadline)) {
+            return 0;
+        }
+
         if (
             SearchMoveSequence(
-                position, observedBoard, plies, &budget, lastMoveOut, resultOut)
+                position,
+                observedBoard,
+                plies,
+                &budget,
+                deadline,
+                lastMoveOut,
+                resultOut)
         ) {
             if (pliesOut != NULL) {
                 *pliesOut = plies;
@@ -1900,6 +1987,74 @@ static void AdoptPosition(
     position->fullmoveNumber = 1U;
 }
 
+/*
+ * A bounded recovery can fail simply because the trusted position is now too
+ * far behind. Do not adopt that unproven board on its own: its side to move
+ * is unknowable. If a later board arrives, however, one legal transition
+ * between the two consecutive observations can establish the mover. Accept
+ * it only when exactly one candidate side has exactly one matching move.
+ *
+ * Hidden state remains a best effort here (as for joining a game in progress)
+ * and the result is therefore published as inferred. Exact DOM history can
+ * still replace it transactionally afterward.
+ */
+static int InferUniquePendingTransition(
+    const char previousBoard[64],
+    const char observedBoard[64],
+    Move *matchingMoveOut,
+    Position *resultOut)
+{
+    int matchingMoverCount = 0;
+    Move matchingMove = {0};
+    Position matchingPosition = {0};
+
+    for (int color = (int)COLOR_WHITE;
+         color <= (int)COLOR_BLACK;
+         color += 1) {
+        Position candidate = {0};
+        Move candidateMove = {0};
+        Position candidateResult = {0};
+        size_t matchCount = 0U;
+
+        memcpy(candidate.board, previousBoard, BOARD_SQUARE_COUNT);
+        candidate.sideToMove = (Color)color;
+        candidate.castlingRights = GuessCastlingRights(previousBoard);
+        candidate.enPassantSquare = -1;
+        candidate.halfmoveClock = 0U;
+        candidate.fullmoveNumber = 1U;
+
+        if (!FindMatchingMove(
+                &candidate,
+                observedBoard,
+                &candidateMove,
+                &candidateResult,
+                &matchCount)) {
+            /* More than one legal move for either candidate is ambiguous,
+             * even when the other color has no match. */
+            if (matchCount > 0U) {
+                return 0;
+            }
+            continue;
+        }
+
+        matchingMoverCount += 1;
+        matchingMove = candidateMove;
+        matchingPosition = candidateResult;
+    }
+
+    if (matchingMoverCount != 1) {
+        return 0;
+    }
+
+    if (matchingMoveOut != NULL) {
+        *matchingMoveOut = matchingMove;
+    }
+    if (resultOut != NULL) {
+        *resultOut = matchingPosition;
+    }
+    return 1;
+}
+
 static int AppendCharacter(
     char *output,
     size_t outputSize,
@@ -2068,6 +2223,366 @@ static void MoveToUci(Move move, char output[6])
     }
 }
 
+static int SquareFromName(const char name[2])
+{
+    if (name == NULL || name[0] < 'a' || name[0] > 'h' ||
+        name[1] < '1' || name[1] > '8') {
+        return -1;
+    }
+
+    return SquareFromRowFile('8' - name[1], name[0] - 'a');
+}
+
+static int MatchUciHistoryMove(
+    const Position *position,
+    const char *token,
+    Move *moveOut)
+{
+    size_t length;
+    int from;
+    int to;
+    char promotion = '\0';
+    MoveList legalMoves;
+    size_t matchCount = 0U;
+    Move match = {0};
+
+    if (position == NULL || token == NULL || moveOut == NULL) {
+        return 0;
+    }
+
+    length = strlen(token);
+    if (length != 4U && length != 5U) {
+        return 0;
+    }
+
+    from = SquareFromName(token);
+    to = SquareFromName(token + 2);
+    if (from < 0 || to < 0) {
+        return 0;
+    }
+
+    if (length == 5U) {
+        promotion = (char)tolower((unsigned char)token[4]);
+        if (strchr("qrbn", promotion) == NULL) {
+            return 0;
+        }
+    }
+
+    GenerateLegalMoves(position, &legalMoves);
+    for (size_t index = 0U; index < legalMoves.count; index += 1U) {
+        Move candidate = legalMoves.moves[index];
+        char candidatePromotion = (candidate.flags & MOVE_FLAG_PROMOTION) != 0U
+            ? (char)tolower((unsigned char)candidate.promotion)
+            : '\0';
+
+        if (candidate.from == from && candidate.to == to &&
+            candidatePromotion == promotion) {
+            match = candidate;
+            matchCount += 1U;
+        }
+    }
+
+    if (matchCount != 1U) {
+        return 0;
+    }
+
+    *moveOut = match;
+    return 1;
+}
+
+static int EndsWith(const char *text, size_t length, const char *suffix)
+{
+    size_t suffixLength = strlen(suffix);
+
+    return length >= suffixLength &&
+        memcmp(text + length - suffixLength, suffix, suffixLength) == 0;
+}
+
+/* Chess.com supplies SAN text rather than a FEN in several board variants.
+ * Only notation that can be proved against exactly one generated legal move
+ * is accepted. Decorations do not affect move identity and are stripped; all
+ * chess state still comes from applying the matched legal move. */
+static int NormaliseSanToken(
+    const char *token,
+    char output[MAX_HISTORY_TOKEN_LENGTH + 1U])
+{
+    size_t offset = 0U;
+    size_t length;
+    int changed;
+
+    if (token == NULL || output == NULL) {
+        return 0;
+    }
+
+    for (const unsigned char *cursor = (const unsigned char *)token;
+         *cursor != '\0'; cursor += 1) {
+        if (isspace(*cursor) != 0) {
+            continue;
+        }
+        if (*cursor < 0x20U || *cursor > 0x7eU ||
+            offset >= MAX_HISTORY_TOKEN_LENGTH) {
+            return 0;
+        }
+        output[offset++] = *cursor == '0' || *cursor == 'o'
+            ? 'O'
+            : (char)*cursor;
+    }
+    output[offset] = '\0';
+
+    do {
+        changed = 0;
+        while (offset > 0U &&
+               (output[offset - 1U] == '+' || output[offset - 1U] == '#' ||
+                output[offset - 1U] == '!' || output[offset - 1U] == '?')) {
+            output[--offset] = '\0';
+            changed = 1;
+        }
+
+        length = offset;
+        if (EndsWith(output, length, "e.p.")) {
+            offset -= 4U;
+            output[offset] = '\0';
+            changed = 1;
+        } else if (EndsWith(output, length, "ep")) {
+            offset -= 2U;
+            output[offset] = '\0';
+            changed = 1;
+        }
+    } while (changed);
+
+    return offset > 0U;
+}
+
+static int MatchSanHistoryMove(
+    const Position *position,
+    const char *rawToken,
+    Move *moveOut)
+{
+    char token[MAX_HISTORY_TOKEN_LENGTH + 1U];
+    size_t length;
+    int castleSide = 0;
+    char pieceType = 'P';
+    char promotion = '\0';
+    int target = -1;
+    int capture = 0;
+    int fromFile = -1;
+    int fromRank = -1;
+    size_t prefixStart = 0U;
+    size_t prefixEnd;
+    MoveList legalMoves;
+    Move match = {0};
+    size_t matchCount = 0U;
+
+    if (position == NULL || rawToken == NULL || moveOut == NULL ||
+        !NormaliseSanToken(rawToken, token)) {
+        return 0;
+    }
+
+    length = strlen(token);
+    if (strcmp(token, "O-O") == 0) {
+        castleSide = 1;
+    } else if (strcmp(token, "O-O-O") == 0) {
+        castleSide = -1;
+    } else {
+        if (length >= 2U && token[length - 2U] == '=' &&
+            strchr("QRBNqrbn", token[length - 1U]) != NULL) {
+            promotion = (char)toupper((unsigned char)token[length - 1U]);
+            token[length - 2U] = '\0';
+            length -= 2U;
+        } else if (length >= 3U &&
+                   strchr("QRBNqrbn", token[length - 1U]) != NULL &&
+                   token[length - 3U] >= 'a' && token[length - 3U] <= 'h' &&
+                   token[length - 2U] >= '1' && token[length - 2U] <= '8') {
+            promotion = (char)toupper((unsigned char)token[length - 1U]);
+            token[length - 1U] = '\0';
+            length -= 1U;
+        }
+
+        if (length < 2U) {
+            return 0;
+        }
+
+        target = SquareFromName(token + length - 2U);
+        if (target < 0) {
+            return 0;
+        }
+        prefixEnd = length - 2U;
+
+        if (prefixEnd > 0U && strchr("KQRBN", token[0]) != NULL) {
+            pieceType = token[0];
+            prefixStart = 1U;
+        }
+
+        for (size_t index = prefixStart; index < prefixEnd; index += 1U) {
+            char character = token[index];
+
+            if (character == 'x') {
+                if (capture) {
+                    return 0;
+                }
+                capture = 1;
+            } else if (character >= 'a' && character <= 'h') {
+                if (fromFile >= 0) {
+                    return 0;
+                }
+                fromFile = character - 'a';
+            } else if (character >= '1' && character <= '8') {
+                if (fromRank >= 0) {
+                    return 0;
+                }
+                fromRank = character - '0';
+            } else {
+                return 0;
+            }
+        }
+
+        if (pieceType == 'P') {
+            if ((capture && fromFile < 0) || (!capture && prefixEnd != 0U)) {
+                return 0;
+            }
+        }
+    }
+
+    GenerateLegalMoves(position, &legalMoves);
+    for (size_t index = 0U; index < legalMoves.count; index += 1U) {
+        Move candidate = legalMoves.moves[index];
+        char movingPiece = (char)toupper(
+            (unsigned char)position->board[candidate.from]);
+        char candidatePromotion =
+            (candidate.flags & MOVE_FLAG_PROMOTION) != 0U
+                ? (char)toupper((unsigned char)candidate.promotion)
+                : '\0';
+        int candidateCapture =
+            (candidate.flags & MOVE_FLAG_CAPTURE) != 0U;
+
+        if (castleSide != 0) {
+            int targetFile = castleSide > 0 ? 6 : 2;
+            if ((candidate.flags & MOVE_FLAG_CASTLING) == 0U ||
+                FileOf(candidate.to) != targetFile) {
+                continue;
+            }
+        } else if (movingPiece != pieceType || candidate.to != target ||
+                   candidateCapture != capture ||
+                   candidatePromotion != promotion ||
+                   (fromFile >= 0 && FileOf(candidate.from) != fromFile) ||
+                   (fromRank >= 0 && 8 - RowOf(candidate.from) != fromRank)) {
+            continue;
+        }
+
+        match = candidate;
+        matchCount += 1U;
+    }
+
+    if (matchCount != 1U) {
+        return 0;
+    }
+
+    *moveOut = match;
+    return 1;
+}
+
+static int ReplayHistory(
+    char *historyMoves,
+    const char *notation,
+    const char *initialFen,
+    Position *positionOut,
+    char lastMoveOut[6],
+    size_t *moveCountOut,
+    char *canonicalMovesOut,
+    size_t canonicalMovesSize)
+{
+    Position replay;
+    char *cursor;
+    size_t moveCount = 0U;
+
+    if (historyMoves == NULL || notation == NULL || positionOut == NULL ||
+        lastMoveOut == NULL) {
+        return 0;
+    }
+
+    if (initialFen != NULL) {
+        if (!PositionFromFen(initialFen, &replay)) {
+            return 0;
+        }
+    } else {
+        InitializePosition(&replay);
+    }
+    lastMoveOut[0] = '\0';
+    if (canonicalMovesOut != NULL && canonicalMovesSize > 0U) {
+        canonicalMovesOut[0] = '\0';
+    }
+
+    if (historyMoves[0] == '\0') {
+        *positionOut = replay;
+        if (moveCountOut != NULL) {
+            *moveCountOut = 0U;
+        }
+        return 1;
+    }
+
+    cursor = historyMoves;
+    for (;;) {
+        char *delimiter = strchr(cursor, '|');
+        char *end = delimiter != NULL ? delimiter : cursor + strlen(cursor);
+        Move move;
+        Position next;
+
+        while (cursor < end && isspace((unsigned char)*cursor) != 0) {
+            cursor += 1;
+        }
+        while (end > cursor && isspace((unsigned char)end[-1]) != 0) {
+            end -= 1;
+        }
+
+        if (cursor == end || (size_t)(end - cursor) > MAX_HISTORY_TOKEN_LENGTH ||
+            moveCount >= MAX_HISTORY_MOVES) {
+            return 0;
+        }
+        *end = '\0';
+
+        if (strcmp(notation, "uci") == 0) {
+            if (!MatchUciHistoryMove(&replay, cursor, &move)) {
+                return 0;
+            }
+        } else if (strcmp(notation, "san") == 0) {
+            if (!MatchSanHistoryMove(&replay, cursor, &move)) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+
+        ApplyMoveUnchecked(&replay, move, &next);
+        replay = next;
+        MoveToUci(move, lastMoveOut);
+        if (canonicalMovesOut != NULL && canonicalMovesSize > 0U) {
+            size_t used = strlen(canonicalMovesOut);
+            size_t needed = strlen(lastMoveOut) + (used > 0U ? 1U : 0U);
+            if (used + needed + 1U > canonicalMovesSize) {
+                return 0;
+            }
+            if (used > 0U) {
+                canonicalMovesOut[used++] = '|';
+                canonicalMovesOut[used] = '\0';
+            }
+            (void)snprintf(canonicalMovesOut + used,
+                           canonicalMovesSize - used, "%s", lastMoveOut);
+        }
+        moveCount += 1U;
+
+        if (delimiter == NULL) {
+            break;
+        }
+        cursor = delimiter + 1;
+    }
+
+    *positionOut = replay;
+    if (moveCountOut != NULL) {
+        *moveCountOut = moveCount;
+    }
+    return 1;
+}
+
 static void LogBoard(FILE *logFile, const char board[64], size_t pieceCount)
 {
     fprintf(logFile, "Observed position (%zu pieces):\n", pieceCount);
@@ -2204,7 +2719,10 @@ static int HandleHello(
         "{\"type\":\"hello\",\"ok\":true,\"protocol_version\":%d,"
         "\"host_version\":\"%s\",\"capabilities\":["
         "\"session_v2\",\"state_override\",\"streaming_analysis\","
-        "\"last_move\"]}",
+        "\"last_move\",\"history_reconciliation\","
+        "\"state_revision\",\"state_source\","
+        "\"analysis_lab\",\"analysis_target\",\"local_game_review\","
+        "\"review_explorer\",\"review_library\"]}",
         CHESSLISTENER_PROTOCOL_VERSION,
         CHESSLISTENER_HOST_VERSION);
 
@@ -2228,10 +2746,20 @@ static void ResetSessionTracking(SessionState *session)
     session->lastMove[0] = '\0';
     memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
     session->hasPendingBoard = 0;
+    session->pendingIsMismatch = 0;
+    session->pendingRecoveryFailed = 0;
+    session->pendingSnapshotSequence = 0U;
     session->lastSnapshotSequence = 0U;
     session->hasSnapshotSequence = 0;
+    session->lastHistorySequence = 0U;
+    session->hasHistorySequence = 0;
+    (void)snprintf(
+        session->stateSource,
+        sizeof(session->stateSource),
+        "inferred");
     session->visuallyFlipped = 0;
     session->hasOrientation = 0;
+    memset(&session->explorer, 0, sizeof(session->explorer));
 }
 
 static int RequireMatchingSession(
@@ -2283,6 +2811,9 @@ static void HandleSessionStart(
     }
 
     if (session->active) {
+        if (session->explorer.active) {
+            AnalysisExploreDestroy(session->explorer.id, "session_replaced");
+        }
         AnalysisSessionEnd("replaced");
     }
 
@@ -2305,6 +2836,7 @@ static void HandlePositionSnapshot(
 {
     int visuallyFlipped;
     int force = 0;
+    int recovery = 0;
     uint64_t snapshotSequence;
     char boardString[BOARD_SQUARE_COUNT + 1U];
 
@@ -2352,6 +2884,12 @@ static void HandlePositionSnapshot(
         return;
     }
 
+    if (FindJsonFieldValue(message, "recovery") != NULL &&
+        !ExtractJsonBoolField(message, "recovery", &recovery)) {
+        (void)WriteResponse(response, 0, "invalid_recovery", NULL, NULL);
+        return;
+    }
+
     size_t pieceCount = 0U;
 
     if (!ValidateBoardString(boardString, &pieceCount)) {
@@ -2378,6 +2916,15 @@ static void HandlePositionSnapshot(
             boardString,
             BOARD_SQUARE_COUNT) == 0
     ) {
+        if (session->pendingIsMismatch) {
+            memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
+            session->hasPendingBoard = 0;
+            session->pendingIsMismatch = 0;
+            session->pendingRecoveryFailed = 0;
+            session->pendingSnapshotSequence = 0U;
+            AnalysisSetSynchronising(0, NULL);
+        }
+
         if (force) {
             char fen[MAX_FEN_LENGTH];
 
@@ -2389,7 +2936,8 @@ static void HandlePositionSnapshot(
             AnalysisPublish(
                 fen,
                 visuallyFlipped,
-                session->lastMove[0] != '\0' ? session->lastMove : NULL);
+                session->lastMove[0] != '\0' ? session->lastMove : NULL,
+                session->stateSource);
             fprintf(logFile, "Refreshed forced duplicate position.\n");
             fflush(logFile);
             (void)WriteResponse(
@@ -2419,6 +2967,10 @@ static void HandlePositionSnapshot(
         InitializePosition(&session->position);
         session->hasPosition = 1;
         session->lastMove[0] = '\0';
+        (void)snprintf(
+            session->stateSource,
+            sizeof(session->stateSource),
+            "exact");
 
         if (!PositionToFen(&session->position, fen)) {
             (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
@@ -2426,13 +2978,17 @@ static void HandlePositionSnapshot(
         }
 
         session->hasPendingBoard = 0;
+        session->pendingIsMismatch = 0;
+        session->pendingRecoveryFailed = 0;
+        session->pendingSnapshotSequence = 0U;
+        AnalysisSetSynchronising(0, NULL);
 
         fprintf(logFile, "\n=== New standard game ===\n");
         LogBoard(logFile, session->position.board, pieceCount);
         fprintf(logFile, "FEN: %s\n", fen);
         fflush(logFile);
 
-        AnalysisPublish(fen, visuallyFlipped, NULL);
+        AnalysisPublish(fen, visuallyFlipped, NULL, session->stateSource);
 
         (void)WriteResponse(response, 1, "game_started", fen, NULL);
         return;
@@ -2459,7 +3015,14 @@ static void HandlePositionSnapshot(
                 movedColor);
             session->hasPosition = 1;
             session->hasPendingBoard = 0;
+            session->pendingIsMismatch = 0;
+            session->pendingRecoveryFailed = 0;
+            session->pendingSnapshotSequence = 0U;
             session->lastMove[0] = '\0';
+            (void)snprintf(
+                session->stateSource,
+                sizeof(session->stateSource),
+                "inferred");
 
             if (!PositionToFen(&session->position, fen)) {
                 (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
@@ -2475,7 +3038,9 @@ static void HandlePositionSnapshot(
             );
             fflush(logFile);
 
-            AnalysisPublish(fen, visuallyFlipped, NULL);
+            AnalysisSetSynchronising(0, NULL);
+            AnalysisPublish(
+                fen, visuallyFlipped, NULL, session->stateSource);
 
             (void)WriteResponse(response, 1, "game_adopted", fen, NULL);
             return;
@@ -2483,6 +3048,9 @@ static void HandlePositionSnapshot(
 
         memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
         session->hasPendingBoard = 1;
+        session->pendingIsMismatch = 0;
+        session->pendingRecoveryFailed = 0;
+        session->pendingSnapshotSequence = snapshotSequence;
 
         fprintf(
             logFile,
@@ -2496,10 +3064,73 @@ static void HandlePositionSnapshot(
         return;
     }
 
+    if (session->pendingIsMismatch && !recovery) {
+        /* Once continuity is broken, a later layout that happens to be one
+         * legal ply from the old trusted position is not proof that every
+         * omitted move was undone. After an explicit bounded recovery has
+         * failed, one uniquely legal move between consecutive observed boards
+         * is enough to resume inferred tracking without adopting an idle or
+         * ambiguous board. Exact history remains the preferred authority. */
+        Move inferredMove;
+        Position inferredResult;
+
+        if (session->pendingRecoveryFailed &&
+            session->hasPendingBoard &&
+            InferUniquePendingTransition(
+                session->pendingBoard,
+                boardString,
+                &inferredMove,
+                &inferredResult)) {
+            char fen[MAX_FEN_LENGTH];
+            char uci[6];
+
+            if (!PositionToFen(&inferredResult, fen)) {
+                (void)WriteResponse(response, 0, "fen_error", NULL, NULL);
+                return;
+            }
+
+            MoveToUci(inferredMove, uci);
+            session->position = inferredResult;
+            (void)snprintf(
+                session->lastMove, sizeof(session->lastMove), "%s", uci);
+            (void)snprintf(
+                session->stateSource,
+                sizeof(session->stateSource),
+                "inferred");
+            memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
+            session->hasPendingBoard = 0;
+            session->pendingIsMismatch = 0;
+            session->pendingRecoveryFailed = 0;
+            session->pendingSnapshotSequence = 0U;
+            AnalysisSetSynchronising(0, NULL);
+
+            fprintf(
+                logFile,
+                "\nConsecutive-board fallback recovered inferred move: %s\n",
+                uci);
+            LogBoard(logFile, session->position.board, pieceCount);
+            fprintf(logFile, "FEN: %s\n", fen);
+            fflush(logFile);
+
+            AnalysisPublish(
+                fen, visuallyFlipped, uci, session->stateSource);
+            (void)WriteResponse(response, 1, "move_recorded", fen, uci);
+            return;
+        }
+
+        memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
+        session->hasPendingBoard = 1;
+        session->pendingSnapshotSequence = snapshotSequence;
+        AnalysisSetSynchronising(1, "Synchronising\342\200\246");
+        (void)WriteResponse(response, 0, "synchronising", NULL, NULL);
+        return;
+    }
+
     Move matchingMove;
     Position result;
     size_t matchCount = 0U;
     int plies = 1;
+    int recoveredFromMismatch = session->pendingIsMismatch;
 
     if (!FindMatchingMove(
         &session->position,
@@ -2507,31 +3138,57 @@ static void HandlePositionSnapshot(
         &matchingMove,
         &result,
         &matchCount)) {
-        /*
-         * No single move explains the new board. Before giving up, look for
-         * a short sequence: snapshots get skipped whenever moves come in
-         * faster than the content script's debounce.
-         */
-        if (
-            matchCount == 0U &&
+        /* Ordinary board capture stops here. It must never pay for a tree
+         * search: keep showing the last trustworthy evaluation while the DOM
+         * history reconciler gets a chance to provide exact state. */
+        if (!recovery) {
+            fprintf(
+                logFile,
+                "Transition needs reconciliation: %zu legal one-ply moves "
+                "matched. Holding trusted state.\n",
+                matchCount);
+            LogBoardDifference(
+                logFile, session->position.board, boardString);
+            LogBoard(logFile, boardString, pieceCount);
+            fflush(logFile);
+
+            memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
+            session->hasPendingBoard = 1;
+            session->pendingIsMismatch = 1;
+            session->pendingRecoveryFailed = 0;
+            session->pendingSnapshotSequence = snapshotSequence;
+            AnalysisSetSynchronising(1, "Synchronising\342\200\246");
+
+            (void)WriteResponse(response, 0, "synchronising", NULL, NULL);
+            return;
+        }
+
+        /* Only the explicitly delayed recovery message may use bounded DFS.
+         * One node budget and one monotonic deadline are shared by every
+         * iterative-deepening depth. */
+        memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
+        session->hasPendingBoard = 1;
+        session->pendingIsMismatch = 1;
+        session->pendingSnapshotSequence = snapshotSequence;
+
+        if (matchCount == 0U &&
             FindMoveSequence(
                 &session->position,
                 boardString,
                 &matchingMove,
                 &result,
-                &plies)
-        ) {
+                &plies)) {
             fprintf(
                 logFile,
-                "\nCaught up: %d plies were played between snapshots.\n",
+                "\nDelayed recovery caught up %d plies.\n",
                 plies
             );
             fflush(logFile);
         } else {
             fprintf(
                 logFile,
-                "Unreachable transition: %zu single moves matched, no "
-                "sequence up to %d plies. Resynchronising.\n",
+                "Delayed recovery did not prove a path: %zu single moves "
+                "matched, bounded search through %d plies failed.\n",
                 matchCount,
                 MAX_CATCHUP_PLIES
             );
@@ -2540,25 +3197,28 @@ static void HandlePositionSnapshot(
             LogBoard(logFile, boardString, pieceCount);
             fflush(logFile);
 
-            /*
-             * Keeping the stale position here was the real bug: every later
-             * frame then failed against it too, so one skipped snapshot
-             * killed the tool for the rest of the game. Drop back to the
-             * mid-game join path instead -- hold this board, and the next
-             * frame re-establishes whose turn it is. One move of downtime
-             * rather than all of them.
-             */
-            session->hasPosition = 0;
-            session->lastMove[0] = '\0';
-            memcpy(session->pendingBoard, boardString, BOARD_SQUARE_COUNT);
-            session->hasPendingBoard = 1;
-
-            (void)WriteResponse(response, 0, "resynchronising", NULL, NULL);
+            AnalysisSetSynchronising(1, "Synchronising\342\200\246");
+            session->pendingRecoveryFailed = 1;
+            (void)WriteResponse(
+                response, 0, "recovery_pending", NULL, NULL);
             return;
         }
     }
 
     session->position = result;
+
+    if (recovery && recoveredFromMismatch) {
+        (void)snprintf(
+            session->stateSource,
+            sizeof(session->stateSource),
+            "inferred");
+    }
+    memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
+    session->hasPendingBoard = 0;
+    session->pendingIsMismatch = 0;
+    session->pendingRecoveryFailed = 0;
+    session->pendingSnapshotSequence = 0U;
+    AnalysisSetSynchronising(0, NULL);
 
     char fen[MAX_FEN_LENGTH];
     char uci[6];
@@ -2575,9 +3235,600 @@ static void HandlePositionSnapshot(
     fprintf(logFile, "FEN: %s\n", fen);
     fflush(logFile);
 
-    AnalysisPublish(fen, visuallyFlipped, uci);
+    AnalysisPublish(fen, visuallyFlipped, uci, session->stateSource);
 
     (void)WriteResponse(response, 1, "move_recorded", fen, uci);
+}
+
+static void HandleHistoryReconcile(
+    const char *message,
+    FILE *logFile,
+    SessionState *session,
+    char response[MAX_RESPONSE_LENGTH])
+{
+    uint64_t historySequence;
+    uint64_t snapshotSequence;
+    int historyComplete;
+    char displayedBoard[BOARD_SQUARE_COUNT + 1U];
+    char notation[8];
+    char historyMoves[MAX_HISTORY_TEXT_LENGTH + 1U];
+    char initialFen[MAX_FEN_LENGTH];
+    const char *initialFenValue = NULL;
+    Position replay;
+    char replayFen[MAX_FEN_LENGTH];
+    char currentFen[MAX_FEN_LENGTH];
+    char lastMove[6];
+    char canonicalMoves[MAX_HISTORY_TEXT_LENGTH + 1U];
+    char canonicalInitialFen[MAX_FEN_LENGTH];
+    size_t moveCount = 0U;
+    int associated = 0;
+    int sameFen = 0;
+
+    if (!RequireMatchingSession(message, session, response)) {
+        return;
+    }
+
+    if (!ExtractJsonUint64Field(message, "history_seq", &historySequence)) {
+        (void)WriteResponse(response, 0, "invalid_history_seq", NULL, NULL);
+        return;
+    }
+    if (session->hasHistorySequence &&
+        historySequence <= session->lastHistorySequence) {
+        (void)WriteResponse(response, 0, "stale_history", NULL, NULL);
+        return;
+    }
+
+    if (!ExtractJsonUint64Field(message, "snapshot_seq", &snapshotSequence) ||
+        !ExtractJsonBoolField(
+            message, "history_complete", &historyComplete) ||
+        !historyComplete ||
+        !ExtractJsonStringField(
+            message,
+            "displayed_board",
+            displayedBoard,
+            sizeof(displayedBoard)) ||
+        !ValidateBoardString(displayedBoard, NULL) ||
+        !ExtractJsonStringField(
+            message, "history_notation", notation, sizeof(notation)) ||
+        (strcmp(notation, "uci") != 0 && strcmp(notation, "san") != 0) ||
+        !ExtractJsonStringField(
+            message,
+            "history_moves",
+            historyMoves,
+            sizeof(historyMoves))) {
+        (void)WriteResponse(response, 0, "invalid_history", NULL, NULL);
+        return;
+    }
+
+    if (FindJsonFieldValue(message, "initial_fen") != NULL) {
+        if (!ExtractJsonStringField(
+                message, "initial_fen", initialFen, sizeof(initialFen))) {
+            (void)WriteResponse(
+                response, 0, "invalid_initial_fen", NULL, NULL);
+            return;
+        }
+        initialFenValue = initialFen;
+    }
+
+    /* A history result is useful only for the exact DOM snapshot it was
+     * captured beside. Never let a slow replay roll a newer board backward. */
+    if (!session->hasSnapshotSequence ||
+        snapshotSequence != session->lastSnapshotSequence) {
+        (void)WriteResponse(
+            response, 0, "history_snapshot_mismatch", NULL, NULL);
+        return;
+    }
+
+    if (session->hasPosition &&
+        BoardsEqual(session->position.board, displayedBoard)) {
+        associated = 1;
+    }
+    if (session->hasPendingBoard &&
+        session->pendingSnapshotSequence == snapshotSequence &&
+        BoardsEqual(session->pendingBoard, displayedBoard)) {
+        associated = 1;
+    }
+    if (!associated) {
+        (void)WriteResponse(
+            response, 0, "history_board_mismatch", NULL, NULL);
+        return;
+    }
+
+    /* From here onward replay is transactional: no session or overlay state
+     * changes unless every token is legal and the final pieces match. */
+    if (!ReplayHistory(
+            historyMoves,
+            notation,
+            initialFenValue,
+            &replay,
+            lastMove,
+            &moveCount,
+            canonicalMoves,
+            sizeof(canonicalMoves)) ||
+        !BoardsEqual(replay.board, displayedBoard) ||
+        !PositionToFen(&replay, replayFen)) {
+        fprintf(
+            logFile,
+            "Rejected history %llu: illegal/incomplete replay or final "
+            "board mismatch.\n",
+            (unsigned long long)historySequence);
+        fflush(logFile);
+        (void)WriteResponse(response, 0, "history_replay_failed", NULL, NULL);
+        return;
+    }
+
+    session->lastHistorySequence = historySequence;
+    session->hasHistorySequence = 1;
+
+    if (session->hasPosition &&
+        PositionToFen(&session->position, currentFen) &&
+        strcmp(currentFen, replayFen) == 0) {
+        sameFen = 1;
+    }
+
+    session->position = replay;
+    session->hasPosition = 1;
+    (void)snprintf(session->lastMove, sizeof(session->lastMove), "%s", lastMove);
+    (void)snprintf(
+        session->stateSource,
+        sizeof(session->stateSource),
+        "exact");
+    memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
+    session->hasPendingBoard = 0;
+    session->pendingIsMismatch = 0;
+    session->pendingRecoveryFailed = 0;
+    session->pendingSnapshotSequence = 0U;
+    AnalysisSetSynchronising(0, NULL);
+
+    if (initialFenValue != NULL) {
+        (void)snprintf(canonicalInitialFen, sizeof(canonicalInitialFen),
+                       "%s", initialFenValue);
+    } else {
+        Position initialPosition;
+        InitializePosition(&initialPosition);
+        if (!PositionToFen(&initialPosition, canonicalInitialFen)) {
+            (void)snprintf(canonicalInitialFen, sizeof(canonicalInitialFen),
+                           "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/"
+                           "RNBQKBNR w KQkq - 0 1");
+        }
+    }
+    AnalysisUpdateGameRecord(
+        canonicalInitialFen, canonicalMoves, moveCount, "*");
+
+    if (sameFen) {
+        /* Provenance changed, but chess state did not. Preserve the running
+         * engine revision and its accumulated depth. */
+        AnalysisUpdateStateSource(session->stateSource);
+        fprintf(
+            logFile,
+            "History %llu confirmed exact state (%zu plies) without "
+            "restarting analysis.\n",
+            (unsigned long long)historySequence,
+            moveCount);
+        fflush(logFile);
+        (void)WriteResponse(
+            response, 1, "history_confirmed", replayFen, NULL);
+        return;
+    }
+
+    fprintf(
+        logFile,
+        "History %llu reconciled exact state (%zu plies): %s\n",
+        (unsigned long long)historySequence,
+        moveCount,
+        replayFen);
+    fflush(logFile);
+    AnalysisPublish(
+        replayFen,
+        session->hasOrientation ? session->visuallyFlipped : 0,
+        lastMove[0] != '\0' ? lastMove : NULL,
+        session->stateSource);
+    (void)WriteResponse(
+        response,
+        1,
+        "history_reconciled",
+        replayFen,
+        lastMove[0] != '\0' ? lastMove : NULL);
+}
+
+static uint64_t AllocateExplorerBranchId(void)
+{
+    uint64_t id = nextExplorerBranchId;
+
+    nextExplorerBranchId += 1U;
+    if (nextExplorerBranchId == 0U ||
+        nextExplorerBranchId > UINT64_C(9007199254740991)) {
+        nextExplorerBranchId = 1U;
+    }
+    return id;
+}
+
+static int ParseUnsignedToken(const char **cursorInOut, uint64_t maximum,
+                              int allowZero, uint64_t *valueOut,
+                              int finalToken)
+{
+    const char *cursor;
+    char *end;
+    unsigned long long value;
+
+    if (cursorInOut == NULL || *cursorInOut == NULL || valueOut == NULL) {
+        return 0;
+    }
+    cursor = *cursorInOut;
+    if (*cursor == '\0' || isdigit((unsigned char)*cursor) == 0) {
+        return 0;
+    }
+
+    errno = 0;
+    value = strtoull(cursor, &end, 10);
+    if (end == cursor || errno == ERANGE || (!allowZero && value == 0ULL) ||
+        value > maximum) {
+        return 0;
+    }
+    if (finalToken) {
+        if (*end != '\0') return 0;
+    } else {
+        if (*end != ' ' || end[1] == '\0') return 0;
+        end += 1;
+    }
+    *cursorInOut = end;
+    *valueOut = (uint64_t)value;
+    return 1;
+}
+
+static int ParseExplorerBranchNode(const char *payload, uint64_t *branchId,
+                                   unsigned int *nodeId)
+{
+    const char *cursor = payload;
+    uint64_t node;
+
+    return ParseUnsignedToken(
+               &cursor, UINT64_C(9007199254740991), 0, branchId, 0) &&
+        ParseUnsignedToken(
+               &cursor, MAX_EXPLORER_NODES - 1U, 1, &node, 1) &&
+        ((*nodeId = (unsigned int)node), 1);
+}
+
+static int ParseExplorerMovePayload(const char *payload, uint64_t *branchId,
+                                    unsigned int *nodeId, char uci[6])
+{
+    const char *cursor = payload;
+    uint64_t node;
+    size_t length;
+
+    if (!ParseUnsignedToken(
+            &cursor, UINT64_C(9007199254740991), 0, branchId, 0) ||
+        !ParseUnsignedToken(
+            &cursor, MAX_EXPLORER_NODES - 1U, 1, &node, 0)) {
+        return 0;
+    }
+    length = strlen(cursor);
+    if ((length != 4U && length != 5U) || length >= 6U) {
+        return 0;
+    }
+    memcpy(uci, cursor, length + 1U);
+    *nodeId = (unsigned int)node;
+    return 1;
+}
+
+static int WriteExploreResponse(char response[MAX_RESPONSE_LENGTH],
+                                const char *reason, uint64_t branchId,
+                                unsigned int nodeId, const char *fen,
+                                const char *lastMove)
+{
+    int written = snprintf(
+        response, MAX_RESPONSE_LENGTH,
+        "{\"ok\":true,\"accepted\":true,\"reason\":\"%s\","
+        "\"branch_id\":%" PRIu64 ",\"node_id\":%u%s%s%s%s%s}",
+        reason, branchId, nodeId,
+        fen != NULL ? ",\"fen\":\"" : "",
+        fen != NULL ? fen : "",
+        fen != NULL ? "\"" : "",
+        lastMove != NULL && *lastMove != '\0' ? ",\"last\":\"" : "",
+        lastMove != NULL && *lastMove != '\0' ? lastMove : "");
+
+    if (written < 0 || (size_t)written >= MAX_RESPONSE_LENGTH) {
+        return 0;
+    }
+    if (lastMove != NULL && *lastMove != '\0') {
+        size_t length = (size_t)written;
+        if (length < 1U || response[length - 1U] != '}' ||
+            length + 1U >= MAX_RESPONSE_LENGTH) {
+            return 0;
+        }
+        response[length - 1U] = '\"';
+        response[length] = '}';
+        response[length + 1U] = '\0';
+    }
+    return 1;
+}
+
+static void RejectExplorer(char response[MAX_RESPONSE_LENGTH],
+                           const char *action, const char *reason,
+                           const char *text, uint64_t branchId,
+                           unsigned int nodeId)
+{
+    AnalysisReportExploreRejected(
+        action, reason, text, (unsigned long long)branchId, nodeId);
+    (void)WriteResponse(response, 0, reason, NULL, NULL);
+}
+
+static int ExplorerNodeFen(const ExplorerBranch *branch, unsigned int nodeId,
+                           char fen[MAX_FEN_LENGTH])
+{
+    return branch != NULL && nodeId < branch->nodeCount &&
+        PositionToFen(&branch->nodes[nodeId].position, fen);
+}
+
+static void HandleExploreStart(const char *message, FILE *logFile,
+                               SessionState *session,
+                               char response[MAX_RESPONSE_LENGTH])
+{
+    char payload[MAX_FEN_LENGTH + MAX_EXPLORER_START_PLIES * 6U + 2U];
+    char currentFen[MAX_FEN_LENGTH];
+    char finalFen[MAX_FEN_LENGTH];
+    char *path;
+    Position base;
+    ExplorerBranch candidate;
+    unsigned int parent = 0U;
+
+    if (!session->hasPosition ||
+        !ExtractJsonStringField(message, "payload", payload, sizeof(payload))) {
+        RejectExplorer(response, "start", "no_live_position",
+                       "A trustworthy live position is required.", 0U, 0U);
+        return;
+    }
+
+    path = strchr(payload, '|');
+    if (path != NULL) {
+        *path = '\0';
+        path += 1;
+        if (strchr(path, '|') != NULL) {
+            RejectExplorer(response, "start", "invalid_path",
+                           "The requested line is malformed.", 0U, 0U);
+            return;
+        }
+    }
+
+    if (!PositionFromFen(payload, &base) ||
+        !PositionToFen(&base, finalFen) || strcmp(payload, finalFen) != 0) {
+        RejectExplorer(response, "start", "invalid_fen",
+                       "The analysis position is not a valid canonical FEN.",
+                       0U, 0U);
+        return;
+    }
+    if (!PositionToFen(&session->position, currentFen) ||
+        strcmp(finalFen, currentFen) != 0) {
+        RejectExplorer(response, "start", "stale_base",
+                       "The live position changed; return Live and try again.",
+                       0U, 0U);
+        return;
+    }
+
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.active = 1;
+    candidate.targeting = 1;
+    candidate.nodeCount = 1U;
+    candidate.nodes[0].position = base;
+    snprintf(candidate.baseSource, sizeof(candidate.baseSource), "%s",
+             session->stateSource);
+
+    if (path != NULL && *path != '\0') {
+        char *cursor = path;
+        unsigned int plyCount = 0U;
+
+        while (*cursor != '\0') {
+            char *comma = strchr(cursor, ',');
+            char token[6];
+            size_t length = comma != NULL
+                ? (size_t)(comma - cursor) : strlen(cursor);
+            Move move;
+            Position next;
+
+            if (++plyCount > MAX_EXPLORER_START_PLIES ||
+                (length != 4U && length != 5U) || length >= sizeof(token)) {
+                RejectExplorer(response, "start", "invalid_path",
+                               "The requested line is too long or malformed.",
+                               0U, 0U);
+                return;
+            }
+            memcpy(token, cursor, length);
+            token[length] = '\0';
+            if (!MatchUciHistoryMove(
+                    &candidate.nodes[parent].position, token, &move)) {
+                RejectExplorer(response, "start", "illegal_move",
+                               "The requested line contains an illegal move.",
+                               0U, 0U);
+                return;
+            }
+            ApplyMoveUnchecked(&candidate.nodes[parent].position, move, &next);
+            candidate.nodes[candidate.nodeCount].position = next;
+            candidate.nodes[candidate.nodeCount].parent = parent;
+            MoveToUci(move, candidate.nodes[candidate.nodeCount].uci);
+            parent = candidate.nodeCount;
+            candidate.nodeCount += 1U;
+            if (comma == NULL) break;
+            cursor = comma + 1;
+            if (*cursor == '\0') {
+                RejectExplorer(response, "start", "invalid_path",
+                               "The requested line is malformed.", 0U, 0U);
+                return;
+            }
+        }
+    } else if (path != NULL && *path == '\0') {
+        RejectExplorer(response, "start", "invalid_path",
+                       "The requested line is empty.", 0U, 0U);
+        return;
+    }
+
+    candidate.id = AllocateExplorerBranchId();
+    candidate.selectedNode = parent;
+    if (!ExplorerNodeFen(&candidate, parent, finalFen)) {
+        RejectExplorer(response, "start", "invalid_position",
+                       "The branch position could not be encoded.", 0U, 0U);
+        return;
+    }
+
+    if (session->explorer.active) {
+        AnalysisExploreDestroy(session->explorer.id, "replaced");
+    }
+    session->explorer = candidate;
+    AnalysisExploreStart(
+        candidate.id, parent, finalFen,
+        session->hasOrientation ? session->visuallyFlipped : 0,
+        parent != 0U ? candidate.nodes[parent].uci : NULL,
+        candidate.baseSource);
+    fprintf(logFile, "Explorer branch %" PRIu64 " started at node %u.\n",
+            candidate.id, parent);
+    fflush(logFile);
+    (void)WriteExploreResponse(
+        response, "explore_started", candidate.id, parent, finalFen,
+        parent != 0U ? candidate.nodes[parent].uci : NULL);
+}
+
+static int ValidateExplorerSelection(SessionState *session, uint64_t branchId,
+                                     unsigned int nodeId,
+                                     char response[MAX_RESPONSE_LENGTH],
+                                     const char *action)
+{
+    if (!session->explorer.active || session->explorer.id != branchId) {
+        RejectExplorer(response, action, "stale_branch",
+                       "That analysis branch is no longer active.",
+                       branchId, nodeId);
+        return 0;
+    }
+    if (nodeId >= session->explorer.nodeCount) {
+        RejectExplorer(response, action, "unknown_node",
+                       "That analysis position no longer exists.",
+                       branchId, nodeId);
+        return 0;
+    }
+    return 1;
+}
+
+static void HandleExploreMove(const char *message, FILE *logFile,
+                              SessionState *session,
+                              char response[MAX_RESPONSE_LENGTH])
+{
+    char payload[96];
+    char requested[6];
+    char canonical[6];
+    char fen[MAX_FEN_LENGTH];
+    uint64_t branchId = 0U;
+    unsigned int parent = 0U;
+    unsigned int selected = 0U;
+    Move move;
+    Position next;
+    ExplorerBranch *branch = &session->explorer;
+
+    if (!ExtractJsonStringField(message, "payload", payload, sizeof(payload)) ||
+        !ParseExplorerMovePayload(payload, &branchId, &parent, requested)) {
+        RejectExplorer(response, "move", "invalid_payload",
+                       "Expected branch, node and a UCI move.", 0U, 0U);
+        return;
+    }
+    if (!ValidateExplorerSelection(
+            session, branchId, parent, response, "move")) return;
+    if (!MatchUciHistoryMove(&branch->nodes[parent].position, requested, &move)) {
+        RejectExplorer(response, "move", "illegal_move",
+                       "That move is not legal in this position.",
+                       branchId, parent);
+        return;
+    }
+    MoveToUci(move, canonical);
+    for (unsigned int index = 1U; index < branch->nodeCount; index += 1U) {
+        if (branch->nodes[index].parent == parent &&
+            strcmp(branch->nodes[index].uci, canonical) == 0) {
+            selected = index;
+            break;
+        }
+    }
+    if (selected == 0U) {
+        if (branch->nodeCount >= MAX_EXPLORER_NODES) {
+            RejectExplorer(response, "move", "branch_full",
+                           "This branch has reached its 256-position limit.",
+                           branchId, parent);
+            return;
+        }
+        ApplyMoveUnchecked(&branch->nodes[parent].position, move, &next);
+        selected = branch->nodeCount++;
+        branch->nodes[selected].position = next;
+        branch->nodes[selected].parent = parent;
+        snprintf(branch->nodes[selected].uci,
+                 sizeof(branch->nodes[selected].uci), "%s", canonical);
+    }
+    branch->selectedNode = selected;
+    branch->targeting = 1;
+    (void)ExplorerNodeFen(branch, selected, fen);
+    AnalysisExploreSelect(
+        branchId, selected, fen,
+        session->hasOrientation ? session->visuallyFlipped : 0,
+        branch->nodes[selected].uci, branch->baseSource, "move");
+    fprintf(logFile, "Explorer branch %" PRIu64 " selected node %u via %s.\n",
+            branchId, selected, canonical);
+    fflush(logFile);
+    (void)WriteExploreResponse(response, "explore_move_applied", branchId,
+                               selected, fen, canonical);
+}
+
+static void HandleExploreSelect(const char *message, SessionState *session,
+                                char response[MAX_RESPONSE_LENGTH],
+                                const char *action)
+{
+    char payload[80];
+    char fen[MAX_FEN_LENGTH];
+    uint64_t branchId = 0U;
+    unsigned int nodeId = 0U;
+    ExplorerBranch *branch = &session->explorer;
+
+    if (!ExtractJsonStringField(message, "payload", payload, sizeof(payload)) ||
+        !ParseExplorerBranchNode(payload, &branchId, &nodeId)) {
+        RejectExplorer(response, action, "invalid_payload",
+                       "Expected a branch and node number.", 0U, 0U);
+        return;
+    }
+    if (!ValidateExplorerSelection(
+            session, branchId, nodeId, response, action)) return;
+    (void)ExplorerNodeFen(branch, nodeId, fen);
+    branch->selectedNode = nodeId;
+    branch->targeting = 1;
+    AnalysisExploreSelect(
+        branchId, nodeId, fen,
+        session->hasOrientation ? session->visuallyFlipped : 0,
+        nodeId != 0U ? branch->nodes[nodeId].uci : NULL,
+        branch->baseSource, action);
+    (void)WriteExploreResponse(
+        response,
+        strcmp(action, "resume") == 0
+            ? "explore_resumed" : "explore_position_selected",
+        branchId, nodeId, fen,
+        nodeId != 0U ? branch->nodes[nodeId].uci : NULL);
+}
+
+static void HandleExploreLive(const char *message, SessionState *session,
+                              char response[MAX_RESPONSE_LENGTH])
+{
+    char payload[48];
+    const char *cursor;
+    uint64_t branchId = 0U;
+
+    if (!ExtractJsonStringField(message, "payload", payload, sizeof(payload))) {
+        RejectExplorer(response, "live", "invalid_payload",
+                       "Expected an analysis branch number.", 0U, 0U);
+        return;
+    }
+    cursor = payload;
+    if (!ParseUnsignedToken(
+            &cursor, UINT64_C(9007199254740991), 0, &branchId, 1) ||
+        !ValidateExplorerSelection(
+            session, branchId, session->explorer.selectedNode,
+            response, "live")) return;
+
+    session->explorer.targeting = 0;
+    AnalysisExploreLive(branchId);
+    (void)WriteExploreResponse(
+        response, "explore_live", branchId,
+        session->explorer.selectedNode, NULL, NULL);
 }
 
 static void HandleSessionCommand(
@@ -2595,6 +3846,27 @@ static void HandleSessionCommand(
     if (!ExtractJsonStringField(
             message, "command", command, sizeof(command))) {
         (void)WriteResponse(response, 0, "invalid_command", NULL, NULL);
+        return;
+    }
+
+    if (strcmp(command, "explore_start") == 0) {
+        HandleExploreStart(message, logFile, session, response);
+        return;
+    }
+    if (strcmp(command, "explore_move") == 0) {
+        HandleExploreMove(message, logFile, session, response);
+        return;
+    }
+    if (strcmp(command, "explore_goto") == 0) {
+        HandleExploreSelect(message, session, response, "goto");
+        return;
+    }
+    if (strcmp(command, "explore_live") == 0) {
+        HandleExploreLive(message, session, response);
+        return;
+    }
+    if (strcmp(command, "explore_resume") == 0) {
+        HandleExploreSelect(message, session, response, "resume");
         return;
     }
 
@@ -2620,6 +3892,14 @@ static void HandleSessionCommand(
         session->lastMove[0] = '\0';
         memset(session->pendingBoard, 0, sizeof(session->pendingBoard));
         session->hasPendingBoard = 0;
+        session->pendingIsMismatch = 0;
+        session->pendingRecoveryFailed = 0;
+        session->pendingSnapshotSequence = 0U;
+        (void)snprintf(
+            session->stateSource,
+            sizeof(session->stateSource),
+            "manual");
+        AnalysisSetSynchronising(0, NULL);
 
         fprintf(
             logFile,
@@ -2630,7 +3910,8 @@ static void HandleSessionCommand(
         AnalysisPublish(
             canonicalFen,
             session->hasOrientation ? session->visuallyFlipped : 0,
-            NULL);
+            NULL,
+            session->stateSource);
         AnalysisReportRecovery(
             "set_fen", 1, "Authoritative position applied.");
         (void)WriteResponse(
@@ -2706,6 +3987,9 @@ static void HandleSessionEnd(
 
     fprintf(logFile, "=== Session ended: %s (%s) ===\n", session->id, reason);
     fflush(logFile);
+    if (session->explorer.active) {
+        AnalysisExploreDestroy(session->explorer.id, reason);
+    }
     AnalysisSessionEnd(reason);
     memset(session, 0, sizeof(*session));
     (void)WriteResponse(response, 1, "session_ended", NULL, NULL);
@@ -2727,6 +4011,8 @@ static void HandleMessage(
         HandleSessionStart(message, logFile, session, response);
     } else if (strcmp(type, "position_snapshot") == 0) {
         HandlePositionSnapshot(message, logFile, session, response);
+    } else if (strcmp(type, "history_reconcile") == 0) {
+        HandleHistoryReconcile(message, logFile, session, response);
     } else if (strcmp(type, "session_command") == 0) {
         HandleSessionCommand(message, logFile, session, response);
     } else if (strcmp(type, "session_end") == 0) {
@@ -2835,6 +4121,10 @@ int main(void)
     }
 
     if (session.active) {
+        if (session.explorer.active) {
+            AnalysisExploreDestroy(
+                session.explorer.id, "browser_disconnected");
+        }
         AnalysisSessionEnd("browser_disconnected");
     }
     AnalysisStop();

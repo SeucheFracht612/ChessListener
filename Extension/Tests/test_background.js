@@ -10,7 +10,12 @@ const BOARD_B = `K${".".repeat(30)}Q${".".repeat(31)}k`;
 const REQUIRED_CAPABILITIES = [
     "session_v2",
     "state_override",
-    "streaming_analysis"
+    "streaming_analysis",
+    "history_reconciliation",
+    "state_revision",
+    "state_source",
+    "analysis_lab",
+    "analysis_target"
 ];
 
 function loadBackground(options = {}) {
@@ -75,7 +80,7 @@ function loadBackground(options = {}) {
                     return makePort();
                 },
                 getManifest() {
-                    return { version: "0.3.0" };
+                    return { version: "0.9.0" };
                 },
                 sendMessage(message) {
                     runtimeMessages.push(message);
@@ -195,7 +200,28 @@ function candidate(tab, options = {}) {
         piece_count: options.pieceCount ?? 2,
         visually_flipped: options.flipped ?? false,
         captured_at: options.capturedAt ?? 1000 + generation,
-        force: options.force ?? false
+        force: options.force ?? false,
+        recovery: options.recovery ?? false
+    };
+}
+
+function historyCandidate(tab, options = {}) {
+    const base = candidate(tab, options);
+    return {
+        type: "history_candidate",
+        page_instance_id: base.page_instance_id,
+        route_generation: base.route_generation,
+        game_key: base.game_key,
+        url: base.url,
+        visible: base.visible,
+        displayed_board: options.displayedBoard ?? base.board,
+        history_notation: options.notation ?? "uci",
+        history_moves: options.moves ?? "e2e4|e7e5",
+        history_complete: options.complete ?? true,
+        captured_at: options.capturedAt ?? 2000 + base.route_generation,
+        ...(options.initialFen === undefined
+            ? {}
+            : { initial_fen: options.initialFen })
     };
 }
 
@@ -217,8 +243,8 @@ function hello(port, overrides = {}) {
     port.emitMessage({
         type: "hello",
         ok: true,
-        protocol_version: 2,
-        host_version: "0.3.0",
+        protocol_version: 4,
+        host_version: "0.9.0",
         capabilities: REQUIRED_CAPABILITIES,
         ...overrides
     });
@@ -242,8 +268,8 @@ async function startFirstSession(harness, tabId = 1, options = {}) {
     await flushTasks();
     assert.equal(harness.ports.length, 1);
     assert.equal(harness.ports[0].posted[0].type, "hello");
-    assert.equal(harness.ports[0].posted[0].protocol_version, 2);
-    assert.equal(harness.ports[0].posted[0].extension_version, "0.3.0");
+    assert.equal(harness.ports[0].posted[0].protocol_version, 4);
+    assert.equal(harness.ports[0].posted[0].extension_version, "0.9.0");
     hello(harness.ports[0]);
     const reply = await pending;
     assert.equal(reply.accepted, true);
@@ -393,6 +419,42 @@ async function testDismissalAndOverlayCommandIsolation() {
     assert.equal(restartEngines.type, "session_command");
     assert.equal(restartEngines.session_id, sessionId);
     assert.equal(restartEngines.command, "restart_engines");
+
+    const explorationCommands = [
+        ["explore_start", "8/8/8/8/8/8/4K3/7k w - - 0 1"],
+        ["explore_move", "7 3 e2e4"],
+        ["explore_goto", "7 2"],
+        ["explore_live", "7"],
+        ["explore_resume", "7 3"]
+    ];
+    for (const [command, payload] of explorationCommands) {
+        const beforeStale = port.posted.length;
+        port.emitMessage({
+            type: "overlay_command",
+            command,
+            session_id: "delayed-old-session",
+            payload
+        });
+        await flushTasks();
+        assert.equal(
+            port.posted.length,
+            beforeStale,
+            `${command} from a stale session must not be forwarded`
+        );
+
+        port.emitMessage({
+            type: "overlay_command",
+            command,
+            session_id: sessionId,
+            payload
+        });
+        await flushTasks();
+        const forwarded = port.posted.at(-1);
+        assert.equal(forwarded.type, "session_command");
+        assert.equal(forwarded.session_id, sessionId);
+        assert.equal(forwarded.command, command);
+        assert.equal(forwarded.payload, payload);
+    }
 
     port.emitMessage({
         type: "overlay_event",
@@ -637,7 +699,7 @@ async function testEventPageRestartPersistence() {
     const latest = nativeMessages(first.ports[0], "position_snapshot").at(-1);
     await flushTasks();
     assert.equal(
-        storageData.session_broker_v2.active_session.session_id,
+        storageData.session_broker_v4.active_session.session_id,
         sessionId
     );
 
@@ -734,6 +796,217 @@ async function testAnalyzeRejectsUnsupportedTab() {
     assert.equal(harness.ports.length, 0);
 }
 
+async function testHistoryAssociationRecoveryAndReconnectOrdering() {
+    const storageData = {};
+    const harness = loadBackground({ storageData });
+    const sessionId = await startFirstSession(harness, 21, {
+        game: "history-game"
+    });
+    const firstPort = harness.ports[0];
+    const firstSnapshot = nativeMessages(firstPort, "position_snapshot")[0];
+    assert.equal(firstSnapshot.snapshot_seq, 1);
+    assert.equal(firstSnapshot.recovery, false);
+
+    const beforeNormalDuplicate = firstPort.posted.length;
+    const normalDuplicate = await harness.send(
+        candidate(21, { game: "history-game" }),
+        21
+    );
+    assert.equal(normalDuplicate.duplicate, true);
+    assert.equal(firstPort.posted.length, beforeNormalDuplicate);
+
+    const recovery = await harness.send(
+        candidate(21, { game: "history-game", recovery: true }),
+        21
+    );
+    assert.equal(recovery.accepted, true);
+    assert.equal(recovery.recovery, true);
+    assert.equal(recovery.snapshot_seq, 2);
+    const recoveryFrame = nativeMessages(firstPort, "position_snapshot").at(-1);
+    assert.equal(recoveryFrame.snapshot_seq, 2);
+    assert.equal(recoveryFrame.recovery, true);
+
+    const exact = await harness.send(
+        historyCandidate(21, {
+            game: "history-game",
+            initialFen:
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        }),
+        21
+    );
+    assert.equal(exact.accepted, true);
+    assert.equal(exact.history_seq, 1);
+    assert.equal(exact.snapshot_seq, 2);
+    const firstHistory = nativeMessages(firstPort, "history_reconcile").at(-1);
+    assert.deepEqual(
+        {
+            type: firstHistory.type,
+            session_id: firstHistory.session_id,
+            history_seq: firstHistory.history_seq,
+            snapshot_seq: firstHistory.snapshot_seq,
+            displayed_board: firstHistory.displayed_board,
+            history_notation: firstHistory.history_notation,
+            history_moves: firstHistory.history_moves,
+            history_complete: firstHistory.history_complete
+        },
+        {
+            type: "history_reconcile",
+            session_id: sessionId,
+            history_seq: 1,
+            snapshot_seq: 2,
+            displayed_board: BOARD_A,
+            history_notation: "uci",
+            history_moves: "e2e4|e7e5",
+            history_complete: true
+        }
+    );
+
+    const beforeHistoryDuplicate = firstPort.posted.length;
+    const duplicateHistory = await harness.send(
+        historyCandidate(21, { game: "history-game" }),
+        21
+    );
+    assert.equal(duplicateHistory.duplicate, undefined);
+    /* The initial_fen difference is a meaningful full-fingerprint rewrite. */
+    assert.equal(duplicateHistory.history_seq, 2);
+    const exactDuplicate = await harness.send(
+        historyCandidate(21, { game: "history-game" }),
+        21
+    );
+    assert.equal(exactDuplicate.duplicate, true);
+    assert.equal(firstPort.posted.length, beforeHistoryDuplicate + 1);
+
+    const rewrite = await harness.send(
+        historyCandidate(21, {
+            game: "history-game",
+            notation: "san",
+            moves: "e4|c5",
+            complete: true
+        }),
+        21
+    );
+    assert.equal(rewrite.history_seq, 3);
+    assert.equal(
+        nativeMessages(firstPort, "history_reconcile").at(-1).history_moves,
+        "e4|c5"
+    );
+
+    const staleCount = firstPort.posted.length;
+    const staleHistory = await harness.send(
+        historyCandidate(21, {
+            game: "history-game",
+            displayedBoard: BOARD_B,
+            moves: "d2d4"
+        }),
+        21
+    );
+    assert.equal(staleHistory.accepted, false);
+    assert.equal(staleHistory.reason, "history_snapshot_mismatch");
+    assert.equal(firstPort.posted.length, staleCount);
+
+    const sessionEndsBeforeForeignHistory = nativeMessages(
+        firstPort,
+        "session_end"
+    ).length;
+    const foreignIdentityHistory = await harness.send(
+        historyCandidate(21, {
+            generation: 1,
+            game: "history-game-new",
+            moves: "d2d4"
+        }),
+        21
+    );
+    assert.equal(foreignIdentityHistory.accepted, false);
+    assert.equal(foreignIdentityHistory.stale, true);
+    assert.equal(
+        nativeMessages(firstPort, "session_end").length,
+        sessionEndsBeforeForeignHistory,
+        "history alone must never replace the owner identity"
+    );
+
+    await flushTasks();
+    assert.equal(
+        storageData.session_broker_v4.active_session.latest_history.history_moves,
+        "e4|c5"
+    );
+
+    const restored = loadBackground({ storageData });
+    const restoredStatePending = restored.send({ type: "popup_get_state" });
+    await flushTasks();
+    assert.equal(restored.ports.length, 1);
+    hello(restored.ports[0]);
+    const restoredState = await restoredStatePending;
+    assert.equal(restoredState.session.session_id, sessionId);
+    assert.deepEqual(
+        restored.ports[0].posted.slice(1).map((message) => message.type),
+        ["session_start", "position_snapshot", "history_reconcile"]
+    );
+    assert.equal(restored.ports[0].posted[2].snapshot_seq, 1);
+    assert.equal(restored.ports[0].posted[2].recovery, false);
+    assert.equal(restored.ports[0].posted[3].snapshot_seq, 1);
+
+    firstPort.emitDisconnect("restart after history");
+    await flushTasks();
+    assert.equal(harness.ports.length, 2);
+    const retryPort = harness.ports[1];
+    hello(retryPort);
+    await flushTasks();
+    assert.deepEqual(
+        retryPort.posted.slice(1).map((message) => message.type),
+        ["session_start", "position_snapshot", "history_reconcile"]
+    );
+    assert.equal(retryPort.posted[1].session_id, sessionId);
+    assert.equal(retryPort.posted[2].snapshot_seq, 1);
+    assert.equal(retryPort.posted[2].recovery, false);
+    assert.equal(retryPort.posted[3].snapshot_seq, 1);
+    assert.equal(retryPort.posted[3].history_moves, "e4|c5");
+
+    const otherTab = await harness.send(
+        historyCandidate(22, { game: "other-game" }),
+        22
+    );
+    assert.equal(otherTab.accepted, false);
+    assert.equal(otherTab.stale, true);
+}
+
+async function testCrashAfterRecoveryReplaysOrdinaryBaseline() {
+    const harness = loadBackground();
+    const sessionId = await startFirstSession(harness, 23, {
+        game: "recovery-crash"
+    });
+    const firstPort = harness.ports[0];
+    const recovery = await harness.send(
+        candidate(23, { game: "recovery-crash", recovery: true }),
+        23
+    );
+    assert.equal(recovery.snapshot_seq, 2);
+    assert.equal(
+        nativeMessages(firstPort, "position_snapshot").at(-1).recovery,
+        true
+    );
+
+    firstPort.emitDisconnect("crash after recovery");
+    await flushTasks();
+    const retryPort = harness.ports[1];
+    hello(retryPort);
+    await flushTasks();
+    assert.deepEqual(
+        retryPort.posted.slice(1).map((message) => message.type),
+        ["session_start", "position_snapshot"]
+    );
+    assert.equal(retryPort.posted[1].session_id, sessionId);
+    assert.equal(retryPort.posted[2].snapshot_seq, 1);
+    assert.equal(retryPort.posted[2].recovery, false);
+
+    const next = await harness.send(
+        candidate(23, { game: "recovery-crash", board: BOARD_B }),
+        23
+    );
+    assert.equal(next.snapshot_seq, 3);
+    assert.equal(retryPort.posted.at(-1).snapshot_seq, 3);
+    assert.equal(retryPort.posted.at(-1).recovery, false);
+}
+
 async function main() {
     await testOwnershipSwitchNavigationAndClose();
     await testDismissalAndOverlayCommandIsolation();
@@ -746,8 +1019,10 @@ async function main() {
     await testEventPageRestartPersistence();
     await testManualStopDoesNotImmediatelyReclaim();
     await testAnalyzeRejectsUnsupportedTab();
+    await testHistoryAssociationRecoveryAndReconnectOrdering();
+    await testCrashAfterRecoveryReplaysOrdinaryBaseline();
     console.log(
-        "PASS session ownership, switching, navigation, dismissal, retry, and stale snapshots"
+        "PASS ownership, recovery ordering, history association, persistence, and reconnect"
     );
 }
 

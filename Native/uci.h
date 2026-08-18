@@ -40,11 +40,18 @@ typedef struct {
 #define UCI_PV_MAX 512
 #define UCI_LINES_MAX 5
 
+typedef enum {
+    UCI_SCORE_EXACT = 0,
+    UCI_SCORE_LOWERBOUND = 1,
+    UCI_SCORE_UPPERBOUND = 2
+} UciScoreBound;
+
 typedef struct {
     int  multipv;            /* 1-based rank                             */
     int  depth;
     int  has_cp,   cp;       /* centipawns, side-to-move POV             */
     int  has_mate, mate;     /* mate in N; negative = being mated        */
+    UciScoreBound bound;      /* UCI lowerbound/upperbound, else exact    */
     char move[8];            /* first move of the line, UCI notation     */
     char pv[UCI_PV_MAX];     /* full line, space separated               */
 } UciLine;
@@ -54,7 +61,7 @@ typedef struct {
 
 UciEngine *uci_start(const UciConfig *cfg);
 
-/* ---- blocking one-shot (Maia) ---- */
+/* ---- one-shot analysis (Maia) ---- */
 
 /* Fills lines[0..n-1] ranked best first. Returns the count, or negative on
  * error. lines[0].move always matches the engine's own bestmove. */
@@ -62,14 +69,20 @@ int uci_analyse(UciEngine *e, const char *fen, UciLine *lines, int max);
 
 int uci_bestmove(UciEngine *e, const char *fen, char *out, size_t outsz);
 
+/* Interruptible form of the engine's configured one-shot search. It uses the
+ * limit from UciConfig (normally "nodes 1" for Maia), while the caller owns
+ * the wall-clock deadline by polling in short slices. The result is exposed
+ * through uci_lines() once uci_search_poll() reports finished. */
+int uci_analyse_begin(UciEngine *e, const char *fen);
+
 /* ---- streaming, interruptible (Stockfish) ---- */
 
 /* Clears the accumulator and issues "position fen ... / go infinite".
  * Returns 0, or -2 if the engine has gone away. */
 int uci_search_begin(UciEngine *e, const char *fen);
 
-/* Consumes whatever the engine has emitted, waiting at most timeout_ms for
- * the first line. Never blocks longer than that.
+/* Consumes engine output for at most timeout_ms total (plus scheduling
+ * granularity), with a finite line budget for perpetually readable pipes.
  *   *updated  set when at least one ranked line changed
  *   *finished set when the engine emitted bestmove (search is over)
  * Returns 0, -1 protocol, -2 engine died, -4 terminal position.
@@ -79,6 +92,10 @@ int uci_search_poll(UciEngine *e, int timeout_ms, int *updated, int *finished);
 /* Sends "stop" and consumes up to and including bestmove, so the engine is
  * clean for the next "position". Safe to call when no search is running. */
 int uci_search_abort(UciEngine *e);
+
+/* As above, but bound the drain-after-stop wait. A timeout leaves the process
+ * unsafe to reuse; callers should uci_stop() it. */
+int uci_search_abort_timeout(UciEngine *e, int timeout_ms);
 
 /* Ranked lines accumulated by the current (or last) search. */
 const UciLine *uci_lines(const UciEngine *e, int *count);

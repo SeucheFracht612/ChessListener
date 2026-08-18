@@ -118,6 +118,14 @@ static int first_word_is(const char *line, const char *tok)
     return strncmp(line, tok, n) == 0 && (line[n] == '\0' || line[n] == ' ');
 }
 
+static long monotonic_ms(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000L + now.tv_nsec / 1000000L;
+}
+
 static int wait_for(UciEngine *e, const char *tok,
                     char *line, size_t linesz, int timeout_ms)
 {
@@ -170,6 +178,10 @@ static int parse_info(const char *src, UciLine *lines, int max, int *seen)
                 if (!strcmp(kind, "cp"))        { tmp.has_cp = 1;   tmp.cp = atoi(v); }
                 else if (!strcmp(kind, "mate")) { tmp.has_mate = 1; tmp.mate = atoi(v); }
             }
+        } else if (!strcmp(tok, "lowerbound")) {
+            tmp.bound = UCI_SCORE_LOWERBOUND;
+        } else if (!strcmp(tok, "upperbound")) {
+            tmp.bound = UCI_SCORE_UPPERBOUND;
         }
     }
 
@@ -193,6 +205,44 @@ static int parse_info(const char *src, UciLine *lines, int max, int *seen)
     lines[slot] = tmp;
     if (tmp.multipv > *seen) *seen = tmp.multipv;
     return 1;
+}
+
+/* Make the engine's explicit bestmove authoritative over the latest info
+ * stream. This matters most for an interrupted one-shot search: info can name
+ * an earlier candidate immediately before bestmove settles on another one. */
+static int record_bestmove(UciEngine *e, const char *move, size_t length)
+{
+    int found = -1;
+
+    if (e == NULL || move == NULL || length == 0U ||
+        length >= sizeof(e->acc[0].move)) {
+        return -1;
+    }
+
+    for (int index = 0; index < e->acc_seen; index += 1) {
+        if (strlen(e->acc[index].move) == length &&
+            memcmp(e->acc[index].move, move, length) == 0) {
+            found = index;
+            break;
+        }
+    }
+
+    if (found > 0) {
+        UciLine swap = e->acc[0];
+        e->acc[0] = e->acc[found];
+        e->acc[found] = swap;
+    } else if (found < 0) {
+        memset(&e->acc[0], 0, sizeof(e->acc[0]));
+        e->acc[0].multipv = 1;
+        memcpy(e->acc[0].move, move, length);
+        e->acc[0].move[length] = '\0';
+        snprintf(e->acc[0].pv, sizeof(e->acc[0].pv), "%s", e->acc[0].move);
+        if (e->acc_seen == 0) {
+            e->acc_seen = 1;
+        }
+    }
+
+    return 0;
 }
 
 /* --------------------------------------------------------------- start -- */
@@ -379,14 +429,52 @@ int uci_bestmove(UciEngine *e, const char *fen, char *out, size_t outsz)
     return 0;
 }
 
+int uci_analyse_begin(UciEngine *e, const char *fen)
+{
+    int status;
+
+    if (!e || !fen) return -1;
+
+    if (e->searching) {
+        status = uci_search_abort(e);
+        if (status != 0) return status;
+    }
+
+    memset(e->acc, 0, sizeof e->acc);
+    e->acc_seen = 0;
+
+    if (send_cmd(e, "position fen %s", fen) < 0) return -2;
+
+    switch (e->limit) {
+    case UCI_LIMIT_NODES:
+        status = send_cmd(e, "go nodes %ld", e->limit_value);
+        break;
+    case UCI_LIMIT_DEPTH:
+        status = send_cmd(e, "go depth %ld", e->limit_value);
+        break;
+    case UCI_LIMIT_MOVETIME:
+        status = send_cmd(e, "go movetime %ld", e->limit_value);
+        break;
+    default:
+        return -1;
+    }
+
+    if (status < 0) return -2;
+    e->searching = 1;
+    return 0;
+}
+
 /* ------------------------------------------------ streaming search -- */
 
 int uci_search_begin(UciEngine *e, const char *fen)
 {
+    int status;
+
     if (!e || !fen) return -1;
 
     if (e->searching) {
-        (void)uci_search_abort(e);
+        status = uci_search_abort(e);
+        if (status != 0) return status;
     }
 
     memset(e->acc, 0, sizeof e->acc);
@@ -402,13 +490,19 @@ int uci_search_begin(UciEngine *e, const char *fen)
 int uci_search_poll(UciEngine *e, int timeout_ms, int *updated, int *finished)
 {
     char line[UCI_LINESZ];
+    long deadline;
     int any = 0;
-    int wait = timeout_ms;
+    int linesRead = 0;
+    int wait;
 
     if (updated)  *updated  = 0;
     if (finished) *finished = 0;
     if (!e) return -1;
     if (!e->searching) { if (finished) *finished = 1; return 0; }
+
+    if (timeout_ms < 0) timeout_ms = 0;
+    wait = timeout_ms;
+    deadline = monotonic_ms() + timeout_ms;
 
     for (;;) {
         int r = rd_line(e, line, sizeof line, wait);
@@ -432,14 +526,14 @@ int uci_search_poll(UciEngine *e, int timeout_ms, int *updated, int *finished)
             if (finished) *finished = 1;
             if (updated)  *updated  = any;
             if (n == 6 && !strncmp(p, "(none)", 6)) return -4;
-            if (e->acc_seen == 0 && n > 0 && n < sizeof e->acc[0].move) {
-                e->acc[0].multipv = 1;
-                memcpy(e->acc[0].move, p, n);
-                e->acc[0].move[n] = '\0';
-                snprintf(e->acc[0].pv, sizeof e->acc[0].pv, "%s",
-                         e->acc[0].move);
-                e->acc_seen = 1;
-                if (updated) *updated = 1;
+            if (n > 0 && n < sizeof e->acc[0].move) {
+                char previous[sizeof e->acc[0].move];
+
+                snprintf(previous, sizeof(previous), "%s", e->acc[0].move);
+                if (record_bestmove(e, p, n) != 0) return -1;
+                if (updated && strcmp(previous, e->acc[0].move) != 0) {
+                    *updated = 1;
+                }
             }
             return 0;
         }
@@ -447,23 +541,41 @@ int uci_search_poll(UciEngine *e, int timeout_ms, int *updated, int *finished)
         if (parse_info(line, e->acc, UCI_LINES_MAX, &e->acc_seen)) {
             any = 1;
         }
+
+        /* A chatty or broken engine can keep its pipe perpetually readable.
+         * Give the owner thread a firm chance to notice supersession instead
+         * of draining an unbounded stream in one call. The line budget also
+         * protects platforms whose monotonic clock has coarse resolution. */
+        linesRead++;
+        if (linesRead >= 256 || monotonic_ms() >= deadline) {
+            if (updated) *updated = any;
+            return 0;
+        }
     }
 }
 
-int uci_search_abort(UciEngine *e)
+int uci_search_abort_timeout(UciEngine *e, int timeout_ms)
 {
     char line[UCI_LINESZ];
+    long deadline;
 
     if (!e) return -1;
     if (!e->searching) return 0;
+    if (timeout_ms < 0) timeout_ms = 0;
 
     if (send_cmd(e, "stop") < 0) { e->searching = 0; return -2; }
+
+    deadline = monotonic_ms() + timeout_ms;
 
     /* Consume up to bestmove so the engine is clean for the next position.
      * A generous but finite timeout: a stopped search answers immediately,
      * and hanging here would be exactly the bug we are removing. */
     for (;;) {
-        int r = rd_line(e, line, sizeof line, 2000);
+        long remaining = deadline - monotonic_ms();
+        int r;
+
+        if (remaining < 0L) remaining = 0L;
+        r = rd_line(e, line, sizeof line, (int)remaining);
 
         if (r == -3) { e->searching = 0; return -3; }
         if (r == -2) { e->searching = 0; return -2; }
@@ -476,6 +588,11 @@ int uci_search_abort(UciEngine *e)
 
         (void)parse_info(line, e->acc, UCI_LINES_MAX, &e->acc_seen);
     }
+}
+
+int uci_search_abort(UciEngine *e)
+{
+    return uci_search_abort_timeout(e, 2000);
 }
 
 const UciLine *uci_lines(const UciEngine *e, int *count)

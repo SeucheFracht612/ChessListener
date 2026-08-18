@@ -39,9 +39,10 @@ def main():
         elif command.startswith("go"):
             for rank, move in enumerate(MULTIPV_MOVES[:multipv], 1):
                 score = 31 - (rank - 1) * 18
+                bound = " lowerbound" if rank == 2 else ""
                 reply(
                     f"info depth 12 seldepth 18 multipv {rank} "
-                    f"score cp {score} nodes 4096 pv {move} e7e5"
+                    f"score cp {score}{bound} nodes 4096 pv {move} e7e5"
                 )
 
             if command == "go infinite":

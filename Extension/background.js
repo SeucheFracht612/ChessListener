@@ -1,14 +1,21 @@
 "use strict";
 
 const NATIVE_HOST = "local.chess_listener";
-const NATIVE_PROTOCOL_VERSION = 2;
+const NATIVE_PROTOCOL_VERSION = 4;
 const REQUIRED_CAPABILITIES = [
     "session_v2",
     "state_override",
-    "streaming_analysis"
+    "streaming_analysis",
+    "history_reconciliation",
+    "state_revision",
+    "state_source",
+    "analysis_lab",
+    "analysis_target"
 ];
 const HANDSHAKE_TIMEOUT_MS = 3000;
-const SESSION_STORAGE_KEY = "session_broker_v2";
+const SESSION_STORAGE_KEY = "session_broker_v4";
+const MAX_HISTORY_PLIES = 1024;
+const MAX_HISTORY_BYTES = 32 * 1024;
 
 const pages = new Map();
 const retiredPageInstances = new Map();
@@ -47,6 +54,8 @@ function serializableSession(session) {
         trigger: session.trigger,
         snapshot_seq: session.snapshotSeq,
         latest_snapshot: session.latestSnapshot,
+        history_seq: session.historySeq,
+        latest_history: session.latestHistory,
         dismissed: session.dismissed,
         retry_used: session.retryUsed,
         native_unavailable: session.nativeUnavailable,
@@ -56,7 +65,7 @@ function serializableSession(session) {
 
 function persistedBrokerState() {
     return {
-        format: 1,
+        format: 2,
         automatic_claims_paused: automaticClaimsPaused,
         protocol_error: nativeProtocolError?.message ?? null,
         active_session: serializableSession(activeSession)
@@ -107,7 +116,16 @@ function restoreSession(saved) {
             typeof saved.latest_snapshot === "object"
                 ? saved.latest_snapshot
                 : null,
+        historySeq: Number.isInteger(saved.history_seq)
+            ? saved.history_seq
+            : 0,
+        latestHistory:
+            saved.latest_history !== null &&
+            typeof saved.latest_history === "object"
+                ? saved.latest_history
+                : null,
         lastSentSnapshotSeq: 0,
+        lastSentHistorySeq: 0,
         hydratedConnection: null,
         dismissed: saved.dismissed === true,
         // A successful event-page rehydration gets a fresh crash retry budget.
@@ -131,7 +149,7 @@ function ensureInitialized() {
                 SESSION_STORAGE_KEY
             );
             const state = stored?.[SESSION_STORAGE_KEY];
-            if (state?.format === 1) {
+            if (state?.format === 2) {
                 automaticClaimsPaused =
                     state.automatic_claims_paused === true;
                 nativeProtocolError =
@@ -173,6 +191,52 @@ function isValidBoard(board) {
         typeof board === "string" &&
         board.length === 64 &&
         /^[prnbqkPRNBQK.]{64}$/.test(board)
+    );
+}
+
+function isValidHistoryToken(token, notation) {
+    if (notation === "uci") {
+        return /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(token);
+    }
+    return (
+        /^(?:O-O(?:-O)?|[KQRBN](?:[a-h]|[1-8]|[a-h][1-8])?x?[a-h][1-8](?:=?[QRBN])?|[a-h](?:x[a-h])?[1-8](?:=?[QRBN])?)[+#]?$/.test(
+            token
+        )
+    );
+}
+
+function isValidInitialFen(fen) {
+    return (
+        fen === undefined ||
+        (typeof fen === "string" &&
+            fen.length <= 128 &&
+            /^[prnbqkPRNBQK1-8/]+ [wb] (?:-|(?=[KQkq])K?Q?k?q?) (?:-|[a-h][36]) \d+ \d+$/.test(
+                fen
+            ))
+    );
+}
+
+function isValidHistoryCandidate(message) {
+    if (
+        !isValidBoard(message?.displayed_board) ||
+        !["uci", "san"].includes(message?.history_notation) ||
+        typeof message?.history_moves !== "string" ||
+        message.history_moves.length === 0 ||
+        message.history_moves.length > MAX_HISTORY_BYTES ||
+        typeof message?.history_complete !== "boolean" ||
+        !isValidInitialFen(message.initial_fen)
+    ) {
+        return false;
+    }
+    const tokens = message.history_moves.split("|");
+    return (
+        tokens.length > 0 &&
+        tokens.length <= MAX_HISTORY_PLIES &&
+        tokens.every(
+            (token) =>
+                token.length > 0 &&
+                isValidHistoryToken(token, message.history_notation)
+        )
     );
 }
 
@@ -238,6 +302,7 @@ function publicState() {
                       game_key: activeSession.gameKey,
                       url: activeSession.url,
                       snapshot_seq: activeSession.snapshotSeq,
+                      history_seq: activeSession.historySeq,
                       dismissed: activeSession.dismissed,
                       retry_used: activeSession.retryUsed,
                       last_error: activeSession.lastError
@@ -264,7 +329,7 @@ function protocolErrorFor(message) {
     const reason = String(message?.reason ?? "");
     if (
         message?.type === "error" &&
-        /(protocol|hello_required|session_v2_required)/i.test(reason)
+        /(protocol|hello_required|session_v[234]_required)/i.test(reason)
     ) {
         return new Error(`Native protocol error: ${reason || "unknown"}`);
     }
@@ -326,6 +391,11 @@ function handleOverlayCommand(message) {
             break;
         case "set_fen":
         case "restart_engines":
+        case "explore_start":
+        case "explore_move":
+        case "explore_goto":
+        case "explore_live":
+        case "explore_resume":
             void forwardSessionCommand(message.command, message.payload);
             break;
         case "stop_session":
@@ -563,8 +633,27 @@ function makeNativeSnapshot(session, candidate, snapshotSeq) {
         url: candidate.url,
         piece_count: candidate.piece_count,
         captured_at: candidate.captured_at,
-        force: candidate.force
+        force: candidate.force,
+        recovery: candidate.recovery
     };
+}
+
+function makeNativeHistory(session, candidate, historySeq) {
+    const message = {
+        type: "history_reconcile",
+        session_id: session.sessionId,
+        history_seq: historySeq,
+        snapshot_seq: session.snapshotSeq,
+        displayed_board: candidate.displayed_board,
+        history_notation: candidate.history_notation,
+        history_moves: candidate.history_moves,
+        history_complete: candidate.history_complete,
+        captured_at: candidate.captured_at
+    };
+    if (candidate.initial_fen !== undefined) {
+        message.initial_fen = candidate.initial_fen;
+    }
+    return message;
 }
 
 function enqueueSessionTask(session, task) {
@@ -606,6 +695,7 @@ async function hydrateAndDeliverLatest(session) {
         postToConnection(connection, makeSessionStart(session));
         session.hydratedConnection = connection;
         session.lastSentSnapshotSeq = 0;
+        session.lastSentHistorySeq = 0;
     }
 
     if (
@@ -614,6 +704,22 @@ async function hydrateAndDeliverLatest(session) {
     ) {
         postToConnection(connection, session.latestSnapshot);
         session.lastSentSnapshotSeq = session.latestSnapshot.snapshot_seq;
+    }
+    if (
+        session.latestHistory !== null &&
+        session.latestSnapshot !== null &&
+        session.latestHistory.displayed_board === session.latestSnapshot.board &&
+        session.latestHistory.history_seq > session.lastSentHistorySeq &&
+        session.lastSentSnapshotSeq > 0
+    ) {
+        /* A recovery probe is intentionally transient and is not the baseline
+         * replayed after a native restart. Associate history with whichever
+         * identical-board snapshot this connection most recently received. */
+        postToConnection(connection, {
+            ...session.latestHistory,
+            snapshot_seq: session.lastSentSnapshotSeq
+        });
+        session.lastSentHistorySeq = session.latestHistory.history_seq;
     }
     session.lastError = null;
     notifyStateChanged();
@@ -662,6 +768,23 @@ function queueLatestSnapshot(session) {
     return enqueueSessionTask(session, () => deliverWithSingleRetry(session));
 }
 
+function queueRecoverySnapshot(session, snapshot) {
+    return enqueueSessionTask(session, async () => {
+        await deliverWithSingleRetry(session);
+        if (
+            activeSession !== session ||
+            session.dismissed ||
+            session.nativeUnavailable ||
+            session.hydratedConnection === null ||
+            snapshot.snapshot_seq <= session.lastSentSnapshotSeq
+        ) {
+            return;
+        }
+        postToConnection(session.hydratedConnection, snapshot);
+        session.lastSentSnapshotSeq = snapshot.snapshot_seq;
+    });
+}
+
 async function hydrateRestoredSessionIfNeeded() {
     if (!restoredSessionNeedsHydration) {
         return;
@@ -688,12 +811,27 @@ async function hydrateRestoredSessionIfNeeded() {
 }
 
 function rememberSnapshot(session, candidate) {
+    const previousBoard = session.latestSnapshot?.board ?? null;
     session.snapshotSeq += 1;
     session.url = candidate.url;
     session.latestSnapshot = makeNativeSnapshot(
         session,
         candidate,
         session.snapshotSeq
+    );
+    if (previousBoard !== null && previousBoard !== candidate.board) {
+        session.latestHistory = null;
+    } else if (session.latestHistory !== null) {
+        session.latestHistory.snapshot_seq = session.snapshotSeq;
+    }
+}
+
+function rememberHistory(session, candidate) {
+    session.historySeq += 1;
+    session.latestHistory = makeNativeHistory(
+        session,
+        candidate,
+        session.historySeq
     );
 }
 
@@ -709,6 +847,9 @@ function newSessionFor(entry, trigger) {
         snapshotSeq: 0,
         latestSnapshot: null,
         lastSentSnapshotSeq: 0,
+        historySeq: 0,
+        latestHistory: null,
+        lastSentHistorySeq: 0,
         hydratedConnection: null,
         dismissed: false,
         retryUsed: false,
@@ -717,6 +858,13 @@ function newSessionFor(entry, trigger) {
         queue: Promise.resolve()
     };
     rememberSnapshot(session, entry.latestCandidate);
+    if (
+        entry.latestHistoryCandidate !== null &&
+        entry.latestHistoryCandidate.displayed_board ===
+            entry.latestCandidate.board
+    ) {
+        rememberHistory(session, entry.latestHistoryCandidate);
+    }
     return session;
 }
 
@@ -852,7 +1000,9 @@ async function preparePageEntry(tabId, message) {
             eligible: false,
             eligibleOrder: ++eligibilityCounter,
             latestCandidate: null,
-            lastIdentityKey: null
+            lastIdentityKey: null,
+            latestHistoryCandidate: null,
+            lastHistoryFingerprint: null
         };
         pages.set(tabId, entry);
     }
@@ -902,6 +1052,19 @@ function snapshotIdentity(message) {
     ].join("|");
 }
 
+function historyFingerprint(message) {
+    return [
+        message.page_instance_id,
+        message.route_generation,
+        message.game_key,
+        message.displayed_board,
+        message.history_notation,
+        message.history_moves,
+        message.history_complete === true ? "complete" : "partial",
+        message.initial_fen ?? ""
+    ].join("|");
+}
+
 async function handleBoardCandidate(message, sender) {
     const tabId = senderTabId(sender);
     if (
@@ -925,6 +1088,7 @@ async function handleBoardCandidate(message, sender) {
 
     const identity = snapshotIdentity(message);
     const duplicate = entry.lastIdentityKey === identity;
+    const recovery = message.recovery === true;
     const candidate = {
         board: message.board,
         visually_flipped: message.visually_flipped,
@@ -935,10 +1099,54 @@ async function handleBoardCandidate(message, sender) {
         captured_at: Number.isFinite(message.captured_at)
             ? message.captured_at
             : Date.now(),
-        force: message.force === true
+        force: message.force === true,
+        recovery
     };
-    entry.latestCandidate = candidate;
-    entry.lastIdentityKey = identity;
+
+    /* A recovery tick is only meaningful for a board that already travelled
+     * through the normal fast path. It must neither claim a session nor become
+     * the snapshot cached for a future session. */
+    if (recovery && !duplicate) {
+        return { accepted: false, reason: "recovery_without_snapshot" };
+    }
+    if (!recovery) {
+        entry.latestCandidate = candidate;
+        entry.lastIdentityKey = identity;
+    }
+
+    if (recovery) {
+        if (
+            activeSession === null ||
+            !sameSessionIdentity(activeSession, entry)
+        ) {
+            return { accepted: true, owner: false, cached: false };
+        }
+        const session = activeSession;
+        restoredSessionNeedsHydration = false;
+        session.snapshotSeq += 1;
+        const recoverySnapshot = makeNativeSnapshot(
+            session,
+            candidate,
+            session.snapshotSeq
+        );
+        if (!session.dismissed && !session.nativeUnavailable) {
+            try {
+                await queueRecoverySnapshot(session, recoverySnapshot);
+            } catch (error) {
+                console.error(
+                    "[ChessListener] could not forward delayed recovery:",
+                    error
+                );
+            }
+        }
+        await notifyStateChanged();
+        return {
+            accepted: true,
+            owner: activeSession === session,
+            recovery: true,
+            snapshot_seq: session.snapshotSeq
+        };
+    }
 
     if (pendingExplicitTabId === tabId) {
         pendingExplicitTabId = null;
@@ -988,6 +1196,99 @@ async function handleBoardCandidate(message, sender) {
         accepted: true,
         owner: true,
         snapshot_seq: activeSession.snapshotSeq
+    };
+}
+
+async function handleHistoryCandidate(message, sender) {
+    const tabId = senderTabId(sender);
+    if (
+        tabId === null ||
+        !isValidPageMessage(message) ||
+        !isValidHistoryCandidate(message)
+    ) {
+        return { accepted: false, reason: "invalid_history" };
+    }
+
+    /* Unlike a board candidate, history is not allowed to create/replace a
+     * page entry or end a session. It can only enrich the exact owner identity
+     * already established by the fast board path. */
+    const entry = pages.get(tabId) ?? null;
+    if (
+        entry === null ||
+        entry.pageInstanceId !== message.page_instance_id ||
+        entry.routeGeneration !== message.route_generation ||
+        entry.gameKey !== message.game_key
+    ) {
+        return { accepted: false, stale: true };
+    }
+
+    /* History never claims ownership. It is useful only when it describes the
+     * exact board snapshot currently owned by this page and session. */
+    if (
+        activeSession === null ||
+        !sameSessionIdentity(activeSession, entry) ||
+        entry.latestCandidate === null ||
+        entry.latestCandidate.board !== message.displayed_board ||
+        activeSession.latestSnapshot === null ||
+        activeSession.latestSnapshot.board !== message.displayed_board
+    ) {
+        return {
+            accepted: false,
+            owner: false,
+            stale: true,
+            reason: "history_snapshot_mismatch"
+        };
+    }
+
+    const fingerprint = historyFingerprint(message);
+    if (
+        entry.lastHistoryFingerprint === fingerprint &&
+        activeSession.latestHistory !== null &&
+        activeSession.latestHistory.displayed_board === message.displayed_board
+    ) {
+        return {
+            accepted: true,
+            owner: true,
+            duplicate: true,
+            history_seq: activeSession.latestHistory.history_seq,
+            snapshot_seq: activeSession.snapshotSeq
+        };
+    }
+
+    const candidate = {
+        displayed_board: message.displayed_board,
+        history_notation: message.history_notation,
+        history_moves: message.history_moves,
+        history_complete: message.history_complete,
+        captured_at: Number.isFinite(message.captured_at)
+            ? message.captured_at
+            : Date.now()
+    };
+    if (message.initial_fen !== undefined) {
+        candidate.initial_fen = message.initial_fen;
+    }
+    const session = activeSession;
+    entry.latestHistoryCandidate = candidate;
+    entry.lastHistoryFingerprint = fingerprint;
+    rememberHistory(session, candidate);
+
+    restoredSessionNeedsHydration = false;
+    if (!session.dismissed && !session.nativeUnavailable) {
+        try {
+            await queueLatestSnapshot(session);
+        } catch (error) {
+            console.error(
+                "[ChessListener] could not forward move history:",
+                error
+            );
+        }
+    }
+    await notifyStateChanged();
+    return {
+        accepted: true,
+        owner: activeSession === session,
+        history_seq: session.historySeq,
+        snapshot_seq: session.snapshotSeq
     };
 }
 
@@ -1206,6 +1507,11 @@ async function dispatchRuntimeMessage(message, sender) {
             await hydrateRestoredSessionIfNeeded();
             return result;
         }
+        case "history_candidate": {
+            const result = await handleHistoryCandidate(message, sender);
+            await hydrateRestoredSessionIfNeeded();
+            return result;
+        }
         case "page_unloading":
             return handlePageUnloading(message, sender);
         case "popup_get_state":
@@ -1226,6 +1532,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
         ![
             "page_state",
             "board_candidate",
+            "history_candidate",
             "page_unloading",
             "popup_get_state",
             "popup_action"

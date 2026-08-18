@@ -17,7 +17,7 @@ DEPS    := $(OBJECTS:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean check check-python check-js check-shell test test-js debug asan
+.PHONY: all clean check check-python check-js check-shell test test-js debug asan tsan
 
 all: $(TARGET)
 
@@ -32,7 +32,7 @@ $(BUILD_DIR):
 
 # Parse source files without importing PyQt or writing __pycache__ directories.
 check-python:
-	$(PYTHON) -c 'import ast, pathlib, sys; files = [pathlib.Path(name) for name in sys.argv[1:]]; [ast.parse(path.read_text(encoding="utf-8"), filename=str(path)) for path in files]; print(f"Python syntax: {len(files)} files OK")' overlay.py san.py Tests/*.py
+	$(PYTHON) -c 'import ast, pathlib, sys; files = [pathlib.Path(name) for name in sys.argv[1:]]; [ast.parse(path.read_text(encoding="utf-8"), filename=str(path)) for path in files]; print(f"Python syntax: {len(files)} files OK")' overlay.py san.py explanations.py review.py study_store.py study.py pgn_import.py Tests/*.py
 
 check-js:
 	$(NODE) --check ../Extension/background.js
@@ -68,12 +68,20 @@ test:
 	$(MAKE) --no-print-directory test-js
 	$(PYTHON) Tests/test_install_lifecycle.py
 	$(PYTHON) Tests/test_san.py
+	$(PYTHON) Tests/test_explanations.py
+	$(PYTHON) Tests/test_review.py
+	$(PYTHON) Tests/test_study_store.py
+	$(PYTHON) Tests/test_study.py
+	$(PYTHON) Tests/test_pgn_import.py
+	$(PYTHON) Tests/test_overlay.py
 	CHESSLISTENER_HOST="$(abspath $(TARGET))" \
 	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
 		$(PYTHON) Tests/test_catchup.py
 	CHESSLISTENER_HOST="$(abspath $(TARGET))" \
 	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
 		$(PYTHON) Tests/e2e.py
+	CHESSLISTENER_HOST="$(abspath $(TARGET))" \
+		$(PYTHON) Tests/test_engine_lanes.py
 
 debug:
 	$(MAKE) --no-print-directory -B \
@@ -97,10 +105,27 @@ asan:
 	CHESSLISTENER_HOST="$(abspath chess-listener-host-asan)" \
 	CHESSLISTENER_FAKE_UCI="$(abspath Tests/fake_uci_engine.py)" \
 		$(PYTHON) Tests/e2e.py
+	ASAN_OPTIONS='detect_leaks=0:halt_on_error=1' \
+	UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1' \
+	CHESSLISTENER_HOST="$(abspath chess-listener-host-asan)" \
+		$(PYTHON) Tests/test_engine_lanes.py
+
+# Focused race detector for the independent Stockfish/Maia owner threads.
+# This is optional because ThreadSanitizer is not available in every toolchain.
+tsan:
+	$(MAKE) --no-print-directory -B \
+		BUILD_DIR=.build/tsan \
+		TARGET=chess-listener-host-tsan \
+		CFLAGS='-std=c11 -O1 -g3 -Wall -Wextra -Wpedantic -pthread -fno-omit-frame-pointer -fsanitize=thread' \
+		LDFLAGS='-fsanitize=thread'
+	TSAN_OPTIONS='halt_on_error=1' \
+	CHESSLISTENER_HOST="$(abspath chess-listener-host-tsan)" \
+		$(PYTHON) Tests/test_engine_lanes.py
 
 clean:
 	rm -rf .build
 	rm -f chess-listener-host chess-listener-host-debug chess-listener-host-asan
+	rm -f chess-listener-host-tsan
 	rm -f main.o uci.o overlay.o analysis.o
 	rm -rf __pycache__ Tests/__pycache__
 

@@ -25,8 +25,8 @@ FAKE_UCI = os.path.abspath(
     os.environ.get("CHESSLISTENER_FAKE_UCI", os.path.join(HERE, "fake_uci_engine.py"))
 )
 
-PROTOCOL_VERSION = 2
-HOST_VERSION = "0.3.0"
+PROTOCOL_VERSION = 4
+HOST_VERSION = "0.9.0"
 DEFAULT_SESSION_ID = "e2e-session"
 MESSAGE_TIMEOUT = float(os.environ.get("CHESSLISTENER_TEST_MESSAGE_TIMEOUT", "3"))
 TEST_TIMEOUT = float(os.environ.get("CHESSLISTENER_TEST_TIMEOUT", "6"))
@@ -139,7 +139,7 @@ def handshake(proc):
     send(proc, {
         "type": "hello",
         "protocol_version": PROTOCOL_VERSION,
-        "extension_version": "0.3.0-test",
+        "extension_version": "0.9.0-test",
     })
     reply = recv(proc)
 
@@ -150,7 +150,9 @@ def handshake(proc):
     if not isinstance(reply.get("capabilities"), list):
         raise AssertionError(f"native handshake has no capabilities: {reply}")
     required = {
-        "session_v2", "state_override", "streaming_analysis", "last_move"
+        "session_v2", "state_override", "streaming_analysis", "last_move",
+        "history_reconciliation", "state_revision", "state_source",
+        "analysis_lab", "analysis_target",
     }
     if not required.issubset(reply["capabilities"]):
         raise AssertionError(f"native handshake misses capabilities: {reply}")
@@ -183,6 +185,7 @@ def send_snapshot(
     visually_flipped=False,
     async_messages=None,
     force=None,
+    recovery=None,
 ):
     payload = {
         "type": "position_snapshot",
@@ -193,8 +196,39 @@ def send_snapshot(
     }
     if force is not None:
         payload["force"] = force
+    if recovery is not None:
+        payload["recovery"] = recovery
     send(proc, payload)
     return recv_response(proc, async_messages=async_messages)
+
+
+def send_history(
+    proc,
+    displayed_board,
+    history_moves,
+    history_seq,
+    snapshot_seq,
+    *,
+    notation="uci",
+    session_id=DEFAULT_SESSION_ID,
+    initial_fen=None,
+    history_complete=True,
+):
+    payload = {
+        "type": "history_reconcile",
+        "session_id": session_id,
+        "history_seq": history_seq,
+        "snapshot_seq": snapshot_seq,
+        "displayed_board": displayed_board,
+        "history_notation": notation,
+        "history_moves": "|".join(history_moves),
+        "history_complete": history_complete,
+        "captured_at": int(time.time() * 1000),
+    }
+    if initial_fen is not None:
+        payload["initial_fen"] = initial_fen
+    send(proc, payload)
+    return recv_response(proc)
 
 
 def host_environment(
@@ -204,6 +238,8 @@ def host_environment(
     overlay_protocol=PROTOCOL_VERSION,
     controls="",
     controls_after_positions="0",
+    start_settings="",
+    set_payload="",
 ):
     environment = dict(os.environ)
     environment.update(
@@ -218,6 +254,11 @@ def host_environment(
         CHESSLISTENER_STUB_CONTROLS_AFTER_POSITIONS=str(
             controls_after_positions
         ),
+        CHESSLISTENER_STUB_START_SETTINGS=start_settings,
+        CHESSLISTENER_STUB_SET_PAYLOAD=(
+            set_payload or
+            "budget=90 explore_budget=-1 maia=1900 threads=1 multipv=2"
+        ),
         BUDGET="100",
     )
     return environment
@@ -230,6 +271,8 @@ def launch_host(
     overlay_protocol=PROTOCOL_VERSION,
     controls="",
     controls_after_positions="0",
+    start_settings="",
+    set_payload="",
 ):
     for path, description in ((HOST, "native host"), (FAKE_UCI, "fake UCI engine")):
         if not os.path.isfile(path) or not os.access(path, os.X_OK):
@@ -245,6 +288,8 @@ def launch_host(
             overlay_protocol=overlay_protocol,
             controls=controls,
             controls_after_positions=controls_after_positions,
+            start_settings=start_settings,
+            set_payload=set_payload,
         ),
     )
 
@@ -256,12 +301,16 @@ def start_host(
     session_id=DEFAULT_SESSION_ID,
     controls="",
     controls_after_positions="0",
+    start_settings="",
+    set_payload="",
 ):
     proc = launch_host(
         frame_log,
         set_after_positions=set_after_positions,
         controls=controls,
         controls_after_positions=controls_after_positions,
+        start_settings=start_settings,
+        set_payload=set_payload,
     )
     handshake(proc)
     if session_id is not None:
@@ -899,6 +948,314 @@ def assert_active_overlay_dismissed_event(frame_log):
         )
 
 
+def session_command(proc, session_id, command, payload=None):
+    message = {
+        "type": "session_command",
+        "session_id": session_id,
+        "command": command,
+    }
+    if payload is not None:
+        message["payload"] = payload
+    send(proc, message)
+    return recv_response(proc)
+
+
+def assert_analysis_lab(frame_log):
+    session_id = "lab-session"
+    initial_fen = (
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/"
+        "RNBQKBNR w KQkq - 0 1"
+    )
+    after_e4_fen = (
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/"
+        "RNBQKBNR b KQkq e3 0 1"
+    )
+    proc = start_host(frame_log, session_id=session_id)
+    try:
+        started = send_snapshot(proc, INITIAL, 1, session_id=session_id)
+        if started.get("reason") != "game_started":
+            raise AssertionError(f"lab setup failed: {started}")
+
+        opened = session_command(
+            proc, session_id, "explore_start",
+            initial_fen + "|e2e4,e7e5",
+        )
+        if opened.get("reason") != "explore_started" or \
+                opened.get("node_id") != 2:
+            raise AssertionError(f"PV-seeded explorer failed: {opened}")
+        branch_id = opened["branch_id"]
+
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "position" and
+                item.get("mode") == "explore" and
+                item.get("branch_id") == branch_id and
+                item.get("node_id") == 2
+                for item in items
+            ),
+        )
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "analysis" and
+                item.get("mode") == "explore" and
+                item.get("branch_id") == branch_id and
+                item.get("node_id") == 2 and
+                item.get("target_revision") == item.get("seq") and
+                len(item.get("lines", [])) >= 2 and
+                item.get("lines", [{}, {}])[1].get("bound") == "lowerbound"
+                for item in items
+            ),
+        )
+        seeded_analysis = next(
+            item for item in reversed(frames)
+            if item.get("type") == "analysis" and
+            item.get("mode") == "explore" and
+            item.get("branch_id") == branch_id and
+            item.get("node_id") == 2
+        )
+        if seeded_analysis.get("best", {}).get("bound") != "exact" or \
+                len(seeded_analysis.get("lines", [])) < 2 or \
+                seeded_analysis["lines"][1].get("bound") != "lowerbound":
+            raise AssertionError(
+                f"UCI score bounds were not preserved: {seeded_analysis}")
+        branch_position_index = max(
+            index for index, item in enumerate(frames)
+            if item.get("type") == "position" and
+            item.get("mode") == "explore" and
+            item.get("branch_id") == branch_id
+        )
+
+        illegal = session_command(
+            proc, session_id, "explore_move", f"{branch_id} 2 e2e4")
+        if illegal.get("reason") != "illegal_move":
+            raise AssertionError(f"illegal lab move was accepted: {illegal}")
+
+        stale_branch = session_command(
+            proc, session_id, "explore_goto", f"{branch_id + 1000} 0")
+        if stale_branch.get("reason") != "stale_branch":
+            raise AssertionError(f"stale branch was accepted: {stale_branch}")
+        unknown_node = session_command(
+            proc, session_id, "explore_goto", f"{branch_id} 255")
+        if unknown_node.get("reason") != "unknown_node":
+            raise AssertionError(f"unknown branch node was accepted: {unknown_node}")
+
+        root = session_command(
+            proc, session_id, "explore_goto", f"{branch_id} 0")
+        if root.get("reason") != "explore_position_selected" or \
+                root.get("node_id") != 0:
+            raise AssertionError(f"lab goto root failed: {root}")
+        root_frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "analysis" and
+                item.get("mode") == "explore" and
+                item.get("branch_id") == branch_id and
+                item.get("node_id") == 0
+                for item in items
+            ),
+        )
+        root_position_index = max(
+            index for index, item in enumerate(root_frames)
+            if item.get("type") == "position" and
+            item.get("mode") == "explore" and
+            item.get("branch_id") == branch_id and
+            item.get("node_id") == 0
+        )
+        if any(
+            item.get("type") == "analysis" and
+            item.get("mode") == "explore" and
+            item.get("node_id") == 2
+            for item in root_frames[root_position_index + 1:]
+        ):
+            raise AssertionError("old-node analysis crossed a newer target")
+
+        alternative = session_command(
+            proc, session_id, "explore_move", f"{branch_id} 0 d2d4")
+        if alternative.get("reason") != "explore_move_applied":
+            raise AssertionError(f"lab alternative failed: {alternative}")
+        alternative_node = alternative["node_id"]
+
+        live_board = apply_move(INITIAL, "e2e4")
+        live_reply = send_snapshot(
+            proc, live_board, 2, session_id=session_id)
+        if live_reply.get("reason") != "move_recorded":
+            raise AssertionError(f"live state stalled behind explorer: {live_reply}")
+
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "live_update" and
+                item.get("fen") == after_e4_fen
+                for item in items
+            ),
+        )
+        if any(
+            item.get("type") == "position" and
+            item.get("mode") == "live" and
+            item.get("fen") == after_e4_fen
+            for item in frames[branch_position_index + 1:]
+        ):
+            raise AssertionError("a real move overwrote the selected lab branch")
+
+        stale_base = session_command(
+            proc, session_id, "explore_start", initial_fen)
+        if stale_base.get("reason") != "stale_base":
+            raise AssertionError(f"stale explorer base was accepted: {stale_base}")
+
+        live = session_command(
+            proc, session_id, "explore_live", str(branch_id))
+        if live.get("reason") != "explore_live":
+            raise AssertionError(f"return to live failed: {live}")
+        live_frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "position" and
+                item.get("mode") == "live" and
+                item.get("fen") == after_e4_fen
+                for item in items
+            ),
+        )
+        live_frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "analysis" and
+                item.get("mode") == "live" and
+                item.get("fen") == after_e4_fen and
+                len(item.get("lines", [])) >= 2
+                for item in items
+            ),
+        )
+        black_analysis = next(
+            item for item in reversed(live_frames)
+            if item.get("type") == "analysis" and
+            item.get("mode") == "live" and
+            item.get("fen") == after_e4_fen and
+            len(item.get("lines", [])) >= 2
+        )
+        if black_analysis["lines"][1].get("bound") != "upperbound":
+            raise AssertionError(
+                "black-to-move score inversion did not invert the UCI bound: "
+                f"{black_analysis}")
+
+        resumed = session_command(
+            proc, session_id, "explore_resume",
+            f"{branch_id} {alternative_node}",
+        )
+        if resumed.get("reason") != "explore_resumed":
+            raise AssertionError(f"branch resume failed: {resumed}")
+
+        # The branch tree is backed by the native legal move generator, not by
+        # permissive GUI piece dragging. Exercise the stateful special moves.
+        special_moves = (
+            ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1"),
+            ("7k/8/8/3pP3/8/8/8/K7 w - d6 0 1", "e5d6"),
+            ("7k/P7/8/8/8/8/8/K7 w - - 0 1", "a7a8n"),
+        )
+        for fen, uci in special_moves:
+            applied = session_command(proc, session_id, "set_fen", fen)
+            if applied.get("reason") != "fen_applied":
+                raise AssertionError(f"special-move FEN failed: {applied}")
+            special = session_command(proc, session_id, "explore_start", fen)
+            if special.get("reason") != "explore_started":
+                raise AssertionError(f"special branch failed: {special}")
+            branch_id = special["branch_id"]
+            played = session_command(
+                proc, session_id, "explore_move", f"{branch_id} 0 {uci}")
+            if played.get("reason") != "explore_move_applied" or \
+                    played.get("last") != uci:
+                raise AssertionError(f"special lab move {uci} failed: {played}")
+
+        start_session(proc, "lab-replacement", "replacement")
+        frames = wait_for_frames(
+            frame_log,
+            lambda items: any(
+                item.get("type") == "explore" and
+                item.get("event") == "destroyed" and
+                item.get("branch_id") == branch_id
+                for item in items
+            ),
+        )
+        replacement_index = max(
+            index for index, item in enumerate(frames)
+            if item.get("type") == "session" and
+            item.get("event") == "started" and
+            item.get("session_id") == "lab-replacement"
+        )
+        if any(
+            item.get("type") == "analysis" and
+            item.get("mode") == "explore"
+            for item in frames[replacement_index + 1:]
+        ):
+            raise AssertionError("branch analysis crossed a session replacement")
+    finally:
+        stop_host(proc)
+
+
+def assert_analysis_settings(temp):
+    """Exercise Analysis Lab-only settings through the real control thread."""
+    cases = (
+        (
+            "continuous",
+            "budget=100 explore_budget=-1 maia=0 threads=1 multipv=3",
+            "budget=90 explore_budget=0 maia=0 threads=1 multipv=2",
+            0,
+        ),
+        (
+            "lower-clamp",
+            "budget=100 explore_budget=-1 maia=0 threads=1 multipv=3",
+            "budget=90 explore_budget=-999 maia=0 threads=1 multipv=2",
+            100,
+        ),
+        (
+            "upper-clamp",
+            "budget=100 explore_budget=-1 maia=0 threads=1 multipv=3",
+            "budget=90 explore_budget=999999 maia=0 threads=1 multipv=2",
+            10000,
+        ),
+    )
+
+    for name, start_settings, set_payload, expected_budget in cases:
+        frame_log = os.path.join(temp, f"analysis-settings-{name}.jsonl")
+        proc = start_host(
+            frame_log,
+            set_after_positions="1",
+            session_id=f"settings-{name}",
+            start_settings=start_settings,
+            set_payload=set_payload,
+        )
+        try:
+            reply = send_snapshot(
+                proc, INITIAL, 1, session_id=f"settings-{name}")
+            if reply.get("reason") != "game_started":
+                raise AssertionError(f"settings setup failed: {reply}")
+            frames = wait_for_frames(
+                frame_log,
+                lambda items: any(
+                    item.get("type") == "ready" for item in items
+                ) and any(
+                    item.get("type") == "settings" for item in items
+                ),
+            )
+        finally:
+            stop_host(proc)
+
+        ready = next(item for item in frames if item.get("type") == "ready")
+        settings = next(
+            item for item in reversed(frames)
+            if item.get("type") == "settings"
+        )
+        if ready.get("explore_budget_ms") != -1 or \
+                ready.get("maia_rating") != 0 or ready.get("maia") is not False:
+            raise AssertionError(
+                f"Maia-off/same-live startup settings were lost: {ready}")
+        if settings.get("explore_budget_ms") != expected_budget or \
+                settings.get("maia_rating") != 0:
+            raise AssertionError(
+                f"Analysis Lab setting clamp failed ({name}): {settings}")
+
+
 def main():
     failures = []
 
@@ -957,6 +1314,14 @@ def main():
             os.path.join(temp, "active-dismissed-frames.jsonl")
         )
         print("active dismissal  -> retained its session id")
+
+        assert_analysis_lab(
+            os.path.join(temp, "analysis-lab-frames.jsonl")
+        )
+        print("analysis lab      -> isolated branch, live updates, resume")
+
+        assert_analysis_settings(temp)
+        print("lab settings      -> same/live, continuous, clamps, Maia off")
 
         frame_log = os.path.join(temp, "overlay-frames.jsonl")
         proc = start_host(frame_log, set_after_positions="3")

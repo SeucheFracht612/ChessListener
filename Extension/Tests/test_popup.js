@@ -44,8 +44,8 @@ async function main() {
     let actionResult = null;
 
     const idleState = {
-        extension_version: "0.3.0",
-        native_protocol_version: 2,
+        extension_version: "0.9.0",
+        native_protocol_version: 4,
         status: "idle",
         protocol_error: null,
         session: null
